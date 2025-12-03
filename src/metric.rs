@@ -5,7 +5,10 @@ use evdev::KeyCode;
 
 use crate::listener::KeyValue;
 
+pub mod bigram_speed;
+pub mod dwell_time;
 pub mod error_rate;
+pub mod flight_time;
 pub mod heatmap;
 pub mod total_presses;
 

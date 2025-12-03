@@ -1,12 +1,14 @@
 use color_eyre::{Result, eyre::ContextCompat};
-use eframe::egui;
+use eframe::egui::{self, ScrollArea};
 use tracing::{error, info};
 use xkbcommon::xkb::{self, Context, Keymap};
 
 use crate::{
     listener::{self, ListenerHandle},
     metric::{
-        KeyContext, Metric, error_rate::ErrorRate, heatmap::HeatMap, total_presses::TotalPresses,
+        KeyContext, Metric, bigram_speed::BigramSpeed, dwell_time::DwellTime,
+        error_rate::ErrorRate, flight_time::FlightTime, heatmap::HeatMap,
+        total_presses::TotalPresses,
     },
     scanner::{self, DeviceMetadata, ScannerHandle},
     xkb_helper,
@@ -44,6 +46,9 @@ impl App {
             Box::new(TotalPresses::default()),
             Box::new(HeatMap::default()),
             Box::new(ErrorRate::default()),
+            Box::new(FlightTime::default()),
+            Box::new(DwellTime::default()),
+            Box::new(BigramSpeed::default()),
         ];
 
         let model = "".to_string();
@@ -269,10 +274,12 @@ impl eframe::App for App {
 
             ui.separator();
 
-            for metric in &self.metrics {
-                metric.ui(ui);
-                ui.separator();
-            }
+            ScrollArea::vertical().show(ui, |ui| {
+                for metric in &self.metrics {
+                    metric.ui(ui);
+                    ui.separator();
+                }
+            });
         });
     }
 }
