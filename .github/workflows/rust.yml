@@ -15,5 +15,7 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+      - name: Install Dependencies
+        run: apt install --yes libxkbcommon-dev
       - name: Build
         run: cargo build --verbose
