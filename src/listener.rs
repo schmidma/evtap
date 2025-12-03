@@ -1,4 +1,4 @@
-use std::io;
+use std::{io, time::SystemTime};
 
 use camino::Utf8PathBuf;
 use color_eyre::{Result, eyre::Context};
@@ -8,7 +8,6 @@ use tokio::{
     sync::mpsc::{Receiver, Sender, channel},
 };
 use tracing::{error, info};
-use xkbcommon::xkb::KeyDirection;
 
 pub enum KeyValue {
     Up,
@@ -18,7 +17,11 @@ pub enum KeyValue {
 
 pub enum Event {
     Connected,
-    Input { key_code: KeyCode, value: KeyValue },
+    Input {
+        timestamp: SystemTime,
+        key_code: KeyCode,
+        value: KeyValue,
+    },
     Stopped,
 }
 
@@ -115,7 +118,7 @@ impl Listener {
     async fn handle_event(&self, maybe_event: io::Result<InputEvent>) {
         match maybe_event {
             Ok(event) => {
-                if let evdev::EventSummary::Key(_key_event, key_code, value) = event.destructure() {
+                if let evdev::EventSummary::Key(key_event, key_code, value) = event.destructure() {
                     let value = match value {
                         0 => KeyValue::Up,
                         1 => KeyValue::Down,
@@ -127,7 +130,11 @@ impl Listener {
                     };
                     let _ = self
                         .event_sender
-                        .send(Event::Input { key_code, value })
+                        .send(Event::Input {
+                            timestamp: key_event.timestamp(),
+                            key_code,
+                            value,
+                        })
                         .await;
                 };
             }

@@ -7,17 +7,11 @@ use crate::app::App;
 
 mod app;
 mod listener;
+mod metric;
 mod scanner;
 
 #[derive(Parser)]
-struct Arguments {
-    /// Keyboard model (e.g., "pc105")
-    model: Option<String>,
-    /// Keyboard layout (e.g., "us", "de")
-    layout: Option<String>,
-    /// Keyboard variant (e.g., "dvorak")
-    variant: Option<String>,
-}
+struct Arguments {}
 
 #[tokio::main]
 async fn main() -> Result<()> {
