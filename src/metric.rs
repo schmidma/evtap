@@ -5,6 +5,7 @@ use evdev::KeyCode;
 
 use crate::listener::KeyValue;
 
+pub mod error_rate;
 pub mod heatmap;
 pub mod total_presses;
 

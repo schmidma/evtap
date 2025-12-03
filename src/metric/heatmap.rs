@@ -21,6 +21,7 @@ impl Metric for HeatMap {
     }
 
     fn ui(&self, ui: &mut Ui) {
+        ui.heading("Heat Map");
         Grid::new("heatmap_grid").striped(true).show(ui, |ui| {
             let mut counts: Vec<_> = self.counts.iter().collect();
             counts.sort_by_key(|(_, count)| std::cmp::Reverse(*count));

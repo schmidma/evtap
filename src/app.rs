@@ -5,7 +5,9 @@ use xkbcommon::xkb::{self, Context, Keymap};
 
 use crate::{
     listener::{self, ListenerHandle},
-    metric::{KeyContext, Metric, heatmap::HeatMap, total_presses::TotalPresses},
+    metric::{
+        KeyContext, Metric, error_rate::ErrorRate, heatmap::HeatMap, total_presses::TotalPresses,
+    },
     scanner::{self, DeviceMetadata, ScannerHandle},
     xkb_helper,
 };
@@ -41,6 +43,7 @@ impl App {
         let metrics: Vec<Box<dyn Metric>> = vec![
             Box::new(TotalPresses::default()),
             Box::new(HeatMap::default()),
+            Box::new(ErrorRate::default()),
         ];
 
         let model = "".to_string();
