@@ -9,6 +9,7 @@ mod app;
 mod listener;
 mod metric;
 mod scanner;
+mod xkb_helper;
 
 #[derive(Parser)]
 struct Arguments {}

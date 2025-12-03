@@ -7,6 +7,7 @@ use crate::{
     listener::{self, ListenerHandle},
     metric::{KeyContext, Metric, heatmap::HeatMap, total_presses::TotalPresses},
     scanner::{self, DeviceMetadata, ScannerHandle},
+    xkb_helper,
 };
 
 pub struct App {
@@ -16,12 +17,15 @@ pub struct App {
     listener: Option<ListenerHandle>,
     metrics: Vec<Box<dyn Metric>>,
 
-    /// Keyboard model (e.g., "pc105")
-    model: Option<String>,
-    /// Keyboard layout (e.g., "us", "de")
-    layout: Option<String>,
-    /// Keyboard variant (e.g., "dvorak")
-    variant: Option<String>,
+    // Keyboard configuration
+    model: String,
+    layout: String,
+    variant: String,
+
+    // Available options
+    available_models: Vec<String>,
+    available_layouts: Vec<String>,
+    available_variants: Vec<String>,
 
     xkb_state: xkb::State,
 }
@@ -39,9 +43,14 @@ impl App {
             Box::new(HeatMap::default()),
         ];
 
-        let model = None;
-        let layout = None;
-        let variant = None;
+        let model = "".to_string();
+        let layout = "".to_string();
+        let variant = "".to_string();
+
+        let available_models = xkb_helper::get_models();
+        let available_layouts = xkb_helper::get_layouts();
+        let available_variants = xkb_helper::get_variants(&layout);
+
         let xkb_state = init_keyboard_state(&model, &layout, &variant)
             .expect("failed to create initial keymap");
 
@@ -54,23 +63,44 @@ impl App {
             model,
             layout,
             variant,
+            available_models,
+            available_layouts,
+            available_variants,
             xkb_state,
+        }
+    }
+
+    fn update_variants(&mut self) {
+        self.available_variants = xkb_helper::get_variants(&self.layout);
+        if !self.available_variants.contains(&self.variant) {
+            self.variant = "".to_string();
+        }
+    }
+
+    fn reinit_xkb(&mut self) {
+        match init_keyboard_state(&self.model, &self.layout, &self.variant) {
+            Ok(state) => {
+                self.xkb_state = state;
+                info!(
+                    "Re-initialized XKB: {} / {} / {}",
+                    self.model, self.layout, self.variant
+                );
+            }
+            Err(err) => {
+                error!("Error initializing keyboard state: {err:?}");
+            }
         }
     }
 }
 
-fn init_keyboard_state(
-    model: &Option<String>,
-    layout: &Option<String>,
-    variant: &Option<String>,
-) -> Result<xkb::State> {
+fn init_keyboard_state(model: &str, layout: &str, variant: &str) -> Result<xkb::State> {
     let context = Context::new(xkb::CONTEXT_NO_FLAGS);
     let keymap = Keymap::new_from_names(
         &context,
         "",
-        model.as_deref().unwrap_or(""),
-        layout.as_deref().unwrap_or(""),
-        variant.as_deref().unwrap_or(""),
+        model,
+        layout,
+        variant,
         None,
         xkb::KEYMAP_COMPILE_NO_FLAGS,
     )
@@ -88,7 +118,9 @@ impl eframe::App for App {
                 }
             }
         }
+
         while let Some(event) = self.listener.as_mut().and_then(|l| l.try_recv_event()) {
+            ctx.request_repaint();
             match event {
                 listener::Event::Connected => {
                     info!("Listener connected to device");
@@ -117,63 +149,126 @@ impl eframe::App for App {
                 }
             }
         }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if let Some(devices) = &self.devices {
                     let text = self
                         .selected_device
                         .map_or("Select a device", |index| &devices[index].name);
+
                     egui::ComboBox::from_label("Device")
                         .selected_text(text)
                         .show_ui(ui, |ui| {
                             for (i, device) in devices.iter().enumerate() {
-                                ui.selectable_value(
-                                    &mut self.selected_device,
-                                    Some(i),
-                                    &device.name,
-                                )
-                                .on_hover_ui(|ui| {
-                                    ui.label(format!("{} ({})", device.physical_path, device.path));
-                                });
+                                if ui
+                                    .selectable_value(
+                                        &mut self.selected_device,
+                                        Some(i),
+                                        &device.name,
+                                    )
+                                    .on_hover_ui(|ui| {
+                                        ui.label(format!(
+                                            "{} ({})",
+                                            device.physical_path, device.path
+                                        ));
+                                    })
+                                    .clicked()
+                                {
+                                    // Optionally auto-start listening or reset something
+                                }
                             }
                         });
                 }
 
-                ui.label("Model:");
-                let model = ui.text_edit_singleline(self.model.get_or_insert_default());
-                ui.label("Layout:");
-                let layout = ui.text_edit_singleline(self.layout.get_or_insert_default());
-                ui.label("Variant:");
-                let variant = ui.text_edit_singleline(self.variant.get_or_insert_default());
+                ui.separator();
 
-                if model.lost_focus() || layout.lost_focus() || variant.lost_focus() {
-                    {
-                        match init_keyboard_state(&self.model, &self.layout, &self.variant) {
-                            Ok(state) => {
-                                self.xkb_state = state;
+                let mut changed = false;
+
+                egui::ComboBox::from_label("Model")
+                    .width(80.0)
+                    .selected_text(&self.model)
+                    .show_ui(ui, |ui| {
+                        for m in &self.available_models {
+                            if ui.selectable_value(&mut self.model, m.clone(), m).clicked() {
+                                changed = true;
                             }
-                            Err(err) => {
-                                error!("Error initializing keyboard state: {err:?}");
+                        }
+                    });
+
+                egui::ComboBox::from_label("Layout")
+                    .selected_text(&self.layout)
+                    .show_ui(ui, |ui| {
+                        let mut update_variants = false;
+                        for l in &self.available_layouts {
+                            if ui
+                                .selectable_value(&mut self.layout, l.clone(), l)
+                                .clicked()
+                            {
+                                changed = true;
+                                update_variants = true;
                             }
+                        }
+                        if update_variants {
+                            self.update_variants();
+                        }
+                    });
+
+                let variant_text = if self.variant.is_empty() {
+                    "Default"
+                } else {
+                    &self.variant
+                };
+                egui::ComboBox::from_label("Variant")
+                    .selected_text(variant_text)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_value(&mut self.variant, "".to_string(), "Default")
+                            .clicked()
+                        {
+                            changed = true;
+                        }
+                        for v in &self.available_variants {
+                            if v.is_empty() {
+                                continue;
+                            }
+                            if ui
+                                .selectable_value(&mut self.variant, v.clone(), v)
+                                .clicked()
+                            {
+                                changed = true;
+                            }
+                        }
+                    });
+
+                if changed {
+                    self.reinit_xkb();
+                }
+
+                if let (Some(devices), Some(index)) = (&self.devices, self.selected_device) {
+                    let btn_text = if self.listener.is_some() {
+                        "Stop"
+                    } else {
+                        "Listen"
+                    };
+                    if ui.button(btn_text).clicked() {
+                        if self.listener.is_some() {
+                            if let Some(l) = &self.listener {
+                                let _ = l.stop();
+                            }
+                        } else {
+                            let device_path = devices[index].path.clone();
+                            self.listener = Some(listener::spawn(device_path));
                         }
                     }
                 }
-
-                if let (Some(devices), Some(index)) = (&self.devices, self.selected_device)
-                    && ui
-                        .button("Listen")
-                        .on_hover_text(
-                            "Start listening for keyboard events from the selected device.",
-                        )
-                        .clicked()
-                {
-                    let device_path = devices[index].path.clone();
-                    self.listener = Some(listener::spawn(device_path));
-                }
             });
+
+            ui.separator();
+
             for metric in &self.metrics {
-                ui.separator();
                 metric.ui(ui);
+                ui.separator();
             }
         });
     }
