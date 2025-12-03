@@ -34,7 +34,18 @@ It relies on the Linux kernel's evdev subsystem.
 
 ### Dependencies
 
-TODO
+You need the XKB common library development files installed on your system:
+
+```
+# Ubuntu / Debian
+sudo apt install libxkbcommon-dev
+
+# Fedora
+sudo dnf install libxkbcommon-devel
+
+# Arch
+sudo pacman -S libxkbcommon
+```
 
 ### Permissions
 
