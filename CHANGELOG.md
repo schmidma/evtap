@@ -4,7 +4,7 @@ All notable changes to evtap are documented here. The format is based on [Keep a
 
 ## [Unreleased]
 
-## [0.1.0] - TBD
+## [0.1.0-rc.1] - 2026-07-28
 
 ### Added
 
@@ -33,5 +33,5 @@ All notable changes to evtap are documented here. The format is based on [Keep a
 - Listener read failures terminate cleanly instead of repeatedly emitting stop events.
 - Normal startup and scan paths no longer rely on panic-prone unwraps or expects.
 
-[Unreleased]: https://github.com/schmidma/evtap/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/schmidma/evtap/releases/tag/v0.1.0
+[Unreleased]: https://github.com/schmidma/evtap/compare/v0.1.0-rc.1...HEAD
+[0.1.0-rc.1]: https://github.com/schmidma/evtap/releases/tag/v0.1.0-rc.1
