@@ -30,7 +30,7 @@ The `0.1.x` goal is a trustworthy Linux-only beta for personal use.
 - [x] User documentation for setup, privacy, metrics, and troubleshooting
 - [x] Manual hardware validation with the maintainer's keyboard and layout
 - [x] Validate at least one permission-denied and reconnect workflow interactively
-- [ ] Publish and test a GitHub prerelease before the final `v0.1.0` tag
+- [x] Publish and test a GitHub prerelease before the final `v0.1.0` tag
 
 ## 0.2 — opt-in aggregate persistence
 
