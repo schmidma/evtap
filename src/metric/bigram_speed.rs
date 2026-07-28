@@ -21,25 +21,25 @@ pub struct BigramSpeed {
 
 impl Metric for BigramSpeed {
     fn process(&mut self, ctx: &KeyContext) {
-        if let KeyValue::Down = ctx.value {
-            if let Some(current_char) = &ctx.utf8 {
-                if let Some((last_char, last_time)) = &self.last_press {
-                    let duration_since = match ctx.timestamp.duration_since(*last_time) {
-                        Ok(duration) => duration,
-                        Err(err) => {
-                            error!("failed to compute duration since last release: {err}");
-                            return;
-                        }
-                    };
-                    if duration_since < TYPING_FLOW_TIMEOUT {
-                        let key = (last_char.clone(), current_char.clone());
-                        let (accumulated_time, count) = self.stats.entry(key).or_default();
-                        *accumulated_time += duration_since;
-                        *count += 1;
+        if let KeyValue::Down = ctx.value
+            && let Some(current_char) = &ctx.utf8
+        {
+            if let Some((last_char, last_time)) = &self.last_press {
+                let duration_since = match ctx.timestamp.duration_since(*last_time) {
+                    Ok(duration) => duration,
+                    Err(err) => {
+                        error!("failed to compute duration since last release: {err}");
+                        return;
                     }
+                };
+                if duration_since < TYPING_FLOW_TIMEOUT {
+                    let key = (last_char.clone(), current_char.clone());
+                    let (accumulated_time, count) = self.stats.entry(key).or_default();
+                    *accumulated_time += duration_since;
+                    *count += 1;
                 }
-                self.last_press = Some((current_char.clone(), ctx.timestamp));
             }
+            self.last_press = Some((current_char.clone(), ctx.timestamp));
         }
     }
 

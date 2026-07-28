@@ -1,4 +1,4 @@
-use color_eyre::{Result, eyre::ContextCompat};
+use color_eyre::{eyre::ContextCompat, Result};
 use eframe::egui::{self, ScrollArea};
 use tracing::{error, info};
 use xkbcommon::xkb::{self, Context, Keymap};
@@ -6,9 +6,8 @@ use xkbcommon::xkb::{self, Context, Keymap};
 use crate::{
     listener::{self, ListenerHandle},
     metric::{
-        KeyContext, Metric, bigram_speed::BigramSpeed, dwell_time::DwellTime,
-        error_rate::ErrorRate, flight_time::FlightTime, heatmap::HeatMap,
-        total_presses::TotalPresses,
+        bigram_speed::BigramSpeed, dwell_time::DwellTime, error_rate::ErrorRate,
+        flight_time::FlightTime, heatmap::HeatMap, total_presses::TotalPresses, KeyContext, Metric,
     },
     scanner::{self, DeviceMetadata, ScannerHandle},
     xkb_helper,
@@ -117,7 +116,7 @@ fn init_keyboard_state(model: &str, layout: &str, variant: &str) -> Result<xkb::
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         while let Some(event) = self.scanner.try_recv_event() {
             match event {
                 scanner::Event::Scan { metadata } => {
@@ -128,7 +127,7 @@ impl eframe::App for App {
         }
 
         while let Some(event) = self.listener.as_mut().and_then(|l| l.try_recv_event()) {
-            ctx.request_repaint();
+            ui.request_repaint();
             match event {
                 listener::Event::Connected => {
                     info!("Listener connected to device");
@@ -158,7 +157,7 @@ impl eframe::App for App {
             }
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.horizontal(|ui| {
                 if let Some(devices) = &self.devices {
                     let text = self
