@@ -4,7 +4,8 @@
 )]
 
 use std::{
-    path::PathBuf,
+    fs,
+    path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -81,6 +82,11 @@ impl DirtyTracker {
         }
         self.status = StorageStatus::Failed;
         Ok(())
+    }
+
+    pub fn set_failed(&mut self) {
+        self.in_flight = None;
+        self.status = StorageStatus::Failed;
     }
 
     pub fn disable(&mut self) {
@@ -183,6 +189,11 @@ impl CheckpointSchedule {
         self.deadline.is_some_and(|deadline| now >= deadline)
     }
 
+    pub fn time_until_due(&self, now: Instant) -> Option<Duration> {
+        self.deadline
+            .map(|deadline| deadline.saturating_duration_since(now))
+    }
+
     pub fn checkpoint_started(&mut self) {
         self.deadline = None;
     }
@@ -224,6 +235,7 @@ pub enum StorageOperation {
     Finalize,
     Discard,
     Retention,
+    DeleteAll,
     ShutdownCheckpoint,
 }
 
@@ -242,6 +254,15 @@ pub enum StorageCommand {
     },
     DiscardActive {
         session_id: SessionId,
+    },
+    ApplyRetention {
+        retention: RetentionPolicy,
+        now_ms: i64,
+    },
+    DeleteAll {
+        reopen: bool,
+        retention: RetentionPolicy,
+        now_ms: i64,
     },
     Shutdown {
         final_checkpoint: Option<CheckpointRequest>,
@@ -276,6 +297,9 @@ pub enum StorageEvent {
     },
     RetentionApplied {
         deleted_sessions: usize,
+    },
+    AllDeleted {
+        reopened: bool,
     },
     Failed(StorageFailure),
     ShutdownComplete {
@@ -331,6 +355,13 @@ impl StorageWorker {
             Err(TryRecvError::Empty) => Ok(None),
             Err(TryRecvError::Disconnected) => Err(StorageWorkerError::EventChannelClosed),
         }
+    }
+
+    pub fn request_shutdown(
+        &self,
+        final_checkpoint: Option<CheckpointRequest>,
+    ) -> Result<(), StorageWorkerError> {
+        self.send(StorageCommand::Shutdown { final_checkpoint })
     }
 
     pub fn shutdown(
@@ -498,6 +529,55 @@ impl WorkerState {
             .apply_retention(now_ms, retention)
             .map_err(|error| error.to_string())
     }
+
+    fn delete_all(
+        &mut self,
+        reopen: bool,
+        retention: RetentionPolicy,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        self.repository = None;
+        self.active_session_id = None;
+        remove_database_files(&self.database_path)?;
+        if reopen {
+            let (active, _) = self.open(retention, now_ms)?;
+            if active.is_some() {
+                return Err("fresh analytics database unexpectedly contained a session".to_owned());
+            }
+        }
+        Ok(())
+    }
+}
+
+fn remove_database_files(database_path: &Path) -> Result<(), String> {
+    let sidecar = |suffix: &str| {
+        let mut path = database_path.as_os_str().to_os_string();
+        path.push(suffix);
+        PathBuf::from(path)
+    };
+    for path in [
+        database_path.to_path_buf(),
+        sidecar("-wal"),
+        sidecar("-shm"),
+        sidecar("-journal"),
+    ] {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "failed to remove analytics file {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    if let Some(parent) = database_path.parent() {
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("failed to synchronize analytics directory: {error}"))?;
+    }
+    Ok(())
 }
 
 fn worker_main(
@@ -622,6 +702,38 @@ fn worker_main(
                     ),
                 }
             }
+            StorageCommand::ApplyRetention { retention, now_ms } => {
+                match state.apply_retention(now_ms, retention) {
+                    Ok(deleted_sessions) => emit(
+                        events,
+                        wake,
+                        StorageEvent::RetentionApplied { deleted_sessions },
+                    ),
+                    Err(details) => emit_failure(
+                        events,
+                        wake,
+                        &state,
+                        StorageOperation::Retention,
+                        None,
+                        details,
+                    ),
+                }
+            }
+            StorageCommand::DeleteAll {
+                reopen,
+                retention,
+                now_ms,
+            } => match state.delete_all(reopen, retention, now_ms) {
+                Ok(()) => emit(events, wake, StorageEvent::AllDeleted { reopened: reopen }),
+                Err(details) => emit_failure(
+                    events,
+                    wake,
+                    &state,
+                    StorageOperation::DeleteAll,
+                    None,
+                    details,
+                ),
+            },
             StorageCommand::Shutdown { final_checkpoint } => {
                 let final_generation = final_checkpoint
                     .as_ref()
@@ -881,6 +993,104 @@ mod tests {
             panic!("expected restored active session");
         };
         assert_eq!(active.metadata.updated_at_ms, 3_000);
+        worker.shutdown(None).unwrap();
+    }
+
+    #[test]
+    fn worker_finalizes_latest_snapshot_and_does_not_restore_it_as_active() {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("evtap.sqlite3");
+        let (wake, _) = wake_signal();
+        let worker =
+            StorageWorker::spawn(path.clone(), RetentionPolicy::Days(90), 2_000, wake).unwrap();
+        assert!(matches!(recv_event(&worker), StorageEvent::Opened { .. }));
+        worker
+            .send(StorageCommand::Checkpoint(CheckpointRequest {
+                generation: DirtyGeneration(1),
+                snapshot: snapshot(2_000),
+            }))
+            .unwrap();
+        assert!(matches!(
+            recv_event(&worker),
+            StorageEvent::Checkpointed { .. }
+        ));
+        worker
+            .send(StorageCommand::Finalize {
+                checkpoint: CheckpointRequest {
+                    generation: DirtyGeneration(2),
+                    snapshot: snapshot(3_000),
+                },
+                completed_at_ms: 4_000,
+                retention: RetentionPolicy::Days(90),
+                retention_now_ms: 4_000,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_event(&worker),
+            StorageEvent::Finalized {
+                generation: DirtyGeneration(2),
+                ..
+            }
+        ));
+        assert!(matches!(
+            recv_event(&worker),
+            StorageEvent::RetentionApplied { .. }
+        ));
+        worker.shutdown(None).unwrap();
+
+        let (wake, _) = wake_signal();
+        let worker = StorageWorker::spawn(path, RetentionPolicy::Days(90), 5_000, wake).unwrap();
+        assert!(matches!(
+            recv_event(&worker),
+            StorageEvent::Opened { active: None, .. }
+        ));
+        worker.shutdown(None).unwrap();
+    }
+
+    #[test]
+    fn delete_all_closes_removes_and_optionally_reopens_storage() {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("evtap.sqlite3");
+        let (wake, _) = wake_signal();
+        let worker =
+            StorageWorker::spawn(path.clone(), RetentionPolicy::Days(90), 2_000, wake).unwrap();
+        assert!(matches!(recv_event(&worker), StorageEvent::Opened { .. }));
+        worker
+            .send(StorageCommand::Checkpoint(CheckpointRequest {
+                generation: DirtyGeneration(1),
+                snapshot: snapshot(2_000),
+            }))
+            .unwrap();
+        assert!(matches!(
+            recv_event(&worker),
+            StorageEvent::Checkpointed { .. }
+        ));
+
+        worker
+            .send(StorageCommand::DeleteAll {
+                reopen: true,
+                retention: RetentionPolicy::Days(90),
+                now_ms: 3_000,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_event(&worker),
+            StorageEvent::AllDeleted { reopened: true }
+        ));
+        assert!(path.exists());
+
+        worker
+            .send(StorageCommand::DeleteAll {
+                reopen: false,
+                retention: RetentionPolicy::Days(90),
+                now_ms: 4_000,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_event(&worker),
+            StorageEvent::AllDeleted { reopened: false }
+        ));
+        assert!(!path.exists());
         worker.shutdown(None).unwrap();
     }
 

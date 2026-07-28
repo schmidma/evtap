@@ -35,7 +35,7 @@ async fn main() -> Result<()> {
     eframe::run_native(
         "evtap",
         options,
-        Box::new(|creation_context| Ok(Box::new(App::new(creation_context)?))),
+        Box::new(move |creation_context| Ok(Box::new(App::new(creation_context, app_paths)?))),
     )
     .map_err(|error| eyre!("failed to run evtap: {error}"))?;
 

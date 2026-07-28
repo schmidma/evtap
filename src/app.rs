@@ -1,9 +1,13 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use color_eyre::{Result, eyre::ContextCompat};
 use eframe::egui::{self, ScrollArea};
 use evdev::KeyCode;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use xkbcommon::xkb::{self, Context, Keymap};
 
 use crate::{
@@ -11,12 +15,23 @@ use crate::{
     listener::{self, ListenerHandle},
     metric::{Metric, default_metrics},
     metric_view::render_metric,
+    paths::AppPaths,
     scanner::{self, DeviceMetadata, ScannerHandle},
+    session::{
+        KeyboardContext, MetricRecoveryIssue, SessionId, SessionSnapshot, StoredSession,
+        recover_default_metrics,
+    },
+    settings::{RetentionPolicy, Settings, SettingsStore},
+    storage::{
+        CheckpointRequest, CheckpointSchedule, DirtyTracker, StorageCommand, StorageEvent,
+        StorageOperation, StorageStatus, StorageWorker,
+    },
     wake::WakeSignal,
     xkb_helper,
 };
 
 const HACK_FONT_NAME: &str = "Hack";
+const LISTENER_EXIT_WAIT: Duration = Duration::from_millis(500);
 
 pub struct App {
     devices: Option<Vec<DeviceMetadata>>,
@@ -26,34 +41,102 @@ pub struct App {
     scanner: ScannerHandle,
     listener: Option<ListenerHandle>,
     listener_state: ListenerState,
+    capture_error: Option<String>,
     wake_signal: WakeSignal,
     metrics: Vec<Box<dyn Metric>>,
     physical_keys: HashMap<u16, PhysicalKey>,
 
-    // Keyboard configuration
     model: String,
     layout: String,
     variant: String,
     keyboard_error: Option<String>,
-
-    // Available options
     available_models: Vec<String>,
     available_layouts: Vec<String>,
     available_variants: Vec<String>,
-
     xkb_state: xkb::State,
+
+    paths: AppPaths,
+    settings_store: SettingsStore,
+    settings: Settings,
+    settings_error: Option<String>,
+    settings_load_failed: bool,
+    storage: Option<StorageWorker>,
+    storage_tracker: DirtyTracker,
+    checkpoint_schedule: CheckpointSchedule,
+    storage_error: Option<String>,
+    storage_open_intent: Option<StorageOpenIntent>,
+    storage_needs_reopen: bool,
+    storage_finished: bool,
+    checkpoint_when_available: bool,
+
+    session: CurrentSession,
+    recovery_messages: Vec<String>,
+    pending_finish: Option<PendingFinish>,
+    discarding: bool,
+    deleting_all_to_disable: bool,
+    shutting_down_storage: bool,
+    confirm_discard: bool,
+    enable_prompt: Option<EnablePrompt>,
+    disable_prompt: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ListenerState {
     Idle,
     Connecting,
     Listening,
     Stopping,
-    Failed(String),
+    Failed,
+}
+
+#[derive(Debug, Default)]
+struct CurrentSession {
+    id: Option<SessionId>,
+    created_at_ms: Option<i64>,
+    captured_duration: Duration,
+    capture_started_at: Option<Instant>,
+    keyboard: Option<KeyboardContext>,
+    resumed: bool,
+}
+
+impl CurrentSession {
+    fn is_active(&self) -> bool {
+        self.keyboard.is_some()
+    }
+
+    fn duration(&self) -> Duration {
+        self.capture_started_at
+            .map_or(self.captured_duration, |started| {
+                self.captured_duration.saturating_add(started.elapsed())
+            })
+    }
+
+    fn finish_capture_segment(&mut self) {
+        if let Some(started) = self.capture_started_at.take() {
+            self.captured_duration = self.captured_duration.saturating_add(started.elapsed());
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StorageOpenIntent {
+    Restore,
+    PreserveCurrent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingFinish {
+    disable_after: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EnablePrompt {
+    Disclosure,
+    ExistingSession,
 }
 
 impl App {
-    pub fn new(creation_context: &eframe::CreationContext<'_>) -> Result<Self> {
+    pub fn new(creation_context: &eframe::CreationContext<'_>, paths: AppPaths) -> Result<Self> {
         creation_context.egui_ctx.set_fonts(font_definitions());
 
         let repaint_context = creation_context.egui_ctx.clone();
@@ -61,18 +144,26 @@ impl App {
         let scanner = scanner::spawn(wake_signal.clone());
         scanner.start_scan()?;
 
-        let metrics = default_metrics();
-
-        let model = String::new();
-        let layout = String::new();
-        let variant = String::new();
-
+        let settings_store = SettingsStore::new(paths.settings_file());
+        let (settings, settings_error, settings_load_failed) = match settings_store.load() {
+            Ok(settings) => (settings, None, false),
+            Err(error) => (
+                Settings::default(),
+                Some(format!(
+                    "Could not load settings; privacy-preserving defaults are in use and the existing file will not be overwritten: {error}"
+                )),
+                true,
+            ),
+        };
+        let model = settings.keyboard_model().to_owned();
+        let layout = settings.keyboard_layout().to_owned();
+        let variant = settings.keyboard_variant().to_owned();
         let available_models = xkb_helper::get_models();
         let available_layouts = xkb_helper::get_layouts();
         let available_variants = xkb_helper::get_variants(&layout);
         let xkb_state = init_keyboard_state(&model, &layout, &variant)?;
 
-        Ok(Self {
+        let mut app = Self {
             devices: None,
             selected_device: None,
             scan_warning: None,
@@ -80,8 +171,9 @@ impl App {
             scanner,
             listener: None,
             listener_state: ListenerState::Idle,
+            capture_error: None,
             wake_signal,
-            metrics,
+            metrics: default_metrics(),
             physical_keys: HashMap::new(),
             model,
             layout,
@@ -91,7 +183,33 @@ impl App {
             available_layouts,
             available_variants,
             xkb_state,
-        })
+            paths,
+            settings_store,
+            settings,
+            settings_error,
+            settings_load_failed,
+            storage: None,
+            storage_tracker: DirtyTracker::default(),
+            checkpoint_schedule: CheckpointSchedule::default(),
+            storage_error: None,
+            storage_open_intent: None,
+            storage_needs_reopen: false,
+            storage_finished: false,
+            checkpoint_when_available: false,
+            session: CurrentSession::default(),
+            recovery_messages: Vec::new(),
+            pending_finish: None,
+            discarding: false,
+            deleting_all_to_disable: false,
+            shutting_down_storage: false,
+            confirm_discard: false,
+            enable_prompt: None,
+            disable_prompt: false,
+        };
+        if app.settings.persistence_enabled() {
+            app.start_storage(StorageOpenIntent::Restore);
+        }
+        Ok(app)
     }
 
     fn request_scan(&mut self) {
@@ -146,17 +264,28 @@ impl App {
             match event {
                 listener::Event::Connected => {
                     self.listener_state = ListenerState::Listening;
+                    self.capture_error = None;
+                    self.session.capture_started_at = Some(Instant::now());
                     info!("listener connected to keyboard");
                 }
                 listener::Event::Stopped { reason } => {
                     let is_error = reason.is_error();
                     let message = reason.to_string();
                     self.listener = None;
+                    self.session.finish_capture_segment();
                     self.listener_state = if is_error {
-                        ListenerState::Failed(message.clone())
+                        self.capture_error = Some(message.clone());
+                        ListenerState::Failed
                     } else {
+                        self.capture_error = None;
                         ListenerState::Idle
                     };
+                    self.note_session_dirty();
+                    if self.pending_finish.is_some() {
+                        self.request_finalize();
+                    } else {
+                        self.request_checkpoint();
+                    }
                     info!(%message, "listener stopped");
                 }
                 listener::Event::Input {
@@ -164,47 +293,361 @@ impl App {
                     key_code,
                     kind,
                 } => {
-                    let code = key_code.code();
-                    let xkb_code = (code + 8).into();
-                    let text = self.xkb_state.key_get_utf8(xkb_code);
-                    let text = (!text.is_empty()).then_some(text);
-
-                    // Decode with the state produced by preceding events, then apply this
-                    // event so modifiers and locks affect subsequent key events.
-                    match kind {
-                        KeyEventKind::Press => {
-                            self.xkb_state.update_key(xkb_code, xkb::KeyDirection::Down);
-                        }
-                        KeyEventKind::Release => {
-                            self.xkb_state.update_key(xkb_code, xkb::KeyDirection::Up);
-                        }
-                        KeyEventKind::Repeat => {}
-                    }
-
-                    let key = self
-                        .physical_keys
-                        .entry(code)
-                        .or_insert_with(|| {
-                            let debug_name = format!("{key_code:?}");
-                            let label = debug_name
-                                .strip_prefix("KEY_")
-                                .unwrap_or(&debug_name)
-                                .to_owned();
-                            PhysicalKey::new(code, label)
-                        })
-                        .clone();
-                    let role = if key_code == KeyCode::KEY_BACKSPACE {
-                        KeyRole::Backspace
-                    } else {
-                        KeyRole::Other
-                    };
-                    let event = KeyEvent::new(key, text, timestamp, kind, role);
-                    for metric in &mut self.metrics {
-                        metric.process(&event);
-                    }
+                    self.process_input(timestamp, key_code, kind);
                 }
             }
         }
+    }
+
+    fn process_input(&mut self, timestamp: SystemTime, key_code: KeyCode, kind: KeyEventKind) {
+        let code = key_code.code();
+        let xkb_code = (code + 8).into();
+        let text = self.xkb_state.key_get_utf8(xkb_code);
+        let text = (!text.is_empty()).then_some(text);
+
+        match kind {
+            KeyEventKind::Press => {
+                self.xkb_state.update_key(xkb_code, xkb::KeyDirection::Down);
+            }
+            KeyEventKind::Release => {
+                self.xkb_state.update_key(xkb_code, xkb::KeyDirection::Up);
+            }
+            KeyEventKind::Repeat => {}
+        }
+
+        let key = self
+            .physical_keys
+            .entry(code)
+            .or_insert_with(|| {
+                let debug_name = format!("{key_code:?}");
+                let label = debug_name
+                    .strip_prefix("KEY_")
+                    .unwrap_or(&debug_name)
+                    .to_owned();
+                PhysicalKey::new(code, label)
+            })
+            .clone();
+        let role = if key_code == KeyCode::KEY_BACKSPACE {
+            KeyRole::Backspace
+        } else {
+            KeyRole::Other
+        };
+        let event = KeyEvent::new(key, text, timestamp, kind, role);
+        for metric in &mut self.metrics {
+            metric.process(&event);
+        }
+        self.note_session_dirty();
+    }
+
+    fn drain_storage_events(&mut self) {
+        loop {
+            let event = match self.storage.as_ref().map(StorageWorker::try_recv) {
+                Some(Ok(Some(event))) => event,
+                Some(Ok(None)) | None => break,
+                Some(Err(error)) => {
+                    self.storage_error = Some(format!("Storage worker stopped: {error}"));
+                    self.storage_tracker.set_failed();
+                    break;
+                }
+            };
+            self.handle_storage_event(event);
+        }
+        if self.storage_finished {
+            self.storage = None;
+            self.storage_finished = false;
+        }
+    }
+
+    fn handle_storage_event(&mut self, event: StorageEvent) {
+        match event {
+            StorageEvent::Opened { active, .. } => {
+                self.storage_tracker.loaded();
+                self.storage_needs_reopen = false;
+                self.storage_error = None;
+                let intent = self
+                    .storage_open_intent
+                    .take()
+                    .unwrap_or(StorageOpenIntent::Restore);
+                match (intent, active) {
+                    (StorageOpenIntent::PreserveCurrent, Some(_)) if self.session.is_active() => {
+                        self.storage_tracker.set_failed();
+                        self.storage_error = Some(
+                            "A different active session already exists in local storage. The current in-memory session was not changed."
+                                .to_owned(),
+                        );
+                    }
+                    (_, Some(active)) => self.restore_active_session(active),
+                    (StorageOpenIntent::PreserveCurrent, None) if self.session.is_active() => {
+                        self.note_session_dirty();
+                        self.request_checkpoint();
+                    }
+                    (_, None) => {}
+                }
+            }
+            StorageEvent::Checkpointed {
+                generation,
+                session_id,
+            } => {
+                self.session.id = Some(session_id);
+                if self.storage_tracker.in_flight() == Some(generation)
+                    && let Err(error) = self.storage_tracker.acknowledge(generation)
+                {
+                    self.storage_error = Some(format!("Invalid storage acknowledgement: {error}"));
+                }
+                if self.pending_finish.is_some()
+                    && self.listener.is_none()
+                    && self.storage_tracker.in_flight().is_none()
+                {
+                    self.request_finalize();
+                } else if self.checkpoint_when_available
+                    && self.storage_tracker.in_flight().is_none()
+                {
+                    self.request_checkpoint();
+                }
+            }
+            StorageEvent::Finalized {
+                generation,
+                session_id: _,
+            } => {
+                if self.storage_tracker.in_flight() == Some(generation) {
+                    let _ = self.storage_tracker.acknowledge(generation);
+                }
+                let disable_after = self
+                    .pending_finish
+                    .take()
+                    .is_some_and(|pending| pending.disable_after);
+                self.reset_current_session();
+                if disable_after {
+                    self.disable_persistence_now();
+                }
+            }
+            StorageEvent::Discarded {
+                session_id: _,
+                deleted,
+            } => {
+                self.discarding = false;
+                if deleted {
+                    self.reset_current_session();
+                } else {
+                    self.storage_error =
+                        Some("The active session no longer exists in storage.".to_owned());
+                }
+            }
+            StorageEvent::RetentionApplied { .. } => {}
+            StorageEvent::AllDeleted { reopened: _ } => {
+                if self.deleting_all_to_disable {
+                    self.deleting_all_to_disable = false;
+                    self.reset_current_session();
+                    self.disable_persistence_now();
+                }
+            }
+            StorageEvent::Failed(failure) => {
+                if let Some(generation) = failure.generation
+                    && self.storage_tracker.in_flight() == Some(generation)
+                {
+                    let _ = self.storage_tracker.fail(generation);
+                    self.checkpoint_schedule.retry_later(Instant::now());
+                } else if failure.operation == StorageOperation::Open {
+                    let _ = self.storage_tracker.fail_loading();
+                    self.storage_needs_reopen = true;
+                }
+                if failure.operation == StorageOperation::Discard {
+                    self.discarding = false;
+                }
+                if failure.operation == StorageOperation::DeleteAll {
+                    self.deleting_all_to_disable = false;
+                }
+                self.storage_error = Some(format!(
+                    "{} ({}): {}",
+                    storage_operation_label(failure.operation),
+                    failure.database_path.display(),
+                    failure.details
+                ));
+            }
+            StorageEvent::ShutdownComplete {
+                final_generation: _,
+                final_checkpoint_saved,
+            } => {
+                if !final_checkpoint_saved {
+                    warn!("storage shutdown completed without saving the final checkpoint");
+                }
+                self.storage_tracker.disable();
+                self.shutting_down_storage = false;
+                self.storage_finished = true;
+            }
+        }
+    }
+
+    fn restore_active_session(&mut self, stored: StoredSession) {
+        let recovered = recover_default_metrics(&stored.metrics);
+        self.recovery_messages = recovered
+            .issues
+            .iter()
+            .map(metric_recovery_message)
+            .collect();
+        self.metrics = recovered.metrics;
+        let metadata = stored.metadata;
+        self.model.clone_from(&metadata.keyboard.model);
+        self.layout.clone_from(&metadata.keyboard.layout);
+        self.variant.clone_from(&metadata.keyboard.variant);
+        self.available_variants = xkb_helper::get_variants(&self.layout);
+        self.reinit_xkb();
+        self.session = CurrentSession {
+            id: Some(metadata.id),
+            created_at_ms: Some(metadata.created_at_ms),
+            captured_duration: Duration::from_nanos(
+                u64::try_from(metadata.captured_duration_ns).unwrap_or_default(),
+            ),
+            capture_started_at: None,
+            keyboard: Some(metadata.keyboard),
+            resumed: true,
+        };
+        self.listener = None;
+        self.listener_state = ListenerState::Idle;
+    }
+
+    fn start_storage(&mut self, intent: StorageOpenIntent) {
+        self.storage_tracker.begin_loading();
+        self.storage_open_intent = Some(intent);
+        self.storage_needs_reopen = false;
+        self.storage_error = None;
+        let now_ms = unix_now_ms().unwrap_or_default();
+        match StorageWorker::spawn(
+            self.paths.database_file(),
+            self.settings.retention(),
+            now_ms,
+            self.wake_signal.clone(),
+        ) {
+            Ok(worker) => self.storage = Some(worker),
+            Err(error) => {
+                self.storage_tracker.set_failed();
+                self.storage_error = Some(format!("Could not start storage: {error}"));
+            }
+        }
+    }
+
+    fn note_session_dirty(&mut self) {
+        if !self.settings.persistence_enabled() {
+            return;
+        }
+        match self.storage_tracker.mark_dirty() {
+            Ok(_) => self.checkpoint_schedule.note_dirty(Instant::now()),
+            Err(_error) if self.storage_tracker.status() == StorageStatus::Loading => {}
+            Err(error) => {
+                self.storage_error = Some(format!("Could not track unsaved changes: {error}"));
+            }
+        }
+    }
+
+    fn request_checkpoint(&mut self) {
+        if !self.settings.persistence_enabled() || !self.session.is_active() {
+            return;
+        }
+        let Some(generation) = self.storage_tracker.begin_checkpoint() else {
+            if self.storage_tracker.in_flight().is_some() {
+                self.checkpoint_when_available = true;
+            }
+            return;
+        };
+        let snapshot = match self.session_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let _ = self.storage_tracker.fail(generation);
+                self.storage_error = Some(error);
+                return;
+            }
+        };
+        let send_result = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "storage worker is unavailable".to_owned())
+            .and_then(|worker| {
+                worker
+                    .send(StorageCommand::Checkpoint(CheckpointRequest {
+                        generation,
+                        snapshot,
+                    }))
+                    .map_err(|error| error.to_string())
+            });
+        match send_result {
+            Ok(()) => {
+                self.checkpoint_when_available = false;
+                self.checkpoint_schedule.checkpoint_started();
+            }
+            Err(error) => {
+                let _ = self.storage_tracker.fail(generation);
+                self.checkpoint_schedule.retry_later(Instant::now());
+                self.storage_error = Some(format!("Could not request checkpoint: {error}"));
+            }
+        }
+    }
+
+    fn request_finalize(&mut self) {
+        if !self.settings.persistence_enabled() || !self.session.is_active() {
+            return;
+        }
+        let Some(generation) = self.storage_tracker.begin_checkpoint() else {
+            return;
+        };
+        let snapshot = match self.session_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let _ = self.storage_tracker.fail(generation);
+                self.storage_error = Some(error);
+                return;
+            }
+        };
+        let completed_at_ms = unix_now_ms().unwrap_or(snapshot.updated_at_ms);
+        let command = StorageCommand::Finalize {
+            checkpoint: CheckpointRequest {
+                generation,
+                snapshot,
+            },
+            completed_at_ms,
+            retention: self.settings.retention(),
+            retention_now_ms: completed_at_ms,
+        };
+        let send_result = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "storage worker is unavailable".to_owned())
+            .and_then(|worker| worker.send(command).map_err(|error| error.to_string()));
+        match send_result {
+            Ok(()) => self.checkpoint_schedule.checkpoint_started(),
+            Err(error) => {
+                let _ = self.storage_tracker.fail(generation);
+                self.storage_error = Some(format!("Could not finish session: {error}"));
+            }
+        }
+    }
+
+    fn session_snapshot(&self) -> Result<SessionSnapshot, String> {
+        let keyboard = self
+            .session
+            .keyboard
+            .clone()
+            .ok_or_else(|| "current session has no fixed keyboard configuration".to_owned())?;
+        let created_at_ms = self
+            .session
+            .created_at_ms
+            .ok_or_else(|| "current session has no creation time".to_owned())?;
+        let updated_at_ms = unix_now_ms()?;
+        let captured_duration_ns = i64::try_from(self.session.duration().as_nanos())
+            .map_err(|_| "captured session duration is too large to save".to_owned())?;
+        let metrics = self
+            .metrics
+            .iter()
+            .map(|metric| metric.snapshot().map_err(|error| error.to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(SessionSnapshot {
+            id: self.session.id,
+            created_at_ms,
+            updated_at_ms: updated_at_ms.max(created_at_ms),
+            captured_duration_ns,
+            application_version: env!("CARGO_PKG_VERSION").to_owned(),
+            keyboard,
+            metrics,
+        })
     }
 
     fn update_variants(&mut self) {
@@ -231,6 +674,242 @@ impl App {
             }
         }
     }
+
+    fn save_keyboard_settings(&mut self) {
+        self.settings.set_keyboard(
+            self.model.clone(),
+            self.layout.clone(),
+            self.variant.clone(),
+        );
+        self.save_settings();
+    }
+
+    fn save_settings(&mut self) -> bool {
+        if self.settings_load_failed {
+            self.settings_error = Some(
+                "Settings were not changed because the existing settings file could not be read. Fix or remove it before changing preferences."
+                    .to_owned(),
+            );
+            return false;
+        }
+        match self.settings_store.save(&self.settings) {
+            Ok(()) => {
+                self.settings_error = None;
+                true
+            }
+            Err(error) => {
+                self.settings_error = Some(format!("Could not save settings: {error}"));
+                false
+            }
+        }
+    }
+
+    fn begin_session_and_listen(&mut self, device_index: usize) {
+        let Some(device) = self
+            .devices
+            .as_ref()
+            .and_then(|devices| devices.get(device_index))
+            .cloned()
+        else {
+            return;
+        };
+        if let Some(keyboard) = &self.session.keyboard
+            && keyboard
+                .display_name
+                .as_deref()
+                .is_some_and(|name| name != device.name)
+        {
+            self.storage_error = Some(
+                "Select the same keyboard model used by the active session, or finish/discard it."
+                    .to_owned(),
+            );
+            return;
+        }
+        if !self.session.is_active() {
+            let now_ms = unix_now_ms().unwrap_or_default();
+            self.session = CurrentSession {
+                id: None,
+                created_at_ms: Some(now_ms),
+                captured_duration: Duration::ZERO,
+                capture_started_at: None,
+                keyboard: Some(KeyboardContext {
+                    display_name: Some(device.name.clone()),
+                    model: self.model.clone(),
+                    layout: self.layout.clone(),
+                    variant: self.variant.clone(),
+                }),
+                resumed: false,
+            };
+            self.note_session_dirty();
+            self.request_checkpoint();
+        }
+        self.listener = Some(listener::spawn(device.path, self.wake_signal.clone()));
+        self.listener_state = ListenerState::Connecting;
+        self.capture_error = None;
+    }
+
+    fn stop_listener(&mut self) {
+        let stop_result = self.listener.as_ref().map(ListenerHandle::stop);
+        match stop_result {
+            Some(Ok(())) => self.listener_state = ListenerState::Stopping,
+            Some(Err(error)) => {
+                self.listener = None;
+                self.session.finish_capture_segment();
+                self.listener_state = ListenerState::Failed;
+                self.capture_error = Some(format!("Could not stop listener: {error:#}"));
+                self.note_session_dirty();
+                if self.pending_finish.is_some() {
+                    self.request_finalize();
+                } else {
+                    self.request_checkpoint();
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn begin_finish(&mut self, disable_after: bool) {
+        self.pending_finish = Some(PendingFinish { disable_after });
+        self.note_session_dirty();
+        if self.listener.is_some() {
+            self.stop_listener();
+        } else {
+            self.request_finalize();
+        }
+    }
+
+    fn begin_discard(&mut self) {
+        self.confirm_discard = false;
+        if self.listener.is_some() || matches!(self.listener_state, ListenerState::Stopping) {
+            return;
+        }
+        if !self.settings.persistence_enabled() {
+            self.reset_current_session();
+            return;
+        }
+        if self.storage_tracker.in_flight().is_some() {
+            self.storage_error = Some("Wait for the current save before discarding.".to_owned());
+            return;
+        }
+        match self.session.id {
+            Some(session_id) => {
+                let result = self
+                    .storage
+                    .as_ref()
+                    .ok_or_else(|| "storage worker is unavailable".to_owned())
+                    .and_then(|worker| {
+                        worker
+                            .send(StorageCommand::DiscardActive { session_id })
+                            .map_err(|error| error.to_string())
+                    });
+                match result {
+                    Ok(()) => self.discarding = true,
+                    Err(error) => {
+                        self.storage_error = Some(format!("Could not discard session: {error}"));
+                    }
+                }
+            }
+            None => self.reset_current_session(),
+        }
+    }
+
+    fn reset_current_session(&mut self) {
+        self.metrics = default_metrics();
+        self.physical_keys.clear();
+        self.session = CurrentSession::default();
+        self.pending_finish = None;
+        self.discarding = false;
+        self.confirm_discard = false;
+        self.recovery_messages.clear();
+        self.checkpoint_schedule.clear();
+        self.checkpoint_when_available = false;
+        if self.settings.persistence_enabled()
+            && self.storage_tracker.status() != StorageStatus::Failed
+        {
+            self.storage_tracker.loaded();
+        }
+        self.model = self.settings.keyboard_model().to_owned();
+        self.layout = self.settings.keyboard_layout().to_owned();
+        self.variant = self.settings.keyboard_variant().to_owned();
+        self.available_variants = xkb_helper::get_variants(&self.layout);
+        self.reinit_xkb();
+    }
+
+    fn has_samples(&self) -> bool {
+        self.session.duration() > Duration::ZERO
+            || self.metrics.iter().any(|metric| metric.has_data())
+    }
+
+    fn enable_persistence(&mut self, intent: StorageOpenIntent) {
+        self.settings.set_persistence_enabled(true);
+        if !self.save_settings() {
+            self.settings.set_persistence_enabled(false);
+            return;
+        }
+        self.enable_prompt = None;
+        self.start_storage(intent);
+    }
+
+    fn disable_persistence_now(&mut self) {
+        self.settings.set_persistence_enabled(false);
+        if !self.save_settings() {
+            self.settings.set_persistence_enabled(true);
+            return;
+        }
+        self.disable_prompt = false;
+        self.shutting_down_storage = true;
+        match &self.storage {
+            Some(worker) => {
+                if let Err(error) = worker.request_shutdown(None) {
+                    self.storage_error = Some(format!("Could not stop storage: {error}"));
+                    self.shutting_down_storage = false;
+                }
+            }
+            None => {
+                self.storage_tracker.disable();
+                self.shutting_down_storage = false;
+            }
+        }
+    }
+
+    fn delete_all_and_disable(&mut self) {
+        let Some(worker) = &self.storage else {
+            self.storage_error =
+                Some("Storage worker is unavailable; analytics were not deleted.".to_owned());
+            return;
+        };
+        let now_ms = unix_now_ms().unwrap_or_default();
+        match worker.send(StorageCommand::DeleteAll {
+            reopen: false,
+            retention: self.settings.retention(),
+            now_ms,
+        }) {
+            Ok(()) => {
+                self.deleting_all_to_disable = true;
+                self.disable_prompt = false;
+            }
+            Err(error) => {
+                self.storage_error = Some(format!("Could not request analytics deletion: {error}"));
+            }
+        }
+    }
+
+    fn change_retention(&mut self, retention: RetentionPolicy) {
+        let previous = self.settings.retention();
+        if self.settings.set_retention(retention).is_err() {
+            return;
+        }
+        if !self.save_settings() {
+            let _ = self.settings.set_retention(previous);
+            return;
+        }
+        if let Some(worker) = &self.storage {
+            let _ = worker.send(StorageCommand::ApplyRetention {
+                retention,
+                now_ms: unix_now_ms().unwrap_or_default(),
+            });
+        }
+    }
 }
 
 impl App {
@@ -238,7 +917,6 @@ impl App {
         ui.group(|ui| {
             ui.set_width(ui.available_width());
             ui.heading("Capture setup");
-
             self.render_device_picker(ui);
             ui.add_space(4.0);
             self.render_keyboard_configuration(ui);
@@ -249,6 +927,16 @@ impl App {
     }
 
     fn render_device_picker(&mut self, ui: &mut egui::Ui) {
+        let configuration_locked = self.session.is_active();
+        let needs_runtime_device = configuration_locked && self.selected_device.is_none();
+        let picker_enabled = self.listener.is_none()
+            && (!configuration_locked || needs_runtime_device)
+            && !matches!(self.listener_state, ListenerState::Stopping);
+        let required_name = self
+            .session
+            .keyboard
+            .as_ref()
+            .and_then(|keyboard| keyboard.display_name.as_deref());
         let mut request_scan = false;
         ui.horizontal_wrapped(|ui| {
             match &self.devices {
@@ -264,32 +952,36 @@ impl App {
                         .selected_device
                         .and_then(|index| devices.get(index))
                         .map_or("Select a keyboard", |device| device.name.as_str());
-
-                    ui.add_enabled_ui(self.listener.is_none(), |ui| {
+                    ui.add_enabled_ui(picker_enabled, |ui| {
                         egui::ComboBox::from_label("Keyboard")
                             .selected_text(text)
                             .show_ui(ui, |ui| {
                                 for (index, device) in devices.iter().enumerate() {
-                                    ui.selectable_value(
-                                        &mut self.selected_device,
-                                        Some(index),
-                                        &device.name,
-                                    )
-                                    .on_hover_ui(|ui| {
-                                        ui.label(format!(
-                                            "{} ({})",
-                                            device.physical_path, device.path
-                                        ));
+                                    let compatible =
+                                        required_name.is_none_or(|name| name == device.name);
+                                    ui.add_enabled_ui(compatible, |ui| {
+                                        ui.selectable_value(
+                                            &mut self.selected_device,
+                                            Some(index),
+                                            &device.name,
+                                        )
+                                        .on_hover_ui(
+                                            |ui| {
+                                                ui.label(format!(
+                                                    "{} ({})",
+                                                    device.physical_path, device.path
+                                                ));
+                                            },
+                                        );
                                     });
                                 }
                             });
                     });
                 }
             }
-
             if ui
                 .add_enabled(
-                    self.listener.is_none() && self.devices.is_some(),
+                    picker_enabled && self.devices.is_some(),
                     egui::Button::new("Rescan"),
                 )
                 .clicked()
@@ -297,18 +989,20 @@ impl App {
                 request_scan = true;
             }
         });
-
+        if configuration_locked {
+            ui.weak("Keyboard and XKB configuration are fixed for the active session.");
+        }
         if request_scan {
             self.request_scan();
         }
     }
 
     fn render_keyboard_configuration(&mut self, ui: &mut egui::Ui) {
-        let enabled = self.listener.is_none();
+        let enabled = self.listener.is_none() && !self.session.is_active();
+        let mut save_settings = false;
         ui.add_enabled_ui(enabled, |ui| {
             ui.horizontal_wrapped(|ui| {
                 let mut changed = false;
-
                 egui::ComboBox::from_label("Model")
                     .width(80.0)
                     .selected_text(&self.model)
@@ -322,7 +1016,6 @@ impl App {
                             }
                         }
                     });
-
                 egui::ComboBox::from_label("Layout")
                     .selected_text(&self.layout)
                     .show_ui(ui, |ui| {
@@ -340,7 +1033,6 @@ impl App {
                             self.update_variants();
                         }
                     });
-
                 let variant_text = if self.variant.is_empty() {
                     "Default"
                 } else {
@@ -365,61 +1057,95 @@ impl App {
                             }
                         }
                     });
-
                 if changed {
                     self.reinit_xkb();
+                    save_settings = true;
                 }
             });
         });
+        if save_settings {
+            self.save_keyboard_settings();
+        }
     }
 
     fn render_session_controls(&mut self, ui: &mut egui::Ui) {
+        let busy = self.pending_finish.is_some()
+            || self.discarding
+            || self.deleting_all_to_disable
+            || matches!(self.listener_state, ListenerState::Stopping);
         ui.horizontal_wrapped(|ui| {
-            if let Some(listener) = &self.listener {
-                let stopping = matches!(self.listener_state, ListenerState::Stopping);
+            if self.listener.is_some() {
                 if ui
-                    .add_enabled(!stopping, egui::Button::new("Stop listening"))
+                    .add_enabled(!busy, egui::Button::new("Stop listening"))
                     .clicked()
                 {
-                    match listener.stop() {
-                        Ok(()) => self.listener_state = ListenerState::Stopping,
-                        Err(error) => {
-                            self.listener = None;
-                            self.listener_state = ListenerState::Failed(format!(
-                                "Could not stop listener: {error:#}"
-                            ));
-                        }
-                    }
+                    self.stop_listener();
                 }
             } else {
-                let selected_path = self
-                    .devices
-                    .as_ref()
-                    .zip(self.selected_device)
-                    .and_then(|(devices, index)| devices.get(index))
-                    .map(|device| device.path.clone());
+                let selected_index = self.selected_device;
+                let storage_ready = self.storage_tracker.status() != StorageStatus::Loading;
                 if ui
                     .add_enabled(
-                        selected_path.is_some(),
+                        selected_index.is_some() && !busy && storage_ready,
                         egui::Button::new("Start listening"),
                     )
                     .clicked()
-                    && let Some(device_path) = selected_path
+                    && let Some(index) = selected_index
                 {
-                    self.listener = Some(listener::spawn(device_path, self.wake_signal.clone()));
-                    self.listener_state = ListenerState::Connecting;
+                    self.begin_session_and_listen(index);
                 }
             }
 
-            if ui.button("Reset session").clicked() {
-                for metric in &mut self.metrics {
-                    metric.reset();
+            if self.settings.persistence_enabled()
+                && ui
+                    .add_enabled(
+                        self.session.is_active() && !busy,
+                        egui::Button::new("Finish session"),
+                    )
+                    .clicked()
+            {
+                self.begin_finish(false);
+            }
+            let discard_label = if self.settings.persistence_enabled() {
+                "Discard session"
+            } else {
+                "Discard current session"
+            };
+            if ui
+                .add_enabled(
+                    self.session.is_active()
+                        && self.listener.is_none()
+                        && !busy
+                        && self.storage_tracker.in_flight().is_none(),
+                    egui::Button::new(discard_label),
+                )
+                .clicked()
+            {
+                if self.has_samples() {
+                    self.confirm_discard = true;
+                } else {
+                    self.begin_discard();
                 }
             }
         });
+
+        if self.confirm_discard {
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                "Discard all aggregates in the current session? This cannot be undone.",
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Discard permanently").clicked() {
+                    self.begin_discard();
+                }
+                if ui.button("Cancel").clicked() {
+                    self.confirm_discard = false;
+                }
+            });
+        }
     }
 
-    fn render_capture_status(&self, ui: &mut egui::Ui) {
+    fn render_capture_status(&mut self, ui: &mut egui::Ui) {
         if let Some(error) = &self.scan_error {
             ui.colored_label(egui::Color32::RED, error);
         }
@@ -429,10 +1155,20 @@ impl App {
         if let Some(error) = &self.keyboard_error {
             ui.colored_label(egui::Color32::RED, error);
         }
+        if let Some(error) = &self.settings_error {
+            ui.colored_label(egui::Color32::RED, error);
+        }
+        if let Some(error) = &self.capture_error {
+            ui.colored_label(egui::Color32::RED, error);
+        }
 
-        match &self.listener_state {
+        match self.listener_state {
             ListenerState::Idle => {
-                ui.weak("Not listening");
+                if self.session.resumed {
+                    ui.weak("Saved session resumed — capture is paused");
+                } else {
+                    ui.weak("Not listening");
+                }
             }
             ListenerState::Connecting => {
                 ui.label("Connecting to keyboard…");
@@ -443,9 +1179,182 @@ impl App {
             ListenerState::Stopping => {
                 ui.label("Stopping listener…");
             }
-            ListenerState::Failed(error) => {
-                ui.colored_label(egui::Color32::RED, error);
+            ListenerState::Failed => {
+                ui.colored_label(egui::Color32::RED, "Capture stopped because of an error");
             }
+        }
+        if self.pending_finish.is_some() {
+            ui.label("Finishing session…");
+        } else if self.discarding {
+            ui.label("Discarding session…");
+        }
+    }
+
+    fn render_persistence_settings(&mut self, ui: &mut egui::Ui) {
+        ui.group(|ui| {
+            ui.set_width(ui.available_width());
+            ui.heading("Local aggregate history");
+            if self.settings.persistence_enabled() {
+                ui.label("Enabled — versioned aggregate snapshots are stored locally in an unencrypted SQLite database.");
+                ui.small(format!("Storage: {}", self.paths.database_file().display()));
+                let mut retention = self.settings.retention();
+                egui::ComboBox::from_label("Retention")
+                    .selected_text(retention_label(retention))
+                    .show_ui(ui, |ui| {
+                        for option in [
+                            RetentionPolicy::Days(30),
+                            RetentionPolicy::Days(90),
+                            RetentionPolicy::Days(365),
+                            RetentionPolicy::Forever,
+                        ] {
+                            ui.selectable_value(&mut retention, option, retention_label(option));
+                        }
+                    });
+                if retention != self.settings.retention() {
+                    self.change_retention(retention);
+                }
+                if ui
+                    .add_enabled(
+                        self.listener.is_none()
+                            && !self.shutting_down_storage
+                            && !self.deleting_all_to_disable,
+                        egui::Button::new("Disable persistence…"),
+                    )
+                    .clicked()
+                {
+                    if self.session.is_active() {
+                        self.disable_prompt = true;
+                    } else {
+                        self.disable_persistence_now();
+                    }
+                }
+            } else {
+                ui.label("Off — session aggregates remain only in memory and are discarded on exit.");
+                if ui.button("Enable persistence…").clicked() {
+                    self.enable_prompt = Some(EnablePrompt::Disclosure);
+                }
+            }
+            self.render_storage_status(ui);
+            self.render_persistence_prompts(ui);
+        });
+    }
+
+    fn render_storage_status(&mut self, ui: &mut egui::Ui) {
+        let label = match self.storage_tracker.status() {
+            StorageStatus::Disabled => "Persistence off",
+            StorageStatus::Loading => "Loading saved session…",
+            StorageStatus::Saved => "Saved",
+            StorageStatus::Dirty => "Unsaved changes",
+            StorageStatus::Saving => "Saving…",
+            StorageStatus::Failed => "Could not save",
+        };
+        ui.weak(label);
+        if let Some(error) = &self.storage_error {
+            ui.colored_label(egui::Color32::RED, error);
+        }
+        if self.storage_tracker.status() == StorageStatus::Failed
+            && self.settings.persistence_enabled()
+            && ui.button("Retry storage operation").clicked()
+        {
+            if self.storage.is_none() {
+                self.start_storage(if self.session.is_active() {
+                    StorageOpenIntent::PreserveCurrent
+                } else {
+                    StorageOpenIntent::Restore
+                });
+            } else if self.storage_needs_reopen {
+                self.storage_tracker.begin_loading();
+                self.storage_open_intent = Some(if self.session.is_active() {
+                    StorageOpenIntent::PreserveCurrent
+                } else {
+                    StorageOpenIntent::Restore
+                });
+                let result = self.storage.as_ref().map_or_else(
+                    || Err("storage worker is unavailable".to_owned()),
+                    |worker| {
+                        worker
+                            .send(StorageCommand::RetryOpen {
+                                retention: self.settings.retention(),
+                                now_ms: unix_now_ms().unwrap_or_default(),
+                            })
+                            .map_err(|error| error.to_string())
+                    },
+                );
+                if let Err(error) = result {
+                    self.storage_tracker.set_failed();
+                    self.storage_error = Some(format!("Could not retry storage: {error}"));
+                }
+            } else if self.pending_finish.is_some() {
+                self.request_finalize();
+            } else {
+                self.request_checkpoint();
+            }
+        }
+    }
+
+    fn render_persistence_prompts(&mut self, ui: &mut egui::Ui) {
+        match self.enable_prompt {
+            Some(EnablePrompt::Disclosure) => {
+                ui.separator();
+                ui.colored_label(egui::Color32::YELLOW, "Review before enabling");
+                ui.label("evtap will store local aggregate character labels, ranked physical keys, bigram pairs, correction pairs, counts, and timing totals. It never stores raw key events, ordered text, event timestamps, or pressed-key state.");
+                ui.label("The SQLite database is local and unencrypted. Completed sessions are retained for 90 days by default and can be deleted in evtap.");
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Continue").clicked() {
+                        if self.session.is_active() {
+                            self.enable_prompt = Some(EnablePrompt::ExistingSession);
+                        } else {
+                            self.enable_persistence(StorageOpenIntent::Restore);
+                        }
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.enable_prompt = None;
+                    }
+                });
+            }
+            Some(EnablePrompt::ExistingSession) => {
+                ui.separator();
+                ui.label("Choose what to do with the current in-memory session:");
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Save current session").clicked() {
+                        self.enable_persistence(StorageOpenIntent::PreserveCurrent);
+                    }
+                    if ui
+                        .add_enabled(
+                            self.listener.is_none(),
+                            egui::Button::new("Start persistence with a new session"),
+                        )
+                        .clicked()
+                    {
+                        self.reset_current_session();
+                        self.enable_persistence(StorageOpenIntent::Restore);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.enable_prompt = None;
+                    }
+                });
+                if self.listener.is_some() {
+                    ui.weak("Stop capture before discarding the current session.");
+                }
+            }
+            None => {}
+        }
+
+        if self.disable_prompt {
+            ui.separator();
+            ui.label("Resolve the active session before disabling persistence:");
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Finish session and keep history").clicked() {
+                    self.disable_prompt = false;
+                    self.begin_finish(true);
+                }
+                if ui.button("Delete all analytics and disable").clicked() {
+                    self.delete_all_and_disable();
+                }
+                if ui.button("Cancel").clicked() {
+                    self.disable_prompt = false;
+                }
+            });
         }
     }
 }
@@ -477,6 +1386,50 @@ fn init_keyboard_state(model: &str, layout: &str, variant: &str) -> Result<xkb::
     Ok(xkb::State::new(&keymap))
 }
 
+fn unix_now_ms() -> Result<i64, String> {
+    let milliseconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "system clock precedes the Unix epoch".to_owned())?
+        .as_millis();
+    i64::try_from(milliseconds).map_err(|_| "system time exceeds the storage range".to_owned())
+}
+
+fn metric_recovery_message(issue: &MetricRecoveryIssue) -> String {
+    match issue {
+        MetricRecoveryIssue::Unknown { metric_id } => {
+            format!("Unsupported saved metric: {metric_id}")
+        }
+        MetricRecoveryIssue::Duplicate { metric_id } => {
+            format!("Duplicate saved metric was ignored: {metric_id}")
+        }
+        MetricRecoveryIssue::Invalid { metric_id, details } => {
+            format!("Could not restore saved metric {metric_id}: {details}")
+        }
+    }
+}
+
+fn storage_operation_label(operation: StorageOperation) -> &'static str {
+    match operation {
+        StorageOperation::Open => "Could not open aggregate storage",
+        StorageOperation::Checkpoint => "Could not save aggregate checkpoint",
+        StorageOperation::Finalize => "Could not finish saved session",
+        StorageOperation::Discard => "Could not discard saved session",
+        StorageOperation::Retention => "Could not apply retention",
+        StorageOperation::DeleteAll => "Could not delete aggregate storage",
+        StorageOperation::ShutdownCheckpoint => "Could not save final aggregate checkpoint",
+    }
+}
+
+fn retention_label(retention: RetentionPolicy) -> &'static str {
+    match retention {
+        RetentionPolicy::Days(30) => "30 days",
+        RetentionPolicy::Days(90) => "90 days",
+        RetentionPolicy::Days(365) => "365 days",
+        RetentionPolicy::Days(_) => "Unsupported",
+        RetentionPolicy::Forever => "Forever",
+    }
+}
+
 impl eframe::App for App {
     fn persist_egui_memory(&self) -> bool {
         false
@@ -485,16 +1438,34 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_scanner_events();
         self.drain_listener_events();
+        self.drain_storage_events();
+
+        let now = Instant::now();
+        if self.listener_state == ListenerState::Listening && self.checkpoint_schedule.is_due(now) {
+            self.request_checkpoint();
+        }
+        if let Some(delay) = self.checkpoint_schedule.time_until_due(now) {
+            ui.ctx().request_repaint_after(delay);
+        }
 
         egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("evtap");
             ui.label("Understand the mechanics of your everyday typing.");
-            ui.small("Session data stays in memory and is discarded when evtap exits.");
+            if self.settings.persistence_enabled() {
+                ui.small("Opt-in aggregate history is stored locally; raw key events and ordered text are never stored.");
+            } else {
+                ui.small("Persistence is off. Session aggregates stay in memory and are discarded when evtap exits.");
+            }
             ui.add_space(8.0);
 
             self.render_capture_setup(ui);
             ui.add_space(8.0);
+            self.render_persistence_settings(ui);
+            ui.add_space(8.0);
 
+            for message in &self.recovery_messages {
+                ui.colored_label(egui::Color32::YELLOW, message);
+            }
             ui.heading("Session analytics");
             ui.small("Timing tables appear as samples arrive; no raw keystroke history is saved.");
             ui.add_space(4.0);
@@ -510,11 +1481,50 @@ impl eframe::App for App {
             });
         });
     }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(listener) = &self.listener {
+            let _ = listener.stop();
+            let deadline = Instant::now() + LISTENER_EXIT_WAIT;
+            while self.listener.is_some() && Instant::now() < deadline {
+                self.drain_listener_events();
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        self.session.finish_capture_segment();
+
+        let final_checkpoint = if self.settings.persistence_enabled()
+            && self.session.is_active()
+            && self.pending_finish.is_none()
+        {
+            let generation = self.storage_tracker.mark_dirty().ok();
+            generation.and_then(|generation| {
+                self.session_snapshot()
+                    .ok()
+                    .map(|snapshot| CheckpointRequest {
+                        generation,
+                        snapshot,
+                    })
+            })
+        } else {
+            None
+        };
+        if let Some(storage) = self.storage.take() {
+            match storage.shutdown(final_checkpoint) {
+                Ok(result) if result.final_checkpoint_saved => {
+                    info!("storage worker shut down after saving aggregate state");
+                }
+                Ok(_) => warn!("storage worker shut down without a final aggregate checkpoint"),
+                Err(error) => warn!(%error, "storage worker shutdown did not complete cleanly"),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::font_definitions;
+    use super::{font_definitions, retention_label, unix_now_ms};
+    use crate::settings::RetentionPolicy;
     use eframe::egui;
 
     #[test]
@@ -529,5 +1539,12 @@ mod tests {
         });
 
         assert!(has_arrow);
+    }
+
+    #[test]
+    fn persistence_helpers_use_bounded_values() {
+        assert!(unix_now_ms().unwrap() > 0);
+        assert_eq!(retention_label(RetentionPolicy::Days(90)), "90 days");
+        assert_eq!(retention_label(RetentionPolicy::Forever), "Forever");
     }
 }
