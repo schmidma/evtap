@@ -1,11 +1,17 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+
+use serde::{Deserialize, Serialize};
 
 use crate::{
     input::{KeyEvent, KeyEventKind, KeyRole},
-    metric::{Metric, MetricDescriptor, MetricReport, ReportSection, ReportValue},
+    metric::{
+        Metric, MetricDescriptor, MetricReport, MetricSnapshot, MetricSnapshotError, ReportSection,
+        ReportValue, validate_count, validate_dimension, validate_entry_count,
+    },
 };
 
 const HISTORY_SIZE: usize = 10;
+const SNAPSHOT_VERSION: u32 = 1;
 const DESCRIPTOR: MetricDescriptor = MetricDescriptor {
     id: "corrections",
     name: "Correction Signals",
@@ -18,6 +24,28 @@ pub struct ErrorRate {
     pending_deleted: Option<String>,
     mistakes: HashMap<String, u64>,
     confusions: HashMap<(String, String), u64>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotV1 {
+    deletions: Vec<DeletionCount>,
+    corrections: Vec<CorrectionCount>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DeletionCount {
+    text: String,
+    count: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CorrectionCount {
+    deleted: String,
+    typed: String,
+    count: u64,
 }
 
 impl Metric for ErrorRate {
@@ -94,6 +122,108 @@ impl Metric for ErrorRate {
                 },
             ],
         }
+    }
+
+    fn has_data(&self) -> bool {
+        !self.mistakes.is_empty() || !self.confusions.is_empty()
+    }
+
+    fn snapshot(&self) -> Result<MetricSnapshot, MetricSnapshotError> {
+        let entries = self
+            .mistakes
+            .len()
+            .checked_add(self.confusions.len())
+            .ok_or_else(|| {
+                MetricSnapshotError::invalid_payload(DESCRIPTOR.id, "too many dimension entries")
+            })?;
+        validate_entry_count(DESCRIPTOR.id, entries)?;
+
+        let mut deletions = Vec::with_capacity(self.mistakes.len());
+        for (text, count) in &self.mistakes {
+            validate_dimension(DESCRIPTOR.id, text)?;
+            validate_count(DESCRIPTOR.id, *count)?;
+            deletions.push(DeletionCount {
+                text: text.clone(),
+                count: *count,
+            });
+        }
+        deletions.sort_by(|left, right| left.text.cmp(&right.text));
+
+        let mut corrections = Vec::with_capacity(self.confusions.len());
+        for ((deleted, typed), count) in &self.confusions {
+            validate_dimension(DESCRIPTOR.id, deleted)?;
+            validate_dimension(DESCRIPTOR.id, typed)?;
+            validate_count(DESCRIPTOR.id, *count)?;
+            corrections.push(CorrectionCount {
+                deleted: deleted.clone(),
+                typed: typed.clone(),
+                count: *count,
+            });
+        }
+        corrections.sort_by(|left, right| {
+            left.deleted
+                .cmp(&right.deleted)
+                .then_with(|| left.typed.cmp(&right.typed))
+        });
+
+        MetricSnapshot::encode(
+            DESCRIPTOR.id,
+            SNAPSHOT_VERSION,
+            &SnapshotV1 {
+                deletions,
+                corrections,
+            },
+        )
+    }
+
+    fn restore(&mut self, snapshot: &MetricSnapshot) -> Result<(), MetricSnapshotError> {
+        let state: SnapshotV1 = snapshot.decode(DESCRIPTOR.id, SNAPSHOT_VERSION)?;
+        let entries = state
+            .deletions
+            .len()
+            .checked_add(state.corrections.len())
+            .ok_or_else(|| {
+                MetricSnapshotError::invalid_payload(DESCRIPTOR.id, "too many dimension entries")
+            })?;
+        validate_entry_count(DESCRIPTOR.id, entries)?;
+
+        let mut deletion_labels = HashSet::with_capacity(state.deletions.len());
+        let mut mistakes = HashMap::with_capacity(state.deletions.len());
+        for deletion in state.deletions {
+            validate_dimension(DESCRIPTOR.id, &deletion.text)?;
+            validate_count(DESCRIPTOR.id, deletion.count)?;
+            if !deletion_labels.insert(deletion.text.clone()) {
+                return Err(MetricSnapshotError::invalid_payload(
+                    DESCRIPTOR.id,
+                    "duplicate deletion dimension",
+                ));
+            }
+            mistakes.insert(deletion.text, deletion.count);
+        }
+
+        let mut correction_pairs = HashSet::with_capacity(state.corrections.len());
+        let mut confusions = HashMap::with_capacity(state.corrections.len());
+        for correction in state.corrections {
+            validate_dimension(DESCRIPTOR.id, &correction.deleted)?;
+            validate_dimension(DESCRIPTOR.id, &correction.typed)?;
+            validate_count(DESCRIPTOR.id, correction.count)?;
+            let pair = (correction.deleted, correction.typed);
+            if !correction_pairs.insert(pair.clone()) {
+                return Err(MetricSnapshotError::invalid_payload(
+                    DESCRIPTOR.id,
+                    "duplicate correction dimension",
+                ));
+            }
+            confusions.insert(pair, correction.count);
+        }
+
+        *self = Self {
+            history: VecDeque::new(),
+            pending_deleted: None,
+            mistakes,
+            confusions,
+        };
+        Ok(())
     }
 
     fn reset(&mut self) {

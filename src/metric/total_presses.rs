@@ -1,8 +1,14 @@
+use serde::{Deserialize, Serialize};
+
 use crate::{
     input::{KeyEvent, KeyEventKind},
-    metric::{Metric, MetricDescriptor, MetricReport, ReportSection, ReportValue},
+    metric::{
+        Metric, MetricDescriptor, MetricReport, MetricSnapshot, MetricSnapshotError, ReportSection,
+        ReportValue,
+    },
 };
 
+const SNAPSHOT_VERSION: u32 = 1;
 const DESCRIPTOR: MetricDescriptor = MetricDescriptor {
     id: "total-presses",
     name: "Total Key Presses",
@@ -11,6 +17,12 @@ const DESCRIPTOR: MetricDescriptor = MetricDescriptor {
 
 #[derive(Default)]
 pub struct TotalPresses {
+    count: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotV1 {
     count: u64,
 }
 
@@ -32,6 +44,24 @@ impl Metric for TotalPresses {
                 value: ReportValue::Count(self.count),
             }],
         }
+    }
+
+    fn has_data(&self) -> bool {
+        self.count > 0
+    }
+
+    fn snapshot(&self) -> Result<MetricSnapshot, MetricSnapshotError> {
+        MetricSnapshot::encode(
+            DESCRIPTOR.id,
+            SNAPSHOT_VERSION,
+            &SnapshotV1 { count: self.count },
+        )
+    }
+
+    fn restore(&mut self, snapshot: &MetricSnapshot) -> Result<(), MetricSnapshotError> {
+        let state: SnapshotV1 = snapshot.decode(DESCRIPTOR.id, SNAPSHOT_VERSION)?;
+        self.count = state.count;
+        Ok(())
     }
 
     fn reset(&mut self) {

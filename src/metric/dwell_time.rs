@@ -1,10 +1,19 @@
-use std::{collections::HashMap, time::SystemTime};
+use std::{
+    collections::{HashMap, HashSet},
+    time::SystemTime,
+};
+
+use serde::{Deserialize, Serialize};
 
 use crate::{
     input::{KeyEvent, KeyEventKind, PhysicalKey},
-    metric::{DurationStats, Metric, MetricDescriptor, MetricReport, ReportSection, ReportValue},
+    metric::{
+        DurationStats, Metric, MetricDescriptor, MetricReport, MetricSnapshot, MetricSnapshotError,
+        ReportSection, ReportValue, validate_dimension, validate_entry_count,
+    },
 };
 
+const SNAPSHOT_VERSION: u32 = 1;
 const DESCRIPTOR: MetricDescriptor = MetricDescriptor {
     id: "dwell-time",
     name: "Dwell Time",
@@ -20,6 +29,20 @@ struct PressedKey {
 pub struct DwellTime {
     pressed_keys: HashMap<PhysicalKey, PressedKey>,
     stats: HashMap<String, DurationStats>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotV1 {
+    entries: Vec<DurationEntry>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DurationEntry {
+    text: String,
+    total_ns: u64,
+    samples: u64,
 }
 
 impl Metric for DwellTime {
@@ -79,6 +102,52 @@ impl Metric for DwellTime {
                     .collect(),
             }],
         }
+    }
+
+    fn has_data(&self) -> bool {
+        !self.stats.is_empty()
+    }
+
+    fn snapshot(&self) -> Result<MetricSnapshot, MetricSnapshotError> {
+        validate_entry_count(DESCRIPTOR.id, self.stats.len())?;
+        let mut entries = Vec::with_capacity(self.stats.len());
+        for (text, stats) in &self.stats {
+            validate_dimension(DESCRIPTOR.id, text)?;
+            let (total_ns, samples) = stats.snapshot_parts(DESCRIPTOR.id)?;
+            entries.push(DurationEntry {
+                text: text.clone(),
+                total_ns,
+                samples,
+            });
+        }
+        entries.sort_by(|left, right| left.text.cmp(&right.text));
+        MetricSnapshot::encode(DESCRIPTOR.id, SNAPSHOT_VERSION, &SnapshotV1 { entries })
+    }
+
+    fn restore(&mut self, snapshot: &MetricSnapshot) -> Result<(), MetricSnapshotError> {
+        let state: SnapshotV1 = snapshot.decode(DESCRIPTOR.id, SNAPSHOT_VERSION)?;
+        validate_entry_count(DESCRIPTOR.id, state.entries.len())?;
+
+        let mut labels = HashSet::with_capacity(state.entries.len());
+        let mut stats = HashMap::with_capacity(state.entries.len());
+        for entry in state.entries {
+            validate_dimension(DESCRIPTOR.id, &entry.text)?;
+            if !labels.insert(entry.text.clone()) {
+                return Err(MetricSnapshotError::invalid_payload(
+                    DESCRIPTOR.id,
+                    "duplicate duration dimension",
+                ));
+            }
+            let duration =
+                DurationStats::from_snapshot_parts(DESCRIPTOR.id, entry.total_ns, entry.samples)?;
+            stats.insert(entry.text, duration);
+        }
+
+        *self = Self {
+            pressed_keys: HashMap::new(),
+            stats,
+        };
+        Ok(())
     }
 
     fn reset(&mut self) {

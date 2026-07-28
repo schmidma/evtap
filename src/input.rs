@@ -15,6 +15,14 @@ impl PhysicalKey {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "physical key codes are consumed by the next persistence milestone"
+    )]
+    pub fn code(&self) -> u16 {
+        self.code
+    }
+
     pub fn label(&self) -> &str {
         &self.label
     }

@@ -1,12 +1,21 @@
-use std::{collections::HashMap, time::Duration, time::SystemTime};
+use std::{
+    collections::{HashMap, HashSet},
+    time::{Duration, SystemTime},
+};
+
+use serde::{Deserialize, Serialize};
 
 use crate::{
     input::{KeyEvent, KeyEventKind},
-    metric::{DurationStats, Metric, MetricDescriptor, MetricReport, ReportSection, ReportValue},
+    metric::{
+        DurationStats, Metric, MetricDescriptor, MetricReport, MetricSnapshot, MetricSnapshotError,
+        ReportSection, ReportValue, validate_dimension, validate_entry_count,
+    },
 };
 
 const TYPING_FLOW_TIMEOUT: Duration = Duration::from_secs(2);
 const MINIMUM_SAMPLES: u64 = 3;
+const SNAPSHOT_VERSION: u32 = 1;
 const DESCRIPTOR: MetricDescriptor = MetricDescriptor {
     id: "bigram-speed",
     name: "Bigram Speed",
@@ -17,6 +26,21 @@ const DESCRIPTOR: MetricDescriptor = MetricDescriptor {
 pub struct BigramSpeed {
     last_press: Option<(String, SystemTime)>,
     stats: HashMap<(String, String), DurationStats>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotV1 {
+    pairs: Vec<BigramEntry>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BigramEntry {
+    first: String,
+    second: String,
+    total_ns: u64,
+    samples: u64,
 }
 
 impl BigramSpeed {
@@ -87,6 +111,60 @@ impl Metric for BigramSpeed {
                 },
             ],
         }
+    }
+
+    fn has_data(&self) -> bool {
+        !self.stats.is_empty()
+    }
+
+    fn snapshot(&self) -> Result<MetricSnapshot, MetricSnapshotError> {
+        validate_entry_count(DESCRIPTOR.id, self.stats.len())?;
+        let mut pairs = Vec::with_capacity(self.stats.len());
+        for ((first, second), stats) in &self.stats {
+            validate_dimension(DESCRIPTOR.id, first)?;
+            validate_dimension(DESCRIPTOR.id, second)?;
+            let (total_ns, samples) = stats.snapshot_parts(DESCRIPTOR.id)?;
+            pairs.push(BigramEntry {
+                first: first.clone(),
+                second: second.clone(),
+                total_ns,
+                samples,
+            });
+        }
+        pairs.sort_by(|left, right| {
+            left.first
+                .cmp(&right.first)
+                .then_with(|| left.second.cmp(&right.second))
+        });
+        MetricSnapshot::encode(DESCRIPTOR.id, SNAPSHOT_VERSION, &SnapshotV1 { pairs })
+    }
+
+    fn restore(&mut self, snapshot: &MetricSnapshot) -> Result<(), MetricSnapshotError> {
+        let state: SnapshotV1 = snapshot.decode(DESCRIPTOR.id, SNAPSHOT_VERSION)?;
+        validate_entry_count(DESCRIPTOR.id, state.pairs.len())?;
+
+        let mut dimensions = HashSet::with_capacity(state.pairs.len());
+        let mut stats = HashMap::with_capacity(state.pairs.len());
+        for entry in state.pairs {
+            validate_dimension(DESCRIPTOR.id, &entry.first)?;
+            validate_dimension(DESCRIPTOR.id, &entry.second)?;
+            let pair = (entry.first, entry.second);
+            if !dimensions.insert(pair.clone()) {
+                return Err(MetricSnapshotError::invalid_payload(
+                    DESCRIPTOR.id,
+                    "duplicate bigram dimension",
+                ));
+            }
+            let duration =
+                DurationStats::from_snapshot_parts(DESCRIPTOR.id, entry.total_ns, entry.samples)?;
+            stats.insert(pair, duration);
+        }
+
+        *self = Self {
+            last_press: None,
+            stats,
+        };
+        Ok(())
     }
 
     fn reset(&mut self) {

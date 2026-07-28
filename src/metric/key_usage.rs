@@ -1,10 +1,16 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+use serde::{Deserialize, Serialize};
 
 use crate::{
     input::{KeyEvent, KeyEventKind, PhysicalKey},
-    metric::{Metric, MetricDescriptor, MetricReport, ReportSection, ReportValue},
+    metric::{
+        Metric, MetricDescriptor, MetricReport, MetricSnapshot, MetricSnapshotError, ReportSection,
+        ReportValue, validate_count, validate_dimension, validate_entry_count,
+    },
 };
 
+const SNAPSHOT_VERSION: u32 = 1;
 const DESCRIPTOR: MetricDescriptor = MetricDescriptor {
     id: "key-usage",
     name: "Key Usage",
@@ -14,6 +20,20 @@ const DESCRIPTOR: MetricDescriptor = MetricDescriptor {
 #[derive(Default)]
 pub struct KeyUsage {
     counts: HashMap<PhysicalKey, u64>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotV1 {
+    keys: Vec<KeyCount>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct KeyCount {
+    code: u16,
+    label: String,
+    count: u64,
 }
 
 impl Metric for KeyUsage {
@@ -50,6 +70,52 @@ impl Metric for KeyUsage {
                     .collect(),
             }],
         }
+    }
+
+    fn has_data(&self) -> bool {
+        !self.counts.is_empty()
+    }
+
+    fn snapshot(&self) -> Result<MetricSnapshot, MetricSnapshotError> {
+        validate_entry_count(DESCRIPTOR.id, self.counts.len())?;
+        let mut keys = Vec::with_capacity(self.counts.len());
+        for (key, count) in &self.counts {
+            validate_dimension(DESCRIPTOR.id, key.label())?;
+            validate_count(DESCRIPTOR.id, *count)?;
+            keys.push(KeyCount {
+                code: key.code(),
+                label: key.label().to_owned(),
+                count: *count,
+            });
+        }
+        keys.sort_by(|left, right| {
+            left.code
+                .cmp(&right.code)
+                .then_with(|| left.label.cmp(&right.label))
+        });
+        MetricSnapshot::encode(DESCRIPTOR.id, SNAPSHOT_VERSION, &SnapshotV1 { keys })
+    }
+
+    fn restore(&mut self, snapshot: &MetricSnapshot) -> Result<(), MetricSnapshotError> {
+        let state: SnapshotV1 = snapshot.decode(DESCRIPTOR.id, SNAPSHOT_VERSION)?;
+        validate_entry_count(DESCRIPTOR.id, state.keys.len())?;
+
+        let mut codes = HashSet::with_capacity(state.keys.len());
+        let mut counts = HashMap::with_capacity(state.keys.len());
+        for key in state.keys {
+            validate_dimension(DESCRIPTOR.id, &key.label)?;
+            validate_count(DESCRIPTOR.id, key.count)?;
+            if !codes.insert(key.code) {
+                return Err(MetricSnapshotError::invalid_payload(
+                    DESCRIPTOR.id,
+                    "duplicate physical key code",
+                ));
+            }
+            counts.insert(PhysicalKey::new(key.code, key.label), key.count);
+        }
+
+        self.counts = counts;
+        Ok(())
     }
 
     fn reset(&mut self) {
