@@ -27,6 +27,7 @@ All notable changes to evtap are documented here. The format is based on [Keep a
 
 ### Fixed
 
+- Proportional UI text now falls back to egui's bundled Hack font for symbols such as the bigram arrow.
 - Keyboard modifiers and locks now update XKB state across press and release events.
 - Background capture and scanning now wake the GUI when data arrives.
 - Listener read failures terminate cleanly instead of repeatedly emitting stop events.

@@ -16,6 +16,8 @@ use crate::{
     xkb_helper,
 };
 
+const HACK_FONT_NAME: &str = "Hack";
+
 pub struct App {
     devices: Option<Vec<DeviceMetadata>>,
     selected_device: Option<usize>,
@@ -52,6 +54,8 @@ enum ListenerState {
 
 impl App {
     pub fn new(creation_context: &eframe::CreationContext<'_>) -> Result<Self> {
+        creation_context.egui_ctx.set_fonts(font_definitions());
+
         let repaint_context = creation_context.egui_ctx.clone();
         let wake_signal = WakeSignal::new(move || repaint_context.request_repaint());
         let scanner = scanner::spawn(wake_signal.clone());
@@ -446,6 +450,18 @@ impl App {
     }
 }
 
+fn font_definitions() -> egui::FontDefinitions {
+    let mut fonts = egui::FontDefinitions::default();
+    let proportional = fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default();
+    if !proportional.iter().any(|font| font == HACK_FONT_NAME) {
+        proportional.push(HACK_FONT_NAME.to_owned());
+    }
+    fonts
+}
+
 fn init_keyboard_state(model: &str, layout: &str, variant: &str) -> Result<xkb::State> {
     let context = Context::new(xkb::CONTEXT_NO_FLAGS);
     let keymap = Keymap::new_from_names(
@@ -489,5 +505,25 @@ impl eframe::App for App {
                 }
             });
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::font_definitions;
+    use eframe::egui;
+
+    #[test]
+    fn proportional_font_family_supports_bigram_arrow() {
+        let context = egui::Context::default();
+        context.set_fonts(font_definitions());
+        let mut has_arrow = false;
+
+        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+            has_arrow =
+                ui.fonts_mut(|fonts| fonts.has_glyph(&egui::FontId::proportional(14.0), '→'));
+        });
+
+        assert!(has_arrow);
     }
 }
