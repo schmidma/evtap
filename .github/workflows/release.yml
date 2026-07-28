@@ -58,7 +58,7 @@ jobs:
               --mtime="@${source_date_epoch}" \
               --owner=0 --group=0 --numeric-owner \
               -C dist -cf - "$directory" | gzip -n > "dist/${archive}"
-          sha256sum "dist/${archive}" > "dist/${archive}.sha256"
+          (cd dist && sha256sum "$archive" > "${archive}.sha256")
 
           echo "archive=dist/${archive}" >> "$GITHUB_OUTPUT"
           echo "checksum=dist/${archive}.sha256" >> "$GITHUB_OUTPUT"
