@@ -28,6 +28,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let app_paths = AppPaths::discover()?;
+    app_paths.prepare_data_dir()?;
     let options = eframe::NativeOptions {
         persistence_path: Some(app_paths.eframe_file()),
         ..Default::default()

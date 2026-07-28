@@ -1,8 +1,3 @@
-#![allow(
-    dead_code,
-    reason = "storage worker integration is completed by the lifecycle milestone"
-)]
-
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -25,12 +20,6 @@ pub const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub struct DirtyGeneration(u64);
-
-impl DirtyGeneration {
-    pub fn get(self) -> u64 {
-        self.0
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StorageStatus {
@@ -98,10 +87,7 @@ impl DirtyTracker {
         self.status
     }
 
-    pub fn current(&self) -> DirtyGeneration {
-        self.current
-    }
-
+    #[cfg(test)]
     pub fn saved(&self) -> DirtyGeneration {
         self.saved
     }
@@ -471,6 +457,7 @@ pub enum StorageWorkerError {
 struct WorkerState {
     repository: Option<Repository>,
     active_session_id: Option<SessionId>,
+    finalized_since_checkpoint: bool,
     database_path: PathBuf,
 }
 
@@ -479,6 +466,7 @@ impl WorkerState {
         Self {
             repository: None,
             active_session_id: None,
+            finalized_since_checkpoint: false,
             database_path,
         }
     }
@@ -490,6 +478,7 @@ impl WorkerState {
     ) -> Result<(Option<StoredSession>, usize), String> {
         self.repository = None;
         self.active_session_id = None;
+        self.finalized_since_checkpoint = false;
         let mut repository =
             Repository::open(self.database_path.clone()).map_err(|error| error.to_string())?;
         let retained_sessions = repository
@@ -513,6 +502,7 @@ impl WorkerState {
             .checkpoint(&request.snapshot)
             .map_err(|error| error.to_string())?;
         self.active_session_id = Some(session_id);
+        self.finalized_since_checkpoint = false;
         Ok(session_id)
     }
 
@@ -530,6 +520,7 @@ impl WorkerState {
             .finalize(&request.snapshot, completed_at_ms)
             .map_err(|error| error.to_string())?;
         self.active_session_id = None;
+        self.finalized_since_checkpoint = true;
         Ok(session_id)
     }
 
@@ -602,6 +593,7 @@ impl WorkerState {
     ) -> Result<(), String> {
         self.repository = None;
         self.active_session_id = None;
+        self.finalized_since_checkpoint = false;
         remove_database_files(&self.database_path)?;
         if reopen {
             let (active, _) = self.open(retention, now_ms)?;
@@ -919,6 +911,9 @@ fn worker_main(
                     .as_ref()
                     .map(|checkpoint| checkpoint.generation);
                 let final_checkpoint_saved = final_checkpoint.is_none_or(|checkpoint| {
+                    if state.finalized_since_checkpoint {
+                        return true;
+                    }
                     let generation = checkpoint.generation;
                     match state.checkpoint(checkpoint) {
                         Ok(session_id) => {
@@ -1262,7 +1257,13 @@ mod tests {
                 deleted: true,
             } if deleted_id == session_id
         ));
-        worker.shutdown(None).unwrap();
+        let shutdown = worker
+            .shutdown(Some(CheckpointRequest {
+                generation: DirtyGeneration(3),
+                snapshot: snapshot(5_000),
+            }))
+            .unwrap();
+        assert!(shutdown.final_checkpoint_saved);
 
         let (wake, _) = wake_signal();
         let worker = StorageWorker::spawn(path, RetentionPolicy::Days(90), 5_000, wake).unwrap();

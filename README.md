@@ -7,14 +7,14 @@
 > [!WARNING]
 > evtap observes global keyboard input from the selected device while listening. Treat it like a keylogger even though it processes data locally and does not save raw input. Read the [privacy model](docs/privacy.md) before use.
 
-evtap is currently pre-1.0 software. The first supported release line is `0.1.x`; interfaces and behavior may still change between minor versions.
+evtap is pre-1.0 software. `0.1.x` is the session-only baseline; the current `0.2` development line adds explicitly opt-in local aggregate persistence. Interfaces and behavior may still change between minor versions.
 
 ## Current scope
 
 - Linux desktop application using evdev input devices
 - One explicitly selected keyboard at a time
-- Session-only, in-memory analytics
-- No export, persistence, telemetry, or network behavior
+- In-memory analytics by default, with optional local aggregate session history
+- No raw-event persistence, export, telemetry, cloud account, or network requests
 - Ranked key-usage table rather than a physical keyboard heatmap
 - Manual XKB model, layout, and variant selection
 
@@ -103,10 +103,27 @@ If evtap cannot inspect any input devices, it displays a permission message rath
 3. Select the XKB model, layout, and variant matching that keyboard. Blank model/layout values use XKB defaults.
 4. Choose **Start listening**.
 5. Type normally in other applications; evtap updates when global events arrive.
-6. Choose **Stop listening** to retain and inspect the current session results.
-7. Choose **Reset session** to clear every metric.
+6. Choose **Stop listening** to pause capture while retaining the active session.
+7. Choose **Discard current session** when persistence is off. With persistence enabled, use **Finish session** to archive it or **Discard session** to delete it.
+8. Open **History** to inspect or delete completed sessions when persistence is enabled.
 
-Keyboard selection and XKB configuration are locked while listening so that a session does not change interpretation midway through a pressed-key sequence.
+Keyboard and XKB configuration become fixed when a capture session starts. A recovered session resumes paused and never starts capture automatically.
+
+## Optional aggregate persistence
+
+Persistence is off by default. Enabling it requires an in-app disclosure explaining that aggregate labels can still be sensitive. When enabled, evtap stores versioned metric snapshots in a local, unencrypted SQLite database and uses a 90-day completed-session retention policy by default. Available retention choices are 30, 90, or 365 days, or forever.
+
+Expected Linux locations are:
+
+```text
+$XDG_CONFIG_HOME/evtap/settings.json
+$XDG_DATA_HOME/evtap/app.ron
+$XDG_DATA_HOME/evtap/evtap.sqlite3
+```
+
+with the usual `~/.config` and `~/.local/share` fallbacks. `settings.json` records consent, retention, and XKB preferences. `app.ron` contains native window state only. `evtap.sqlite3` contains session metadata and aggregate metric snapshots. evtap creates private application directories and files with restrictive Unix permissions, but the database is not encrypted and filesystem backups or privileged processes can still read it.
+
+Active sessions are checkpointed approximately every 30 seconds while dirty, immediately after capture stops, during finishing, and during graceful exit. A crash can lose changes after the latest committed checkpoint. See the [persistence specification](docs/persistence-spec.md) and [privacy model](docs/privacy.md) for exact fields and lifecycle behavior.
 
 ## Keyboard layout behavior
 
@@ -116,20 +133,21 @@ Physical metrics such as key usage identify the key itself. Text-oriented metric
 
 ## Privacy
 
-While listening, evtap:
+evtap:
 
-- reads global events from one keyboard;
+- reads global events from one explicitly selected keyboard only while listening;
 - computes aggregate metrics locally;
-- keeps only bounded transient text needed for correction inference;
-- does not persist raw events or typed text;
+- keeps bounded transient state needed for timing and correction inference;
+- never persists raw events, ordered text, event timestamps, pressed-key state, or transient correction history;
+- can optionally persist sensitive aggregate labels, counts, and duration totals;
 - does not export, transmit, or send telemetry;
-- discards the entire session when reset or when the process exits.
+- discards the active session on exit when persistence is off, or checkpoints it for paused recovery when persistence is enabled.
 
 More detail is available in [docs/privacy.md](docs/privacy.md).
 
 ## Development
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, quality checks, architecture boundaries, metric-extension guidance, and privacy requirements. The current release plan is in [ROADMAP.md](ROADMAP.md), and notable changes are tracked in [CHANGELOG.md](CHANGELOG.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, quality checks, architecture boundaries, metric-extension guidance, and privacy requirements. Persistence prereleases use the [manual validation guide](docs/persistence-validation.md). The current release plan is in [ROADMAP.md](ROADMAP.md), and notable changes are tracked in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

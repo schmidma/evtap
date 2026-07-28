@@ -1,8 +1,3 @@
-#![allow(
-    dead_code,
-    reason = "settings are consumed by the persistence lifecycle milestone"
-)]
-
 use std::{
     fs::{self, DirBuilder, File, OpenOptions},
     io::{Read, Write},
@@ -154,10 +149,6 @@ pub struct SettingsStore {
 impl SettingsStore {
     pub fn new(path: PathBuf) -> Self {
         Self { path }
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 
     pub fn load(&self) -> Result<Settings, SettingsError> {
@@ -367,7 +358,10 @@ pub enum SettingsError {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::PermissionsExt as _};
+    use std::{
+        fs,
+        os::unix::fs::{PermissionsExt as _, symlink},
+    };
 
     use tempfile::tempdir;
 
@@ -431,6 +425,30 @@ mod tests {
             Err(SettingsError::UnsupportedSchemaVersion { actual: 2, .. })
         ));
         assert_eq!(fs::read(path).unwrap(), original);
+    }
+
+    #[test]
+    fn rejects_symlinked_and_oversized_settings_without_modifying_them() {
+        let temporary = tempdir().unwrap();
+        let target = temporary.path().join("target.json");
+        let path = temporary.path().join("settings.json");
+        fs::write(&target, b"sensitive target").unwrap();
+        symlink(&target, &path).unwrap();
+        let store = SettingsStore::new(path);
+
+        assert!(matches!(store.load(), Err(SettingsError::UnsafePath)));
+        assert!(matches!(
+            store.save(&Settings::default()),
+            Err(SettingsError::UnsafePath)
+        ));
+        assert_eq!(fs::read(&target).unwrap(), b"sensitive target");
+
+        let oversized = temporary.path().join("oversized.json");
+        fs::write(&oversized, vec![b' '; 1024 * 1024 + 1]).unwrap();
+        assert!(matches!(
+            SettingsStore::new(oversized).load(),
+            Err(SettingsError::FileTooLarge)
+        ));
     }
 
     #[test]

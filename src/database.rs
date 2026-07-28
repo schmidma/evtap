@@ -1,8 +1,3 @@
-#![allow(
-    dead_code,
-    reason = "database repository is consumed by the storage worker milestone"
-)]
-
 use std::{
     collections::HashSet,
     fs::{self, DirBuilder, OpenOptions},
@@ -79,7 +74,6 @@ PRAGMA user_version = 1;
 
 pub struct Repository {
     connection: Connection,
-    path: Option<PathBuf>,
 }
 
 impl Repository {
@@ -93,10 +87,7 @@ impl Repository {
         )?;
         set_private_permissions(&path, 0o600)?;
 
-        let mut repository = Self {
-            connection,
-            path: Some(path),
-        };
+        let mut repository = Self { connection };
         repository.configure(true)?;
         Ok(repository)
     }
@@ -104,16 +95,9 @@ impl Repository {
     #[cfg(test)]
     pub fn open_in_memory() -> Result<Self, RepositoryError> {
         let connection = Connection::open_in_memory()?;
-        let mut repository = Self {
-            connection,
-            path: None,
-        };
+        let mut repository = Self { connection };
         repository.configure(false)?;
         Ok(repository)
-    }
-
-    pub fn path(&self) -> Option<&Path> {
-        self.path.as_deref()
     }
 
     pub fn checkpoint(&mut self, snapshot: &SessionSnapshot) -> Result<SessionId, RepositoryError> {
@@ -348,15 +332,6 @@ impl Repository {
              WHERE status = 'completed' AND completed_at_ms < ?1",
             [cutoff],
         )?;
-        transaction.commit()?;
-        Ok(changed)
-    }
-
-    pub fn clear_all(&mut self) -> Result<usize, RepositoryError> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed = transaction.execute("DELETE FROM sessions", [])?;
         transaction.commit()?;
         Ok(changed)
     }
@@ -762,7 +737,10 @@ pub enum RepositoryError {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::PermissionsExt as _};
+    use std::{
+        fs,
+        os::unix::fs::{PermissionsExt as _, symlink},
+    };
 
     use rusqlite::Connection;
     use tempfile::tempdir;
@@ -802,7 +780,6 @@ mod tests {
         let path = temporary.path().join("data/evtap.sqlite3");
         let repository = Repository::open(path.clone()).unwrap();
 
-        assert_eq!(repository.path(), Some(path.as_path()));
         assert_eq!(
             fs::metadata(path.parent().unwrap())
                 .unwrap()
@@ -825,6 +802,21 @@ mod tests {
             .unwrap();
         assert_eq!(application_id, APPLICATION_ID);
         assert_eq!(schema_version, DATABASE_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn rejects_symlinked_database_without_modifying_its_target() {
+        let temporary = tempdir().unwrap();
+        let target = temporary.path().join("target.sqlite3");
+        let path = temporary.path().join("evtap.sqlite3");
+        fs::write(&target, b"sensitive target").unwrap();
+        symlink(&target, &path).unwrap();
+
+        assert!(matches!(
+            Repository::open(path),
+            Err(RepositoryError::UnsafeDatabasePath)
+        ));
+        assert_eq!(fs::read(target).unwrap(), b"sensitive target");
     }
 
     #[test]
@@ -880,6 +872,35 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_failure_rolls_back_the_whole_checkpoint() {
+        let mut repository = Repository::open_in_memory().unwrap();
+        repository
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_metric_insert
+                 BEFORE INSERT ON metric_snapshots
+                 BEGIN SELECT RAISE(ABORT, 'injected checkpoint failure'); END;",
+            )
+            .unwrap();
+
+        assert!(matches!(
+            repository.checkpoint(&snapshot(None, 2_000)),
+            Err(RepositoryError::Sqlite(_))
+        ));
+        let session_count: i64 = repository
+            .connection
+            .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        let metric_count: i64 = repository
+            .connection
+            .query_row("SELECT count(*) FROM metric_snapshots", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!((session_count, metric_count), (0, 0));
+    }
+
+    #[test]
     fn finalizes_lists_retains_and_deletes_sessions() {
         let mut repository = Repository::open_in_memory().unwrap();
         let session_id = repository.checkpoint(&snapshot(None, 2_000)).unwrap();
@@ -892,6 +913,7 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].metadata.status, SessionStatus::Completed);
         assert_eq!(history[0].total_presses, Some(12));
+        let active_id = repository.checkpoint(&snapshot(None, 5_000)).unwrap();
         assert_eq!(
             repository
                 .apply_retention(4_000, RetentionPolicy::Forever)
@@ -905,6 +927,10 @@ mod tests {
             1
         );
         assert!(repository.load_session(session_id).unwrap().is_none());
+        assert_eq!(
+            repository.load_active().unwrap().unwrap().metadata.id,
+            active_id
+        );
     }
 
     #[test]
@@ -933,6 +959,38 @@ mod tests {
         );
         assert_eq!(second_page.len(), 1);
         assert_eq!(second_page[0].metadata.id, completed[0]);
+    }
+
+    #[test]
+    fn failed_migration_rolls_back_schema_and_version() {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("migration.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .pragma_update(None, "application_id", APPLICATION_ID)
+            .unwrap();
+        connection
+            .execute("CREATE TABLE sessions (sentinel TEXT NOT NULL)", [])
+            .unwrap();
+        connection
+            .execute("INSERT INTO sessions VALUES ('preserved')", [])
+            .unwrap();
+        drop(connection);
+
+        assert!(matches!(
+            Repository::open(path.clone()),
+            Err(RepositoryError::Sqlite(_))
+        ));
+
+        let connection = Connection::open(path).unwrap();
+        let schema_version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        let sentinel: String = connection
+            .query_row("SELECT sentinel FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(schema_version, 0);
+        assert_eq!(sentinel, "preserved");
     }
 
     #[test]

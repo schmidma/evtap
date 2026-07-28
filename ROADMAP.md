@@ -34,9 +34,29 @@ The `0.1.x` goal is a trustworthy Linux-only beta for personal use.
 
 ## 0.2 — opt-in aggregate persistence
 
-The [accepted persistence specification](docs/persistence-spec.md) defines local, versioned aggregate storage without raw event history. Implementation has not started.
+The [accepted persistence specification](docs/persistence-spec.md) defines local, versioned aggregate storage without raw event history. The implementation is now on `main` for prerelease hardening.
 
-The planned scope includes resumable active sessions, completed-session history, retention and deletion controls, privacy-sensitive settings, and separate eframe window-state persistence.
+### Product scope
+
+- Persistence remains off until the user accepts an explicit sensitivity disclosure.
+- Versioned aggregate snapshots never cross the storage boundary as raw events.
+- Active sessions recover paused with transient metric state cleared.
+- Completed history is paginated and rendered through separate metric instances.
+- Retention and per-session/complete deletion are user controlled.
+- Privacy settings, window state, and analytics use separate files.
+
+### Quality gate
+
+- [x] Versioned, deterministic, size-limited snapshots for every bundled metric
+- [x] Durable/transient state separation and restart-safe restoration tests
+- [x] Atomic private settings with unsupported-version protection
+- [x] SQLite identity, schema migration, transactions, retention, and cascading deletion
+- [x] Dedicated worker, dirty generations, 30-second schedule, retries, and bounded shutdown
+- [x] Capture/session separation, configuration locking, finish/discard, and enable/disable flows
+- [x] Paginated history, isolated detail restoration, retention, and deletion UI
+- [x] Rust 1.92, strict Clippy, unit/integration, RustSec, and privacy fault checks
+- [ ] Interactive permission, restart, crash-recovery, disk-failure, retention, and deletion validation
+- [ ] Publish and test a `0.2.0` prerelease before the final tag
 
 ## After 0.2
 

@@ -396,7 +396,13 @@ impl App {
 
     fn handle_storage_event(&mut self, event: StorageEvent) {
         match event {
-            StorageEvent::Opened { active, .. } => {
+            StorageEvent::Opened {
+                active,
+                retained_sessions,
+            } => {
+                if retained_sessions > 0 {
+                    info!(retained_sessions, "removed expired completed sessions");
+                }
                 self.storage_tracker.loaded();
                 self.storage_needs_reopen = false;
                 self.storage_error = None;
@@ -446,8 +452,15 @@ impl App {
             }
             StorageEvent::Finalized {
                 generation,
-                session_id: _,
+                session_id,
             } => {
+                if self.session.id != Some(session_id) {
+                    self.storage_error = Some(
+                        "Storage finalized an unexpected session; in-memory aggregates were preserved."
+                            .to_owned(),
+                    );
+                    return;
+                }
                 if self.storage_tracker.in_flight() == Some(generation) {
                     let _ = self.storage_tracker.acknowledge(generation);
                 }
@@ -464,11 +477,14 @@ impl App {
                 }
             }
             StorageEvent::Discarded {
-                session_id: _,
+                session_id,
                 deleted,
             } => {
                 self.discarding = false;
-                if deleted {
+                if self.session.id != Some(session_id) {
+                    self.storage_error =
+                        Some("Storage acknowledged discard for an unexpected session.".to_owned());
+                } else if deleted {
                     self.reset_current_session();
                 } else {
                     self.storage_error =
@@ -480,8 +496,13 @@ impl App {
                     self.request_history_page(self.history_offset);
                 }
             }
-            StorageEvent::AllDeleted { reopened: _ } => {
+            StorageEvent::AllDeleted { reopened } => {
                 let disable_after = self.deleting_all_to_disable;
+                if reopened == disable_after {
+                    self.storage_error = Some(
+                        "Storage deletion completed with an unexpected reopen state.".to_owned(),
+                    );
+                }
                 self.deleting_all_to_disable = false;
                 self.deleting_all = false;
                 self.confirm_delete_all = false;
@@ -946,6 +967,9 @@ impl App {
     }
 
     fn reset_current_session(&mut self) {
+        for metric in &mut self.metrics {
+            metric.reset();
+        }
         self.metrics = default_metrics();
         self.physical_keys.clear();
         self.session = CurrentSession::default();
@@ -2000,10 +2024,7 @@ impl eframe::App for App {
         }
         self.session.finish_capture_segment();
 
-        let final_checkpoint = if self.settings.persistence_enabled()
-            && self.session.is_active()
-            && self.pending_finish.is_none()
-        {
+        let final_checkpoint = if self.settings.persistence_enabled() && self.session.is_active() {
             let generation = self.storage_tracker.mark_dirty().ok();
             generation.and_then(|generation| {
                 self.session_snapshot()

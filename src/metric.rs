@@ -1,8 +1,3 @@
-#![allow(
-    dead_code,
-    reason = "snapshot APIs are consumed by the next persistence milestone"
-)]
-
 use std::time::Duration;
 
 use serde::{Serialize, de::DeserializeOwned};

@@ -1,6 +1,6 @@
 # Metric definitions
 
-All evtap metrics cover only the current in-memory session. Results are descriptive signals, not ergonomic or medical diagnoses.
+All evtap metrics describe one active or completed session. Results are descriptive signals, not ergonomic or medical diagnoses. Persistence, when explicitly enabled, stores only the durable aggregate fields described below; metric computation still happens in memory.
 
 ## Event terminology
 
@@ -60,6 +60,18 @@ Measures press-to-press time between consecutive text-producing physical presses
 
 A pair appears only after at least three samples. The report shows the five fastest and five slowest average pairs, including sample counts. The labels represent produced text rather than physical key positions, so the configured XKB layout affects them.
 
-## Reset and lifecycle
+## Durable and transient state
 
-**Stop listening** ends capture but preserves the aggregates for inspection. **Reset session** clears every aggregate and transient metric buffer. Closing evtap discards the session.
+When persistence is enabled, metric snapshots contain aggregate counts and dimensions only:
+
+- total physical press count;
+- physical key code, display label, and count;
+- deletion label/count and inferred deleted-to-typed pair/count;
+- flight and dwell label, accumulated duration, and sample count;
+- bigram labels, accumulated duration, and sample count.
+
+Snapshots never contain event timestamps, pressed-key maps, the recent correction buffer, pending deletions, previous-press/release context, or ordered event history. Restoring always starts with fresh transient state, so no timing or correction sample bridges a restart.
+
+## Session lifecycle
+
+**Stop listening** pauses capture but preserves the active session. With persistence off, **Discard current session** clears every aggregate and transient metric buffer. With persistence enabled, **Finish session** archives the latest aggregate snapshot, while **Discard session** deletes the active database row and clears memory only after deletion is acknowledged. Closing evtap discards an in-memory-only session or performs a bounded final checkpoint for an opted-in persisted session.

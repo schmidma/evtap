@@ -175,7 +175,7 @@ impl Listener {
             1 => KeyEventKind::Press,
             2 => KeyEventKind::Repeat,
             _ => {
-                warn!(?key_code, value, "ignoring unknown key value");
+                warn!("ignoring keyboard event with an unknown transition value");
                 return true;
             }
         };

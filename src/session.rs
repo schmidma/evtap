@@ -1,8 +1,3 @@
-#![allow(
-    dead_code,
-    reason = "session types are consumed by the storage worker milestone"
-)]
-
 use std::collections::HashSet;
 
 use crate::metric::{Metric, MetricSnapshot, MetricSnapshotError, default_metrics};

@@ -4,6 +4,28 @@ All notable changes to evtap are documented here. The format is based on [Keep a
 
 ## [Unreleased]
 
+### Added
+
+- Explicitly opt-in local aggregate persistence with a privacy disclosure and 90-day default retention.
+- Versioned, deterministic snapshots for every bundled metric, with strict size and value validation.
+- Private XDG settings, native window-state restoration, and a bundled SQLite analytics database.
+- Crash-recoverable active sessions, periodic transactional checkpoints, dirty-generation acknowledgements, and bounded graceful shutdown.
+- Finish/discard session lifecycle, configuration locking, storage status, retries, and enable/disable resolution flows.
+- Paginated completed-session history, isolated metric detail restoration, retention controls, individual deletion, complete analytics deletion, and disk-usage display.
+- Fault tests for malformed snapshots/settings, symlink paths, transaction rollback, migration failure, corrupt/newer databases, worker recovery, retention, and deletion.
+
+### Changed
+
+- **Stop listening** now pauses the active session instead of implying that the analytics session ended.
+- Session configuration becomes fixed at first capture and recovered sessions resume paused.
+- Privacy, metrics, troubleshooting, roadmap, and contributor documentation now describe the optional aggregate-storage boundary.
+
+### Security
+
+- Raw key events, ordered text, event timestamps, pressed-key state, and transient correction/timing context are excluded from persistent snapshots.
+- Settings and analytics use restrictive Unix permissions, atomic settings replacement, SQLite application identity, foreign keys, secure deletion, and WAL-backed transactions.
+- Unsupported settings or database versions and corrupt/unidentified databases are handled non-destructively rather than reset automatically.
+
 ## [0.1.0] - 2026-07-28
 
 ### Added
