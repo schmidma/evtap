@@ -1,18 +1,52 @@
-use std::{io, time::SystemTime};
+use std::{fmt, io, time::SystemTime};
 
 use camino::Utf8PathBuf;
 use color_eyre::{Result, eyre::Context};
 use evdev::{Device, InputEvent, KeyCode};
 use tokio::{
     select,
-    sync::mpsc::{Receiver, Sender, channel},
+    sync::mpsc::{
+        Receiver, Sender, UnboundedReceiver, UnboundedSender, channel, unbounded_channel,
+    },
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
+use crate::wake::WakeSignal;
+
+const EVENT_CHANNEL_CAPACITY: usize = 2_048;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KeyValue {
     Up,
     Down,
     Repeat,
+}
+
+#[derive(Debug)]
+pub enum StopReason {
+    Requested,
+    OpenFailed(String),
+    EventStreamFailed(String),
+    ReadFailed(String),
+}
+
+impl StopReason {
+    pub fn is_error(&self) -> bool {
+        !matches!(self, Self::Requested)
+    }
+}
+
+impl fmt::Display for StopReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Requested => formatter.write_str("stopped"),
+            Self::OpenFailed(error) => write!(formatter, "failed to open keyboard: {error}"),
+            Self::EventStreamFailed(error) => {
+                write!(formatter, "failed to start keyboard event stream: {error}")
+            }
+            Self::ReadFailed(error) => write!(formatter, "keyboard read failed: {error}"),
+        }
+    }
 }
 
 pub enum Event {
@@ -22,129 +56,150 @@ pub enum Event {
         key_code: KeyCode,
         value: KeyValue,
     },
-    Stopped,
+    Stopped {
+        reason: StopReason,
+    },
 }
 
-pub enum Command {
+enum Command {
     Stop,
 }
 
 pub struct ListenerHandle {
-    sender: Sender<Command>,
-    receiver: Receiver<Event>,
+    command_sender: UnboundedSender<Command>,
+    event_receiver: Receiver<Event>,
 }
 
 impl ListenerHandle {
     pub fn try_recv_event(&mut self) -> Option<Event> {
-        self.receiver.try_recv().ok()
+        self.event_receiver.try_recv().ok()
     }
 
     pub fn stop(&self) -> Result<()> {
-        self.sender
-            .try_send(Command::Stop)
-            .wrap_err("failed to send stop command")
+        self.command_sender
+            .send(Command::Stop)
+            .wrap_err("failed to request listener shutdown")
     }
 }
 
-pub fn spawn(device_path: Utf8PathBuf) -> ListenerHandle {
-    let (command_sender, command_receiver) = channel(1337);
-    let (event_sender, event_receiver) = channel(1337);
+pub fn spawn(device_path: Utf8PathBuf, wake_signal: WakeSignal) -> ListenerHandle {
+    let (command_sender, command_receiver) = unbounded_channel();
+    let (event_sender, event_receiver) = channel(EVENT_CHANNEL_CAPACITY);
     tokio::spawn(async move {
-        let listener = Listener {
+        Listener {
             device_path,
             command_receiver,
             event_sender,
-        };
-        listener.run().await
+            wake_signal,
+        }
+        .run()
+        .await;
     });
     ListenerHandle {
-        sender: command_sender,
-        receiver: event_receiver,
+        command_sender,
+        event_receiver,
     }
 }
 
 struct Listener {
     device_path: Utf8PathBuf,
-    command_receiver: Receiver<Command>,
+    command_receiver: UnboundedReceiver<Command>,
     event_sender: Sender<Event>,
+    wake_signal: WakeSignal,
 }
 
 impl Listener {
-    pub async fn run(mut self) {
+    async fn run(mut self) {
         let device = match Device::open(&self.device_path) {
-            Ok(d) => d,
-            Err(e) => {
-                error!("failed to open device {}: {e:#?}", self.device_path);
-                let _ = self.event_sender.send(Event::Stopped).await;
+            Ok(device) => device,
+            Err(error) => {
+                error!(path = %self.device_path, %error, "failed to open keyboard");
+                self.send_event(Event::Stopped {
+                    reason: StopReason::OpenFailed(error.to_string()),
+                })
+                .await;
                 return;
             }
         };
-        let _ = self.event_sender.send(Event::Connected).await;
 
         let mut device_events = match device.into_event_stream() {
-            Ok(d) => d,
-            Err(err) => {
-                error!(
-                    "failed to create event stream for device {}: {err:#?}",
-                    self.device_path
-                );
-                let _ = self.event_sender.send(Event::Stopped).await;
+            Ok(events) => events,
+            Err(error) => {
+                error!(path = %self.device_path, %error, "failed to create keyboard event stream");
+                self.send_event(Event::Stopped {
+                    reason: StopReason::EventStreamFailed(error.to_string()),
+                })
+                .await;
                 return;
             }
         };
+
+        if !self.send_event(Event::Connected).await {
+            return;
+        }
 
         loop {
             select! {
+                biased;
                 command = self.command_receiver.recv() => {
                     match command {
                         Some(Command::Stop) => {
-                            let _ = self.event_sender.send(Event::Stopped).await;
-                            return;
+                            self.send_event(Event::Stopped {
+                                reason: StopReason::Requested,
+                            }).await;
                         }
-                        None => {
-                            info!("Listener command channel closed, shutting down.");
-                            let _ = self.event_sender.send(Event::Stopped).await;
-                            return;
-                        }
+                        None => info!("listener command channel closed, shutting down"),
                     }
+                    return;
                 }
-                maybe_event = device_events.next_event() => {
-                    self.handle_event(maybe_event).await;
+                event = device_events.next_event() => {
+                    if !self.handle_event(event).await {
+                        return;
+                    }
                 }
             }
         }
     }
 
-    async fn handle_event(&self, maybe_event: io::Result<InputEvent>) {
-        match maybe_event {
-            Ok(event) => {
-                if let evdev::EventSummary::Key(key_event, key_code, value) = event.destructure() {
-                    let value = match value {
-                        0 => KeyValue::Up,
-                        1 => KeyValue::Down,
-                        2 => KeyValue::Repeat,
-                        _ => {
-                            error!("unknown key value {value} for key code {key_code:?}");
-                            return;
-                        }
-                    };
-                    let _ = self
-                        .event_sender
-                        .send(Event::Input {
-                            timestamp: key_event.timestamp(),
-                            key_code,
-                            value,
-                        })
-                        .await;
-                };
+    async fn handle_event(&self, event: io::Result<InputEvent>) -> bool {
+        let event = match event {
+            Ok(event) => event,
+            Err(error) => {
+                error!(path = %self.device_path, %error, "failed to read keyboard event");
+                self.send_event(Event::Stopped {
+                    reason: StopReason::ReadFailed(error.to_string()),
+                })
+                .await;
+                return false;
             }
-            Err(err) => {
-                error!(
-                    "error reading event from device {}: {err:#?}",
-                    self.device_path
-                );
-                let _ = self.event_sender.send(Event::Stopped).await;
+        };
+
+        let evdev::EventSummary::Key(key_event, key_code, value) = event.destructure() else {
+            return true;
+        };
+        let value = match value {
+            0 => KeyValue::Up,
+            1 => KeyValue::Down,
+            2 => KeyValue::Repeat,
+            _ => {
+                warn!(?key_code, value, "ignoring unknown key value");
+                return true;
             }
+        };
+
+        self.send_event(Event::Input {
+            timestamp: key_event.timestamp(),
+            key_code,
+            value,
+        })
+        .await
+    }
+
+    async fn send_event(&self, event: Event) -> bool {
+        if self.event_sender.send(event).await.is_err() {
+            return false;
         }
+        self.wake_signal.notify();
+        true
     }
 }

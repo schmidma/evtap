@@ -1,12 +1,21 @@
 use camino::Utf8PathBuf;
 use color_eyre::{Result, eyre::Context};
-use evdev::Device;
+use evdev::{AttributeSetRef, Device, KeyCode};
 use tokio::{
     fs,
     sync::mpsc::{self, Receiver, Sender},
 };
-use tokio_stream::{StreamExt, wrappers::ReadDirStream};
 use tracing::{info, warn};
+
+use crate::wake::WakeSignal;
+
+const CHANNEL_CAPACITY: usize = 1;
+const REQUIRED_KEYBOARD_KEYS: [KeyCode; 4] = [
+    KeyCode::KEY_A,
+    KeyCode::KEY_Z,
+    KeyCode::KEY_ENTER,
+    KeyCode::KEY_SPACE,
+];
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DeviceMetadata {
@@ -15,8 +24,22 @@ pub struct DeviceMetadata {
     pub physical_path: String,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeviceScanIssue {
+    pub path: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScanReport {
+    pub devices: Vec<DeviceMetadata>,
+    pub issues: Vec<DeviceScanIssue>,
+}
+
 pub enum Event {
-    Scan { metadata: Vec<DeviceMetadata> },
+    ScanFinished {
+        result: std::result::Result<ScanReport, String>,
+    },
 }
 
 enum Command {
@@ -36,20 +59,22 @@ impl ScannerHandle {
     pub fn start_scan(&self) -> Result<()> {
         self.commands
             .try_send(Command::Scan)
-            .wrap_err("failed to send scan command")
+            .wrap_err("failed to request an input-device scan")
     }
 }
 
-pub fn spawn() -> ScannerHandle {
-    let (event_sender, event_receiver) = mpsc::channel(1337);
-    let (command_sender, command_receiver) = mpsc::channel(1337);
+pub fn spawn(wake_signal: WakeSignal) -> ScannerHandle {
+    let (event_sender, event_receiver) = mpsc::channel(CHANNEL_CAPACITY);
+    let (command_sender, command_receiver) = mpsc::channel(CHANNEL_CAPACITY);
 
     tokio::spawn(async move {
-        let scanner = Scanner {
-            sender: event_sender,
-            receiver: command_receiver,
-        };
-        scanner.run().await;
+        Scanner {
+            event_sender,
+            command_receiver,
+            wake_signal,
+        }
+        .run()
+        .await;
     });
 
     ScannerHandle {
@@ -59,54 +84,129 @@ pub fn spawn() -> ScannerHandle {
 }
 
 struct Scanner {
-    sender: Sender<Event>,
-    receiver: Receiver<Command>,
+    event_sender: Sender<Event>,
+    command_receiver: Receiver<Command>,
+    wake_signal: WakeSignal,
 }
 
 impl Scanner {
     async fn run(mut self) {
-        loop {
-            match self.receiver.recv().await {
-                Some(command) => match command {
-                    Command::Scan => {
-                        let metadata = scan_devices().await.unwrap_or_default();
-                        let _ = self.sender.send(Event::Scan { metadata }).await;
+        while let Some(command) = self.command_receiver.recv().await {
+            match command {
+                Command::Scan => {
+                    let result = scan_devices().await.map_err(|error| format!("{error:#}"));
+                    if self
+                        .event_sender
+                        .send(Event::ScanFinished { result })
+                        .await
+                        .is_err()
+                    {
+                        return;
                     }
-                },
-                None => {
-                    info!("Scanner command channel closed, shutting down.");
-                    break;
+                    self.wake_signal.notify();
                 }
-            };
+            }
         }
+        info!("Scanner command channel closed, shutting down");
     }
 }
 
-async fn scan_devices() -> Result<Vec<DeviceMetadata>> {
-    let read_dir = fs::read_dir("/dev/input")
+async fn scan_devices() -> Result<ScanReport> {
+    let mut read_dir = fs::read_dir("/dev/input")
         .await
-        .wrap_err("failed to read /dev/input directory")?;
-    ReadDirStream::new(read_dir)
-        .filter_map(|path| {
-            let path = Utf8PathBuf::try_from(path.expect("failed to read /dev/input entry").path())
-                .expect("path to be valid UTF-8");
-            if !path.as_str().contains("event") {
-                return None;
+        .wrap_err("failed to read /dev/input; verify that Linux evdev is available")?;
+    let mut devices = Vec::new();
+    let mut issues = Vec::new();
+
+    while let Some(entry) = read_dir
+        .next_entry()
+        .await
+        .wrap_err("failed to read an entry from /dev/input")?
+    {
+        let path = match Utf8PathBuf::from_path_buf(entry.path()) {
+            Ok(path) => path,
+            Err(path) => {
+                let path = path.to_string_lossy().into_owned();
+                warn!(%path, "ignoring input device with a non-UTF-8 path");
+                issues.push(DeviceScanIssue {
+                    path,
+                    message: "device path is not valid UTF-8".to_owned(),
+                });
+                continue;
             }
-            let Ok(device) = Device::open(&path) else {
-                warn!("failed to open device at {path}");
-                return None;
-            };
-            let name = device.name().unwrap_or("Unknown").to_string();
-            info!("Found: {name} ({path})");
-            let physical_path = device.physical_path().unwrap_or("Unknown").to_string();
-            let metadata = DeviceMetadata {
-                path,
-                name,
-                physical_path,
-            };
-            Some(Ok(metadata))
-        })
-        .collect()
-        .await
+        };
+
+        if !path
+            .file_name()
+            .is_some_and(|name| name.starts_with("event"))
+        {
+            continue;
+        }
+
+        let device = match Device::open(&path) {
+            Ok(device) => device,
+            Err(error) => {
+                warn!(%path, %error, "failed to inspect input device");
+                issues.push(DeviceScanIssue {
+                    path: path.into_string(),
+                    message: error.to_string(),
+                });
+                continue;
+            }
+        };
+
+        if !is_keyboard(&device) {
+            continue;
+        }
+
+        let name = device.name().unwrap_or("Unknown keyboard").to_owned();
+        let physical_path = device.physical_path().unwrap_or("Unknown").to_owned();
+        info!(%name, %path, "found keyboard");
+        devices.push(DeviceMetadata {
+            path,
+            name,
+            physical_path,
+        });
+    }
+
+    devices.sort_by(|left, right| {
+        left.name
+            .to_lowercase()
+            .cmp(&right.name.to_lowercase())
+            .then_with(|| left.path.cmp(&right.path))
+    });
+
+    Ok(ScanReport { devices, issues })
+}
+
+fn is_keyboard(device: &Device) -> bool {
+    device
+        .supported_keys()
+        .is_some_and(has_required_keyboard_keys)
+}
+
+fn has_required_keyboard_keys(keys: &AttributeSetRef<KeyCode>) -> bool {
+    REQUIRED_KEYBOARD_KEYS.iter().all(|key| keys.contains(*key))
+}
+
+#[cfg(test)]
+mod tests {
+    use evdev::AttributeSet;
+
+    use super::{REQUIRED_KEYBOARD_KEYS, has_required_keyboard_keys};
+
+    #[test]
+    fn recognizes_required_keyboard_keys() {
+        let keys: AttributeSet<_> = REQUIRED_KEYBOARD_KEYS.into_iter().collect();
+
+        assert!(has_required_keyboard_keys(&keys));
+    }
+
+    #[test]
+    fn rejects_incomplete_keyboard_keys() {
+        let mut keys: AttributeSet<_> = REQUIRED_KEYBOARD_KEYS.into_iter().collect();
+        keys.remove(REQUIRED_KEYBOARD_KEYS[0]);
+
+        assert!(!has_required_keyboard_keys(&keys));
+    }
 }

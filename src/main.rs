@@ -8,6 +8,7 @@ mod app;
 mod listener;
 mod metric;
 mod scanner;
+mod wake;
 mod xkb_helper;
 
 #[tokio::main]
@@ -23,7 +24,7 @@ async fn main() -> Result<()> {
     eframe::run_native(
         "evtap",
         options,
-        Box::new(|creation_context| Ok(Box::new(App::new(creation_context)))),
+        Box::new(|creation_context| Ok(Box::new(App::new(creation_context)?))),
     )
     .map_err(|error| eyre!("failed to run evtap: {error}"))?;
 

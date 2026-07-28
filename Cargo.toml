@@ -21,9 +21,6 @@ tokio = { version = "1.53.1", features = [
   "rt-multi-thread",
   "sync",
 ] }
-tokio-stream = { version = "0.1.19", default-features = false, features = [
-  "fs",
-] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 xkbcommon = "0.9.0"
