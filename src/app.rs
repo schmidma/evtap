@@ -229,79 +229,80 @@ impl App {
     }
 }
 
-fn init_keyboard_state(model: &str, layout: &str, variant: &str) -> Result<xkb::State> {
-    let context = Context::new(xkb::CONTEXT_NO_FLAGS);
-    let keymap = Keymap::new_from_names(
-        &context,
-        "",
-        model,
-        layout,
-        variant,
-        None,
-        xkb::KEYMAP_COMPILE_NO_FLAGS,
-    )
-    .wrap_err("failed to create XKB keymap")?;
-    Ok(xkb::State::new(&keymap))
-}
+impl App {
+    fn render_capture_setup(&mut self, ui: &mut egui::Ui) {
+        ui.group(|ui| {
+            ui.set_width(ui.available_width());
+            ui.heading("Capture setup");
 
-impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.drain_scanner_events();
-        self.drain_listener_events();
+            self.render_device_picker(ui);
+            ui.add_space(4.0);
+            self.render_keyboard_configuration(ui);
+            ui.add_space(4.0);
+            self.render_session_controls(ui);
+            self.render_capture_status(ui);
+        });
+    }
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            let mut request_scan = false;
-            ui.horizontal(|ui| {
-                match &self.devices {
-                    None => {
-                        ui.spinner();
-                        ui.label("Scanning for keyboards…");
-                    }
-                    Some(devices) if devices.is_empty() => {
-                        ui.label("No readable keyboards");
-                    }
-                    Some(devices) => {
-                        let text = self
-                            .selected_device
-                            .and_then(|index| devices.get(index))
-                            .map_or("Select a keyboard", |device| device.name.as_str());
-
-                        ui.add_enabled_ui(self.listener.is_none(), |ui| {
-                            egui::ComboBox::from_label("Keyboard")
-                                .selected_text(text)
-                                .show_ui(ui, |ui| {
-                                    for (index, device) in devices.iter().enumerate() {
-                                        ui.selectable_value(
-                                            &mut self.selected_device,
-                                            Some(index),
-                                            &device.name,
-                                        )
-                                        .on_hover_ui(
-                                            |ui| {
-                                                ui.label(format!(
-                                                    "{} ({})",
-                                                    device.physical_path, device.path
-                                                ));
-                                            },
-                                        );
-                                    }
-                                });
-                        });
-                    }
+    fn render_device_picker(&mut self, ui: &mut egui::Ui) {
+        let mut request_scan = false;
+        ui.horizontal_wrapped(|ui| {
+            match &self.devices {
+                None => {
+                    ui.spinner();
+                    ui.label("Scanning for keyboards…");
                 }
-
-                if ui
-                    .add_enabled(
-                        self.listener.is_none() && self.devices.is_some(),
-                        egui::Button::new("Rescan"),
-                    )
-                    .clicked()
-                {
-                    request_scan = true;
+                Some(devices) if devices.is_empty() => {
+                    ui.label("No readable keyboards");
                 }
+                Some(devices) => {
+                    let text = self
+                        .selected_device
+                        .and_then(|index| devices.get(index))
+                        .map_or("Select a keyboard", |device| device.name.as_str());
 
-                ui.separator();
+                    ui.add_enabled_ui(self.listener.is_none(), |ui| {
+                        egui::ComboBox::from_label("Keyboard")
+                            .selected_text(text)
+                            .show_ui(ui, |ui| {
+                                for (index, device) in devices.iter().enumerate() {
+                                    ui.selectable_value(
+                                        &mut self.selected_device,
+                                        Some(index),
+                                        &device.name,
+                                    )
+                                    .on_hover_ui(|ui| {
+                                        ui.label(format!(
+                                            "{} ({})",
+                                            device.physical_path, device.path
+                                        ));
+                                    });
+                                }
+                            });
+                    });
+                }
+            }
 
+            if ui
+                .add_enabled(
+                    self.listener.is_none() && self.devices.is_some(),
+                    egui::Button::new("Rescan"),
+                )
+                .clicked()
+            {
+                request_scan = true;
+            }
+        });
+
+        if request_scan {
+            self.request_scan();
+        }
+    }
+
+    fn render_keyboard_configuration(&mut self, ui: &mut egui::Ui) {
+        let enabled = self.listener.is_none();
+        ui.add_enabled_ui(enabled, |ui| {
+            ui.horizontal_wrapped(|ui| {
                 let mut changed = false;
 
                 egui::ComboBox::from_label("Model")
@@ -364,79 +365,127 @@ impl eframe::App for App {
                 if changed {
                     self.reinit_xkb();
                 }
+            });
+        });
+    }
 
-                if let Some(listener) = &self.listener {
-                    let stopping = matches!(self.listener_state, ListenerState::Stopping);
-                    if ui
-                        .add_enabled(!stopping, egui::Button::new("Stop"))
-                        .clicked()
-                    {
-                        match listener.stop() {
-                            Ok(()) => self.listener_state = ListenerState::Stopping,
-                            Err(error) => {
-                                self.listener = None;
-                                self.listener_state = ListenerState::Failed(format!(
-                                    "Could not stop listener: {error:#}"
-                                ));
-                            }
+    fn render_session_controls(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            if let Some(listener) = &self.listener {
+                let stopping = matches!(self.listener_state, ListenerState::Stopping);
+                if ui
+                    .add_enabled(!stopping, egui::Button::new("Stop listening"))
+                    .clicked()
+                {
+                    match listener.stop() {
+                        Ok(()) => self.listener_state = ListenerState::Stopping,
+                        Err(error) => {
+                            self.listener = None;
+                            self.listener_state = ListenerState::Failed(format!(
+                                "Could not stop listener: {error:#}"
+                            ));
                         }
                     }
-                } else if let Some(device_path) = self
+                }
+            } else {
+                let selected_path = self
                     .devices
                     .as_ref()
                     .zip(self.selected_device)
                     .and_then(|(devices, index)| devices.get(index))
-                    .map(|device| device.path.clone())
-                    && ui.button("Listen").clicked()
+                    .map(|device| device.path.clone());
+                if ui
+                    .add_enabled(
+                        selected_path.is_some(),
+                        egui::Button::new("Start listening"),
+                    )
+                    .clicked()
+                    && let Some(device_path) = selected_path
                 {
                     self.listener = Some(listener::spawn(device_path, self.wake_signal.clone()));
                     self.listener_state = ListenerState::Connecting;
                 }
-
-                ui.separator();
-                if ui.button("Reset session").clicked() {
-                    for metric in &mut self.metrics {
-                        metric.reset();
-                    }
-                }
-            });
-
-            if request_scan {
-                self.request_scan();
             }
 
-            if let Some(error) = &self.scan_error {
+            if ui.button("Reset session").clicked() {
+                for metric in &mut self.metrics {
+                    metric.reset();
+                }
+            }
+        });
+    }
+
+    fn render_capture_status(&self, ui: &mut egui::Ui) {
+        if let Some(error) = &self.scan_error {
+            ui.colored_label(egui::Color32::RED, error);
+        }
+        if let Some(warning) = &self.scan_warning {
+            ui.colored_label(egui::Color32::YELLOW, warning);
+        }
+        if let Some(error) = &self.keyboard_error {
+            ui.colored_label(egui::Color32::RED, error);
+        }
+
+        match &self.listener_state {
+            ListenerState::Idle => {
+                ui.weak("Not listening");
+            }
+            ListenerState::Connecting => {
+                ui.label("Connecting to keyboard…");
+            }
+            ListenerState::Listening => {
+                ui.colored_label(egui::Color32::GREEN, "Listening");
+            }
+            ListenerState::Stopping => {
+                ui.label("Stopping listener…");
+            }
+            ListenerState::Failed(error) => {
                 ui.colored_label(egui::Color32::RED, error);
             }
-            if let Some(warning) = &self.scan_warning {
-                ui.colored_label(egui::Color32::YELLOW, warning);
-            }
-            if let Some(error) = &self.keyboard_error {
-                ui.colored_label(egui::Color32::RED, error);
-            }
+        }
+    }
+}
 
-            match &self.listener_state {
-                ListenerState::Idle => {}
-                ListenerState::Connecting => {
-                    ui.label("Connecting to keyboard…");
-                }
-                ListenerState::Listening => {
-                    ui.colored_label(egui::Color32::GREEN, "Listening");
-                }
-                ListenerState::Stopping => {
-                    ui.label("Stopping listener…");
-                }
-                ListenerState::Failed(error) => {
-                    ui.colored_label(egui::Color32::RED, error);
-                }
-            }
+fn init_keyboard_state(model: &str, layout: &str, variant: &str) -> Result<xkb::State> {
+    let context = Context::new(xkb::CONTEXT_NO_FLAGS);
+    let keymap = Keymap::new_from_names(
+        &context,
+        "",
+        model,
+        layout,
+        variant,
+        None,
+        xkb::KEYMAP_COMPILE_NO_FLAGS,
+    )
+    .wrap_err("failed to create XKB keymap")?;
+    Ok(xkb::State::new(&keymap))
+}
 
-            ui.separator();
+impl eframe::App for App {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.drain_scanner_events();
+        self.drain_listener_events();
+
+        egui::CentralPanel::default().show(ui, |ui| {
+            ui.heading("evtap");
+            ui.label("Understand the mechanics of your everyday typing.");
+            ui.small("Session data stays in memory and is discarded when evtap exits.");
+            ui.add_space(8.0);
+
+            self.render_capture_setup(ui);
+            ui.add_space(8.0);
+
+            ui.heading("Session analytics");
+            ui.small("Timing tables appear as samples arrive; no raw keystroke history is saved.");
+            ui.add_space(4.0);
 
             ScrollArea::vertical().show(ui, |ui| {
                 for metric in &self.metrics {
-                    render_metric(ui, metric.as_ref());
-                    ui.separator();
+                    ui.group(|ui| {
+                        ui.set_width(ui.available_width());
+                        render_metric(ui, metric.as_ref());
+                    });
+                    ui.add_space(6.0);
                 }
             });
         });
