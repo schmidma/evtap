@@ -478,6 +478,10 @@ fn init_keyboard_state(model: &str, layout: &str, variant: &str) -> Result<xkb::
 }
 
 impl eframe::App for App {
+    fn persist_egui_memory(&self) -> bool {
+        false
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_scanner_events();
         self.drain_listener_events();
