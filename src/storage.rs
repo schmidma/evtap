@@ -15,7 +15,7 @@ use thiserror::Error;
 
 use crate::{
     database::Repository,
-    session::{SessionId, SessionSnapshot, StoredSession},
+    session::{SessionId, SessionSnapshot, SessionStatus, SessionSummary, StoredSession},
     settings::RetentionPolicy,
     wake::WakeSignal,
 };
@@ -236,6 +236,10 @@ pub enum StorageOperation {
     Discard,
     Retention,
     DeleteAll,
+    HistoryList,
+    HistoryDetail,
+    DeleteCompleted,
+    Maintenance,
     ShutdownCheckpoint,
 }
 
@@ -263,6 +267,18 @@ pub enum StorageCommand {
         reopen: bool,
         retention: RetentionPolicy,
         now_ms: i64,
+    },
+    ListCompleted {
+        request_id: u64,
+        limit: u32,
+        offset: u32,
+    },
+    LoadCompleted {
+        request_id: u64,
+        session_id: SessionId,
+    },
+    DeleteCompleted {
+        session_id: SessionId,
     },
     Shutdown {
         final_checkpoint: Option<CheckpointRequest>,
@@ -300,6 +316,19 @@ pub enum StorageEvent {
     },
     AllDeleted {
         reopened: bool,
+    },
+    HistoryLoaded {
+        request_id: u64,
+        offset: u32,
+        sessions: Vec<SessionSummary>,
+    },
+    CompletedLoaded {
+        request_id: u64,
+        session: Option<StoredSession>,
+    },
+    CompletedDeleted {
+        session_id: SessionId,
+        deleted: bool,
     },
     Failed(StorageFailure),
     ShutdownComplete {
@@ -530,6 +559,41 @@ impl WorkerState {
             .map_err(|error| error.to_string())
     }
 
+    fn list_completed(&self, limit: u32, offset: u32) -> Result<Vec<SessionSummary>, String> {
+        self.repository
+            .as_ref()
+            .ok_or_else(|| "storage is unavailable".to_owned())?
+            .list_completed(limit, offset)
+            .map_err(|error| error.to_string())
+    }
+
+    fn load_completed(&self, session_id: SessionId) -> Result<Option<StoredSession>, String> {
+        self.repository
+            .as_ref()
+            .ok_or_else(|| "storage is unavailable".to_owned())?
+            .load_session(session_id)
+            .map(|session| {
+                session.filter(|stored| stored.metadata.status == SessionStatus::Completed)
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    fn delete_completed(&mut self, session_id: SessionId) -> Result<bool, String> {
+        self.repository
+            .as_mut()
+            .ok_or_else(|| "storage is unavailable".to_owned())?
+            .delete_completed(session_id)
+            .map_err(|error| error.to_string())
+    }
+
+    fn reclaim_after_deletion(&self) -> Result<(), String> {
+        self.repository
+            .as_ref()
+            .ok_or_else(|| "storage is unavailable".to_owned())?
+            .reclaim_after_deletion()
+            .map_err(|error| error.to_string())
+    }
+
     fn delete_all(
         &mut self,
         reopen: bool,
@@ -657,11 +721,25 @@ fn worker_main(
                             },
                         );
                         match state.apply_retention(retention_now_ms, retention) {
-                            Ok(deleted_sessions) => emit(
-                                events,
-                                wake,
-                                StorageEvent::RetentionApplied { deleted_sessions },
-                            ),
+                            Ok(deleted_sessions) => {
+                                emit(
+                                    events,
+                                    wake,
+                                    StorageEvent::RetentionApplied { deleted_sessions },
+                                );
+                                if deleted_sessions > 0
+                                    && let Err(details) = state.reclaim_after_deletion()
+                                {
+                                    emit_failure(
+                                        events,
+                                        wake,
+                                        &state,
+                                        StorageOperation::Maintenance,
+                                        None,
+                                        details,
+                                    );
+                                }
+                            }
                             Err(details) => emit_failure(
                                 events,
                                 wake,
@@ -684,14 +762,26 @@ fn worker_main(
             }
             StorageCommand::DiscardActive { session_id } => {
                 match state.discard_active(session_id) {
-                    Ok(deleted) => emit(
-                        events,
-                        wake,
-                        StorageEvent::Discarded {
-                            session_id,
-                            deleted,
-                        },
-                    ),
+                    Ok(deleted) => {
+                        emit(
+                            events,
+                            wake,
+                            StorageEvent::Discarded {
+                                session_id,
+                                deleted,
+                            },
+                        );
+                        if deleted && let Err(details) = state.reclaim_after_deletion() {
+                            emit_failure(
+                                events,
+                                wake,
+                                &state,
+                                StorageOperation::Maintenance,
+                                None,
+                                details,
+                            );
+                        }
+                    }
                     Err(details) => emit_failure(
                         events,
                         wake,
@@ -704,11 +794,25 @@ fn worker_main(
             }
             StorageCommand::ApplyRetention { retention, now_ms } => {
                 match state.apply_retention(now_ms, retention) {
-                    Ok(deleted_sessions) => emit(
-                        events,
-                        wake,
-                        StorageEvent::RetentionApplied { deleted_sessions },
-                    ),
+                    Ok(deleted_sessions) => {
+                        emit(
+                            events,
+                            wake,
+                            StorageEvent::RetentionApplied { deleted_sessions },
+                        );
+                        if deleted_sessions > 0
+                            && let Err(details) = state.reclaim_after_deletion()
+                        {
+                            emit_failure(
+                                events,
+                                wake,
+                                &state,
+                                StorageOperation::Maintenance,
+                                None,
+                                details,
+                            );
+                        }
+                    }
                     Err(details) => emit_failure(
                         events,
                         wake,
@@ -734,6 +838,82 @@ fn worker_main(
                     details,
                 ),
             },
+            StorageCommand::ListCompleted {
+                request_id,
+                limit,
+                offset,
+            } => match state.list_completed(limit, offset) {
+                Ok(sessions) => emit(
+                    events,
+                    wake,
+                    StorageEvent::HistoryLoaded {
+                        request_id,
+                        offset,
+                        sessions,
+                    },
+                ),
+                Err(details) => emit_failure(
+                    events,
+                    wake,
+                    &state,
+                    StorageOperation::HistoryList,
+                    None,
+                    details,
+                ),
+            },
+            StorageCommand::LoadCompleted {
+                request_id,
+                session_id,
+            } => match state.load_completed(session_id) {
+                Ok(session) => emit(
+                    events,
+                    wake,
+                    StorageEvent::CompletedLoaded {
+                        request_id,
+                        session,
+                    },
+                ),
+                Err(details) => emit_failure(
+                    events,
+                    wake,
+                    &state,
+                    StorageOperation::HistoryDetail,
+                    None,
+                    details,
+                ),
+            },
+            StorageCommand::DeleteCompleted { session_id } => {
+                match state.delete_completed(session_id) {
+                    Ok(deleted) => {
+                        emit(
+                            events,
+                            wake,
+                            StorageEvent::CompletedDeleted {
+                                session_id,
+                                deleted,
+                            },
+                        );
+                        if deleted && let Err(details) = state.reclaim_after_deletion() {
+                            emit_failure(
+                                events,
+                                wake,
+                                &state,
+                                StorageOperation::Maintenance,
+                                None,
+                                details,
+                            );
+                        }
+                    }
+                    Err(details) => emit_failure(
+                        events,
+                        wake,
+                        &state,
+                        StorageOperation::DeleteCompleted,
+                        None,
+                        details,
+                    ),
+                }
+            }
             StorageCommand::Shutdown { final_checkpoint } => {
                 let final_generation = final_checkpoint
                     .as_ref()
@@ -997,7 +1177,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_finalizes_latest_snapshot_and_does_not_restore_it_as_active() {
+    fn worker_lists_loads_and_deletes_completed_sessions() {
         let temporary = tempdir().unwrap();
         let path = temporary.path().join("evtap.sqlite3");
         let (wake, _) = wake_signal();
@@ -1025,16 +1205,62 @@ mod tests {
                 retention_now_ms: 4_000,
             })
             .unwrap();
-        assert!(matches!(
-            recv_event(&worker),
+        let session_id = match recv_event(&worker) {
             StorageEvent::Finalized {
                 generation: DirtyGeneration(2),
-                ..
-            }
-        ));
+                session_id,
+            } => session_id,
+            event => panic!("unexpected event: {event:?}"),
+        };
         assert!(matches!(
             recv_event(&worker),
             StorageEvent::RetentionApplied { .. }
+        ));
+
+        worker
+            .send(StorageCommand::ListCompleted {
+                request_id: 7,
+                limit: 50,
+                offset: 0,
+            })
+            .unwrap();
+        let StorageEvent::HistoryLoaded {
+            request_id: 7,
+            sessions,
+            ..
+        } = recv_event(&worker)
+        else {
+            panic!("expected history page");
+        };
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].metadata.id, session_id);
+        assert_eq!(sessions[0].total_presses, Some(4));
+
+        worker
+            .send(StorageCommand::LoadCompleted {
+                request_id: 8,
+                session_id,
+            })
+            .unwrap();
+        let StorageEvent::CompletedLoaded {
+            request_id: 8,
+            session: Some(stored),
+        } = recv_event(&worker)
+        else {
+            panic!("expected completed-session detail");
+        };
+        assert_eq!(stored.metadata.id, session_id);
+        assert_eq!(stored.metrics.len(), 1);
+
+        worker
+            .send(StorageCommand::DeleteCompleted { session_id })
+            .unwrap();
+        assert!(matches!(
+            recv_event(&worker),
+            StorageEvent::CompletedDeleted {
+                session_id: deleted_id,
+                deleted: true,
+            } if deleted_id == session_id
         ));
         worker.shutdown(None).unwrap();
 

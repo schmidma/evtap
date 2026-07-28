@@ -361,6 +361,20 @@ impl Repository {
         Ok(changed)
     }
 
+    pub fn reclaim_after_deletion(&self) -> Result<(), RepositoryError> {
+        let (busy, _, _): (i64, i64, i64) =
+            self.connection
+                .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?;
+        if busy != 0 {
+            return Err(RepositoryError::WalCheckpointBusy);
+        }
+        self.connection
+            .execute_batch("PRAGMA incremental_vacuum(64)")?;
+        Ok(())
+    }
+
     fn configure(&mut self, persistent: bool) -> Result<(), RepositoryError> {
         self.connection.busy_timeout(BUSY_TIMEOUT)?;
 
@@ -742,6 +756,8 @@ pub enum RepositoryError {
     InvalidPageSize(u32),
     #[error("retention interval is invalid")]
     InvalidRetention,
+    #[error("SQLite WAL checkpoint remained busy")]
+    WalCheckpointBusy,
 }
 
 #[cfg(test)]
@@ -889,6 +905,34 @@ mod tests {
             1
         );
         assert!(repository.load_session(session_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn completed_history_is_paginated_newest_first() {
+        let mut repository = Repository::open_in_memory().unwrap();
+        let mut completed = Vec::new();
+        for (updated_at_ms, completed_at_ms) in [(2_000, 3_000), (4_000, 5_000), (6_000, 7_000)] {
+            let session_id = repository
+                .checkpoint(&snapshot(None, updated_at_ms))
+                .unwrap();
+            repository
+                .finalize(&snapshot(Some(session_id), updated_at_ms), completed_at_ms)
+                .unwrap();
+            completed.push(session_id);
+        }
+
+        let first_page = repository.list_completed(2, 0).unwrap();
+        let second_page = repository.list_completed(2, 2).unwrap();
+
+        assert_eq!(
+            first_page
+                .iter()
+                .map(|summary| summary.metadata.id)
+                .collect::<Vec<_>>(),
+            vec![completed[2], completed[1]]
+        );
+        assert_eq!(second_page.len(), 1);
+        assert_eq!(second_page[0].metadata.id, completed[0]);
     }
 
     #[test]

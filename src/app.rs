@@ -1,9 +1,11 @@
 use std::{
     collections::HashMap,
+    path::Path,
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use chrono::{Local, TimeZone};
 use color_eyre::{Result, eyre::ContextCompat};
 use eframe::egui::{self, ScrollArea};
 use evdev::KeyCode;
@@ -18,8 +20,8 @@ use crate::{
     paths::AppPaths,
     scanner::{self, DeviceMetadata, ScannerHandle},
     session::{
-        KeyboardContext, MetricRecoveryIssue, SessionId, SessionSnapshot, StoredSession,
-        recover_default_metrics,
+        KeyboardContext, MetricRecoveryIssue, SessionId, SessionMetadata, SessionSnapshot,
+        SessionSummary, StoredSession, recover_default_metrics,
     },
     settings::{RetentionPolicy, Settings, SettingsStore},
     storage::{
@@ -32,6 +34,7 @@ use crate::{
 
 const HACK_FONT_NAME: &str = "Hack";
 const LISTENER_EXIT_WAIT: Duration = Duration::from_millis(500);
+const HISTORY_PAGE_SIZE: u32 = 50;
 
 pub struct App {
     devices: Option<Vec<DeviceMetadata>>,
@@ -74,10 +77,24 @@ pub struct App {
     pending_finish: Option<PendingFinish>,
     discarding: bool,
     deleting_all_to_disable: bool,
+    deleting_all: bool,
     shutting_down_storage: bool,
     confirm_discard: bool,
+    confirm_delete_all: bool,
     enable_prompt: Option<EnablePrompt>,
     disable_prompt: bool,
+
+    history_open: bool,
+    history_sessions: Vec<SessionSummary>,
+    history_offset: u32,
+    history_has_more: bool,
+    history_loading: bool,
+    history_error: Option<String>,
+    history_list_request_id: u64,
+    history_detail_request_id: u64,
+    history_detail: Option<HistoryDetail>,
+    confirm_history_delete: Option<SessionId>,
+    deleting_completed: Option<SessionId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -133,6 +150,12 @@ struct PendingFinish {
 enum EnablePrompt {
     Disclosure,
     ExistingSession,
+}
+
+struct HistoryDetail {
+    metadata: SessionMetadata,
+    metrics: Vec<Box<dyn Metric>>,
+    messages: Vec<String>,
 }
 
 impl App {
@@ -201,10 +224,23 @@ impl App {
             pending_finish: None,
             discarding: false,
             deleting_all_to_disable: false,
+            deleting_all: false,
             shutting_down_storage: false,
             confirm_discard: false,
+            confirm_delete_all: false,
             enable_prompt: None,
             disable_prompt: false,
+            history_open: false,
+            history_sessions: Vec::new(),
+            history_offset: 0,
+            history_has_more: false,
+            history_loading: false,
+            history_error: None,
+            history_list_request_id: 0,
+            history_detail_request_id: 0,
+            history_detail: None,
+            confirm_history_delete: None,
+            deleting_completed: None,
         };
         if app.settings.persistence_enabled() {
             app.start_storage(StorageOpenIntent::Restore);
@@ -383,6 +419,9 @@ impl App {
                     }
                     (_, None) => {}
                 }
+                if self.history_open {
+                    self.request_history_page(self.history_offset);
+                }
             }
             StorageEvent::Checkpointed {
                 generation,
@@ -417,6 +456,9 @@ impl App {
                     .take()
                     .is_some_and(|pending| pending.disable_after);
                 self.reset_current_session();
+                if self.history_open {
+                    self.request_history_page(0);
+                }
                 if disable_after {
                     self.disable_persistence_now();
                 }
@@ -433,12 +475,90 @@ impl App {
                         Some("The active session no longer exists in storage.".to_owned());
                 }
             }
-            StorageEvent::RetentionApplied { .. } => {}
+            StorageEvent::RetentionApplied { deleted_sessions } => {
+                if deleted_sessions > 0 && self.history_open {
+                    self.request_history_page(self.history_offset);
+                }
+            }
             StorageEvent::AllDeleted { reopened: _ } => {
-                if self.deleting_all_to_disable {
-                    self.deleting_all_to_disable = false;
-                    self.reset_current_session();
+                let disable_after = self.deleting_all_to_disable;
+                self.deleting_all_to_disable = false;
+                self.deleting_all = false;
+                self.confirm_delete_all = false;
+                self.history_sessions.clear();
+                self.history_detail = None;
+                self.confirm_history_delete = None;
+                self.deleting_completed = None;
+                self.history_open = false;
+                self.reset_current_session();
+                if disable_after {
                     self.disable_persistence_now();
+                }
+            }
+            StorageEvent::HistoryLoaded {
+                request_id,
+                offset,
+                mut sessions,
+            } => {
+                if request_id == self.history_list_request_id {
+                    self.history_has_more = sessions.len() > HISTORY_PAGE_SIZE as usize;
+                    sessions.truncate(HISTORY_PAGE_SIZE as usize);
+                    self.history_sessions = sessions;
+                    self.history_offset = offset;
+                    self.history_loading = false;
+                    self.history_error = None;
+                }
+            }
+            StorageEvent::CompletedLoaded {
+                request_id,
+                session,
+            } => {
+                if request_id == self.history_detail_request_id {
+                    self.history_loading = false;
+                    match session {
+                        Some(stored) => {
+                            let recovered = recover_default_metrics(&stored.metrics);
+                            self.history_detail = Some(HistoryDetail {
+                                metadata: stored.metadata,
+                                metrics: recovered.metrics,
+                                messages: recovered
+                                    .issues
+                                    .iter()
+                                    .map(metric_recovery_message)
+                                    .collect(),
+                            });
+                            self.history_error = None;
+                        }
+                        None => {
+                            self.history_detail = None;
+                            self.history_error =
+                                Some("The selected completed session no longer exists.".to_owned());
+                        }
+                    }
+                }
+            }
+            StorageEvent::CompletedDeleted {
+                session_id,
+                deleted,
+            } => {
+                self.deleting_completed = None;
+                self.confirm_history_delete = None;
+                if deleted {
+                    self.history_sessions
+                        .retain(|summary| summary.metadata.id != session_id);
+                    if self
+                        .history_detail
+                        .as_ref()
+                        .is_some_and(|detail| detail.metadata.id == session_id)
+                    {
+                        self.history_detail = None;
+                    }
+                    if self.history_open {
+                        self.request_history_page(self.history_offset);
+                    }
+                } else {
+                    self.history_error =
+                        Some("The selected completed session no longer exists.".to_owned());
                 }
             }
             StorageEvent::Failed(failure) => {
@@ -456,6 +576,18 @@ impl App {
                 }
                 if failure.operation == StorageOperation::DeleteAll {
                     self.deleting_all_to_disable = false;
+                    self.deleting_all = false;
+                }
+                if matches!(
+                    failure.operation,
+                    StorageOperation::HistoryList | StorageOperation::HistoryDetail
+                ) {
+                    self.history_loading = false;
+                    self.history_error = Some(failure.details.clone());
+                }
+                if failure.operation == StorageOperation::DeleteCompleted {
+                    self.deleting_completed = None;
+                    self.history_error = Some(failure.details.clone());
                 }
                 self.storage_error = Some(format!(
                     "{} ({}): {}",
@@ -857,6 +989,8 @@ impl App {
             return;
         }
         self.disable_prompt = false;
+        self.history_open = false;
+        self.history_detail = None;
         self.shutting_down_storage = true;
         match &self.storage {
             Some(worker) => {
@@ -886,10 +1020,32 @@ impl App {
         }) {
             Ok(()) => {
                 self.deleting_all_to_disable = true;
+                self.deleting_all = true;
                 self.disable_prompt = false;
             }
             Err(error) => {
                 self.storage_error = Some(format!("Could not request analytics deletion: {error}"));
+            }
+        }
+    }
+
+    fn delete_all_analytics(&mut self) {
+        let Some(worker) = &self.storage else {
+            self.history_error =
+                Some("Storage worker is unavailable; analytics were not deleted.".to_owned());
+            return;
+        };
+        match worker.send(StorageCommand::DeleteAll {
+            reopen: true,
+            retention: self.settings.retention(),
+            now_ms: unix_now_ms().unwrap_or_default(),
+        }) {
+            Ok(()) => {
+                self.deleting_all = true;
+                self.confirm_delete_all = false;
+            }
+            Err(error) => {
+                self.history_error = Some(format!("Could not request analytics deletion: {error}"));
             }
         }
     }
@@ -908,6 +1064,61 @@ impl App {
                 retention,
                 now_ms: unix_now_ms().unwrap_or_default(),
             });
+        }
+    }
+
+    fn request_history_page(&mut self, offset: u32) {
+        self.history_list_request_id = self.history_list_request_id.wrapping_add(1).max(1);
+        self.history_loading = true;
+        self.history_error = None;
+        let command = StorageCommand::ListCompleted {
+            request_id: self.history_list_request_id,
+            limit: HISTORY_PAGE_SIZE + 1,
+            offset,
+        };
+        if let Err(error) = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "storage worker is unavailable".to_owned())
+            .and_then(|worker| worker.send(command).map_err(|error| error.to_string()))
+        {
+            self.history_loading = false;
+            self.history_error = Some(format!("Could not load history: {error}"));
+        }
+    }
+
+    fn request_history_detail(&mut self, session_id: SessionId) {
+        self.history_detail_request_id = self.history_detail_request_id.wrapping_add(1).max(1);
+        self.history_loading = true;
+        self.history_error = None;
+        let command = StorageCommand::LoadCompleted {
+            request_id: self.history_detail_request_id,
+            session_id,
+        };
+        if let Err(error) = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "storage worker is unavailable".to_owned())
+            .and_then(|worker| worker.send(command).map_err(|error| error.to_string()))
+        {
+            self.history_loading = false;
+            self.history_error = Some(format!("Could not load session details: {error}"));
+        }
+    }
+
+    fn delete_completed_session(&mut self, session_id: SessionId) {
+        self.confirm_history_delete = None;
+        let command = StorageCommand::DeleteCompleted { session_id };
+        match self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "storage worker is unavailable".to_owned())
+            .and_then(|worker| worker.send(command).map_err(|error| error.to_string()))
+        {
+            Ok(()) => self.deleting_completed = Some(session_id),
+            Err(error) => {
+                self.history_error = Some(format!("Could not delete completed session: {error}"));
+            }
         }
     }
 }
@@ -1071,7 +1282,7 @@ impl App {
     fn render_session_controls(&mut self, ui: &mut egui::Ui) {
         let busy = self.pending_finish.is_some()
             || self.discarding
-            || self.deleting_all_to_disable
+            || self.deleting_all
             || matches!(self.listener_state, ListenerState::Stopping);
         ui.horizontal_wrapped(|ui| {
             if self.listener.is_some() {
@@ -1197,6 +1408,7 @@ impl App {
             if self.settings.persistence_enabled() {
                 ui.label("Enabled — versioned aggregate snapshots are stored locally in an unencrypted SQLite database.");
                 ui.small(format!("Storage: {}", self.paths.database_file().display()));
+                ui.small("Privacy details: docs/privacy.md in the evtap source distribution.");
                 let mut retention = self.settings.retention();
                 egui::ComboBox::from_label("Retention")
                     .selected_text(retention_label(retention))
@@ -1213,11 +1425,44 @@ impl App {
                 if retention != self.settings.retention() {
                     self.change_retention(retention);
                 }
+                ui.small(format!(
+                    "Current disk usage: {}",
+                    format_byte_size(database_disk_usage(&self.paths.database_file()))
+                ));
+                if ui
+                    .add_enabled(
+                        self.storage_tracker.status() != StorageStatus::Loading,
+                        egui::Button::new(if self.history_open {
+                            "Hide history"
+                        } else {
+                            "History"
+                        }),
+                    )
+                    .clicked()
+                {
+                    self.history_open = !self.history_open;
+                    if self.history_open {
+                        self.request_history_page(0);
+                    } else {
+                        self.history_detail = None;
+                    }
+                }
+                if ui
+                    .add_enabled(
+                        self.listener.is_none()
+                            && self.storage_tracker.in_flight().is_none()
+                            && !self.deleting_all,
+                        egui::Button::new("Delete all stored analytics…"),
+                    )
+                    .clicked()
+                {
+                    self.confirm_delete_all = true;
+                }
                 if ui
                     .add_enabled(
                         self.listener.is_none()
                             && !self.shutting_down_storage
-                            && !self.deleting_all_to_disable,
+                            && !self.deleting_all,
                         egui::Button::new("Disable persistence…"),
                     )
                     .clicked()
@@ -1233,6 +1478,23 @@ impl App {
                 if ui.button("Enable persistence…").clicked() {
                     self.enable_prompt = Some(EnablePrompt::Disclosure);
                 }
+            }
+            if self.confirm_delete_all {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    "Delete the active session, all completed sessions, and every aggregate snapshot? Settings are retained. This cannot be undone.",
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Delete all analytics permanently").clicked() {
+                        self.delete_all_analytics();
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.confirm_delete_all = false;
+                    }
+                });
+            }
+            if self.deleting_all {
+                ui.label("Deleting all stored analytics…");
             }
             self.render_storage_status(ui);
             self.render_persistence_prompts(ui);
@@ -1289,6 +1551,194 @@ impl App {
             } else {
                 self.request_checkpoint();
             }
+        }
+    }
+
+    fn render_history(&mut self, ui: &mut egui::Ui) {
+        ui.group(|ui| {
+            ui.set_width(ui.available_width());
+            ui.heading("Completed-session history");
+            ScrollArea::vertical()
+                .id_salt("completed-session-history")
+                .max_height(600.0)
+                .show(ui, |ui| self.render_history_contents(ui));
+        });
+    }
+
+    fn render_history_contents(&mut self, ui: &mut egui::Ui) {
+        if self.history_loading {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Loading history…");
+            });
+        }
+        if let Some(error) = &self.history_error {
+            ui.colored_label(egui::Color32::RED, error);
+        }
+
+        let mut open_session = None;
+        let mut request_delete = None;
+        if self.history_sessions.is_empty() && !self.history_loading {
+            ui.weak("No completed sessions are stored on this page.");
+        }
+        for summary in &self.history_sessions {
+            ui.group(|ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong(format_local_timestamp(summary.metadata.created_at_ms));
+                    ui.label(format!(
+                        "Capture duration: {}",
+                        format_duration_ns(summary.metadata.captured_duration_ns)
+                    ));
+                    ui.label(match summary.total_presses {
+                        Some(count) => format!("Physical presses: {count}"),
+                        None => "Physical presses unavailable".to_owned(),
+                    });
+                });
+                ui.small(format!(
+                    "{} · layout {}{}",
+                    summary
+                        .metadata
+                        .keyboard
+                        .display_name
+                        .as_deref()
+                        .unwrap_or("Unnamed keyboard"),
+                    summary.metadata.keyboard.layout,
+                    if summary.metadata.keyboard.variant.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" / {}", summary.metadata.keyboard.variant)
+                    }
+                ));
+                ui.horizontal(|ui| {
+                    if ui.button("Open").clicked() {
+                        open_session = Some(summary.metadata.id);
+                    }
+                    if ui
+                        .add_enabled(
+                            self.deleting_completed != Some(summary.metadata.id),
+                            egui::Button::new("Delete"),
+                        )
+                        .clicked()
+                    {
+                        request_delete = Some(summary.metadata.id);
+                    }
+                });
+            });
+            ui.add_space(4.0);
+        }
+
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    self.history_offset > 0 && !self.history_loading,
+                    egui::Button::new("Previous page"),
+                )
+                .clicked()
+            {
+                self.request_history_page(self.history_offset.saturating_sub(HISTORY_PAGE_SIZE));
+            }
+            ui.label(format!(
+                "Page {}",
+                self.history_offset / HISTORY_PAGE_SIZE + 1
+            ));
+            if ui
+                .add_enabled(
+                    self.history_has_more && !self.history_loading,
+                    egui::Button::new("Next page"),
+                )
+                .clicked()
+            {
+                self.request_history_page(self.history_offset.saturating_add(HISTORY_PAGE_SIZE));
+            }
+        });
+
+        if let Some(session_id) = open_session {
+            self.request_history_detail(session_id);
+        }
+        if let Some(session_id) = request_delete {
+            self.confirm_history_delete = Some(session_id);
+        }
+
+        let mut close_detail = false;
+        let mut delete_detail = None;
+        if let Some(detail) = &self.history_detail {
+            ui.separator();
+            ui.heading("Completed session details");
+            ui.label(format!(
+                "Started: {}",
+                format_local_timestamp(detail.metadata.created_at_ms)
+            ));
+            if let Some(completed_at_ms) = detail.metadata.completed_at_ms {
+                ui.label(format!(
+                    "Completed: {}",
+                    format_local_timestamp(completed_at_ms)
+                ));
+            }
+            ui.label(format!(
+                "Captured: {}",
+                format_duration_ns(detail.metadata.captured_duration_ns)
+            ));
+            ui.label(format!(
+                "Keyboard: {} · model {} · layout {}{}",
+                detail
+                    .metadata
+                    .keyboard
+                    .display_name
+                    .as_deref()
+                    .unwrap_or("Unnamed keyboard"),
+                detail.metadata.keyboard.model,
+                detail.metadata.keyboard.layout,
+                if detail.metadata.keyboard.variant.is_empty() {
+                    String::new()
+                } else {
+                    format!(" / {}", detail.metadata.keyboard.variant)
+                }
+            ));
+            ui.small(format!(
+                "Captured by evtap {}",
+                detail.metadata.application_version
+            ));
+            for message in &detail.messages {
+                ui.colored_label(egui::Color32::YELLOW, message);
+            }
+            for metric in &detail.metrics {
+                ui.group(|ui| {
+                    ui.set_width(ui.available_width());
+                    render_metric(ui, metric.as_ref());
+                });
+                ui.add_space(4.0);
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Close details").clicked() {
+                    close_detail = true;
+                }
+                if ui.button("Delete this session").clicked() {
+                    delete_detail = Some(detail.metadata.id);
+                }
+            });
+        }
+        if close_detail {
+            self.history_detail = None;
+        }
+        if let Some(session_id) = delete_detail {
+            self.confirm_history_delete = Some(session_id);
+        }
+
+        if let Some(session_id) = self.confirm_history_delete {
+            ui.separator();
+            ui.colored_label(
+                    egui::Color32::YELLOW,
+                    "Delete this completed session and all of its aggregate snapshots? This cannot be undone.",
+                );
+            ui.horizontal(|ui| {
+                if ui.button("Delete permanently").clicked() {
+                    self.delete_completed_session(session_id);
+                }
+                if ui.button("Cancel").clicked() {
+                    self.confirm_history_delete = None;
+                }
+            });
         }
     }
 
@@ -1416,8 +1866,59 @@ fn storage_operation_label(operation: StorageOperation) -> &'static str {
         StorageOperation::Discard => "Could not discard saved session",
         StorageOperation::Retention => "Could not apply retention",
         StorageOperation::DeleteAll => "Could not delete aggregate storage",
+        StorageOperation::HistoryList => "Could not load session history",
+        StorageOperation::HistoryDetail => "Could not load session details",
+        StorageOperation::DeleteCompleted => "Could not delete completed session",
+        StorageOperation::Maintenance => "Could not reclaim deleted storage",
         StorageOperation::ShutdownCheckpoint => "Could not save final aggregate checkpoint",
     }
+}
+
+fn database_disk_usage(database_path: &Path) -> u64 {
+    let sidecar = |suffix: &str| {
+        let mut path = database_path.as_os_str().to_os_string();
+        path.push(suffix);
+        std::path::PathBuf::from(path)
+    };
+    [
+        database_path.to_path_buf(),
+        sidecar("-wal"),
+        sidecar("-shm"),
+    ]
+    .into_iter()
+    .filter_map(|path| path.metadata().ok().map(|metadata| metadata.len()))
+    .fold(0_u64, u64::saturating_add)
+}
+
+fn format_byte_size(bytes: u64) -> String {
+    const KIBIBYTE: u64 = 1024;
+    const MEBIBYTE: u64 = 1024 * KIBIBYTE;
+    if bytes >= MEBIBYTE {
+        format!("{:.1} MiB", bytes as f64 / MEBIBYTE as f64)
+    } else if bytes >= KIBIBYTE {
+        format!("{:.1} KiB", bytes as f64 / KIBIBYTE as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn format_duration_ns(duration_ns: i64) -> String {
+    let Ok(duration_ns) = u64::try_from(duration_ns) else {
+        return "Unavailable".to_owned();
+    };
+    let seconds = duration_ns / 1_000_000_000;
+    let hours = seconds / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+    let seconds = seconds % 60;
+    format!("{hours:02}:{minutes:02}:{seconds:02}")
+}
+
+fn format_local_timestamp(timestamp_ms: i64) -> String {
+    Local
+        .timestamp_millis_opt(timestamp_ms)
+        .single()
+        .map(|timestamp| timestamp.format("%Y-%m-%d %H:%M:%S %:z").to_string())
+        .unwrap_or_else(|| format!("{timestamp_ms} ms since Unix epoch"))
 }
 
 fn retention_label(retention: RetentionPolicy) -> &'static str {
@@ -1449,6 +1950,9 @@ impl eframe::App for App {
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
+            ScrollArea::vertical()
+                .id_salt("application-content")
+                .show(ui, |ui| {
             ui.heading("evtap");
             ui.label("Understand the mechanics of your everyday typing.");
             if self.settings.persistence_enabled() {
@@ -1462,6 +1966,10 @@ impl eframe::App for App {
             ui.add_space(8.0);
             self.render_persistence_settings(ui);
             ui.add_space(8.0);
+            if self.history_open {
+                self.render_history(ui);
+                ui.add_space(8.0);
+            }
 
             for message in &self.recovery_messages {
                 ui.colored_label(egui::Color32::YELLOW, message);
@@ -1470,15 +1978,14 @@ impl eframe::App for App {
             ui.small("Timing tables appear as samples arrive; no raw keystroke history is saved.");
             ui.add_space(4.0);
 
-            ScrollArea::vertical().show(ui, |ui| {
-                for metric in &self.metrics {
-                    ui.group(|ui| {
-                        ui.set_width(ui.available_width());
-                        render_metric(ui, metric.as_ref());
-                    });
-                    ui.add_space(6.0);
-                }
-            });
+            for metric in &self.metrics {
+                ui.group(|ui| {
+                    ui.set_width(ui.available_width());
+                    render_metric(ui, metric.as_ref());
+                });
+                ui.add_space(6.0);
+            }
+                });
         });
     }
 
@@ -1523,7 +2030,12 @@ impl eframe::App for App {
 
 #[cfg(test)]
 mod tests {
-    use super::{font_definitions, retention_label, unix_now_ms};
+    use std::fs;
+
+    use super::{
+        database_disk_usage, font_definitions, format_byte_size, format_duration_ns,
+        format_local_timestamp, retention_label, unix_now_ms,
+    };
     use crate::settings::RetentionPolicy;
     use eframe::egui;
 
@@ -1546,5 +2058,19 @@ mod tests {
         assert!(unix_now_ms().unwrap() > 0);
         assert_eq!(retention_label(RetentionPolicy::Days(90)), "90 days");
         assert_eq!(retention_label(RetentionPolicy::Forever), "Forever");
+        assert_eq!(format_duration_ns(3_661_000_000_000), "01:01:01");
+        assert_eq!(format_duration_ns(-1), "Unavailable");
+        assert_eq!(format_byte_size(1_536), "1.5 KiB");
+        assert!(!format_local_timestamp(0).is_empty());
+    }
+
+    #[test]
+    fn disk_usage_includes_sqlite_sidecars() {
+        let temporary = tempfile::tempdir().unwrap();
+        let database = temporary.path().join("evtap.sqlite3");
+        fs::write(&database, [0_u8; 5]).unwrap();
+        fs::write(temporary.path().join("evtap.sqlite3-wal"), [0_u8; 7]).unwrap();
+
+        assert_eq!(database_disk_usage(&database), 12);
     }
 }
