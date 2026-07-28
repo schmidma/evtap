@@ -1,73 +1,120 @@
-use std::collections::HashMap;
-use std::time::{Duration, SystemTime};
-
-use eframe::egui::{Grid, Ui};
-use evdev::KeyCode;
-use tracing::error;
+use std::{collections::HashMap, time::SystemTime};
 
 use crate::{
-    listener::KeyValue,
-    metric::{KeyContext, Metric},
+    input::{KeyEvent, KeyEventKind, PhysicalKey},
+    metric::{DurationStats, Metric, MetricDescriptor, MetricReport, ReportSection, ReportValue},
 };
+
+const DESCRIPTOR: MetricDescriptor = MetricDescriptor {
+    id: "dwell-time",
+    name: "Dwell Time",
+    description: "Average time each character key is held down.",
+};
+
+struct PressedKey {
+    timestamp: SystemTime,
+    text: Option<String>,
+}
 
 #[derive(Default)]
 pub struct DwellTime {
-    pressed_keys: HashMap<KeyCode, SystemTime>,
-    // Map char string to (total_duration, count)
-    stats: HashMap<String, (Duration, u64)>,
+    pressed_keys: HashMap<PhysicalKey, PressedKey>,
+    stats: HashMap<String, DurationStats>,
 }
 
 impl Metric for DwellTime {
-    fn process(&mut self, ctx: &KeyContext) {
-        match ctx.value {
-            KeyValue::Down => {
-                self.pressed_keys.insert(ctx.key_code, ctx.timestamp);
+    fn descriptor(&self) -> &'static MetricDescriptor {
+        &DESCRIPTOR
+    }
+
+    fn process(&mut self, event: &KeyEvent) {
+        match event.kind() {
+            KeyEventKind::Press => {
+                self.pressed_keys
+                    .entry(event.key().clone())
+                    .or_insert_with(|| PressedKey {
+                        timestamp: event.timestamp(),
+                        text: event.text().map(str::to_owned),
+                    });
             }
-            KeyValue::Up => {
-                let Some(start_time) = self.pressed_keys.remove(&ctx.key_code) else {
+            KeyEventKind::Release => {
+                let Some(pressed) = self.pressed_keys.remove(event.key()) else {
                     return;
                 };
-                if let Some(char_str) = &ctx.utf8 {
-                    let duration_since = match ctx.timestamp.duration_since(start_time) {
-                        Ok(duration) => duration,
-                        Err(err) => {
-                            error!("failed to compute duration since last release: {err}");
-                            return;
-                        }
-                    };
-                    let (accumulated_time, count) = self.stats.entry(char_str.clone()).or_default();
-                    *accumulated_time += duration_since;
-                    *count += 1;
-                }
+                let (Some(text), Ok(duration)) = (
+                    pressed.text,
+                    event.timestamp().duration_since(pressed.timestamp),
+                ) else {
+                    return;
+                };
+                self.stats.entry(text).or_default().record(duration);
             }
-            _ => {}
+            KeyEventKind::Repeat => {}
         }
     }
 
-    fn ui(&self, ui: &mut Ui) {
-        ui.heading("Dwell Time");
-        ui.small("Avg time a key is held down.");
-        ui.add_space(5.0);
-
-        Grid::new("dwell_time_grid").striped(true).show(ui, |ui| {
-            ui.strong("Key");
-            ui.strong("Avg Time (ms)");
-            ui.end_row();
-
-            let mut data: Vec<_> = self
-                .stats
-                .iter()
-                .map(|(k, (d, c))| (k, d.as_secs_f64() * 1000.0 / *c as f64))
-                .collect();
-
-            // Sort by slowest (descending)
-            data.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-            for (key, ms) in data.into_iter().take(5) {
-                ui.label(key);
-                ui.label(format!("{:.1}", ms));
-                ui.end_row();
-            }
+    fn report(&self) -> MetricReport {
+        let mut data: Vec<_> = self.stats.iter().collect();
+        data.sort_by(|(left_key, left), (right_key, right)| {
+            right
+                .average_milliseconds()
+                .total_cmp(&left.average_milliseconds())
+                .then_with(|| left_key.cmp(right_key))
         });
+
+        MetricReport {
+            sections: vec![ReportSection::Table {
+                title: None,
+                columns: &["Key", "Average", "Samples"],
+                rows: data
+                    .into_iter()
+                    .take(5)
+                    .map(|(key, stats)| {
+                        vec![
+                            ReportValue::Text(key.clone()),
+                            ReportValue::Milliseconds(stats.average_milliseconds()),
+                            ReportValue::Count(stats.samples),
+                        ]
+                    })
+                    .collect(),
+            }],
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, SystemTime};
+
+    use crate::{
+        input::{KeyEvent, KeyEventKind, KeyRole, PhysicalKey},
+        metric::Metric,
+    };
+
+    use super::DwellTime;
+
+    fn event(at_ms: u64, kind: KeyEventKind, text: Option<&str>) -> KeyEvent {
+        KeyEvent::new(
+            PhysicalKey::new(30, "A"),
+            text.map(str::to_owned),
+            SystemTime::UNIX_EPOCH + Duration::from_millis(at_ms),
+            kind,
+            KeyRole::Other,
+        )
+    }
+
+    #[test]
+    fn uses_text_captured_when_key_was_pressed() {
+        let mut metric = DwellTime::default();
+
+        metric.process(&event(100, KeyEventKind::Press, Some("A")));
+        metric.process(&event(220, KeyEventKind::Release, Some("a")));
+
+        assert_eq!(metric.stats.get("A").map(|stats| stats.samples), Some(1));
+        assert_eq!(metric.stats.get("a").map(|stats| stats.samples), None);
     }
 }

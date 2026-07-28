@@ -1,15 +1,16 @@
+use std::collections::HashMap;
+
 use color_eyre::{Result, eyre::ContextCompat};
 use eframe::egui::{self, ScrollArea};
+use evdev::KeyCode;
 use tracing::{error, info};
 use xkbcommon::xkb::{self, Context, Keymap};
 
 use crate::{
-    listener::{self, KeyValue, ListenerHandle},
-    metric::{
-        KeyContext, Metric, bigram_speed::BigramSpeed, dwell_time::DwellTime,
-        error_rate::ErrorRate, flight_time::FlightTime, heatmap::HeatMap,
-        total_presses::TotalPresses,
-    },
+    input::{KeyEvent, KeyEventKind, KeyRole, PhysicalKey},
+    listener::{self, ListenerHandle},
+    metric::{Metric, default_metrics},
+    metric_view::render_metric,
     scanner::{self, DeviceMetadata, ScannerHandle},
     wake::WakeSignal,
     xkb_helper,
@@ -25,6 +26,7 @@ pub struct App {
     listener_state: ListenerState,
     wake_signal: WakeSignal,
     metrics: Vec<Box<dyn Metric>>,
+    physical_keys: HashMap<u16, PhysicalKey>,
 
     // Keyboard configuration
     model: String,
@@ -55,14 +57,7 @@ impl App {
         let scanner = scanner::spawn(wake_signal.clone());
         scanner.start_scan()?;
 
-        let metrics: Vec<Box<dyn Metric>> = vec![
-            Box::new(TotalPresses::default()),
-            Box::new(HeatMap::default()),
-            Box::new(ErrorRate::default()),
-            Box::new(FlightTime::default()),
-            Box::new(DwellTime::default()),
-            Box::new(BigramSpeed::default()),
-        ];
+        let metrics = default_metrics();
 
         let model = String::new();
         let layout = String::new();
@@ -83,6 +78,7 @@ impl App {
             listener_state: ListenerState::Idle,
             wake_signal,
             metrics,
+            physical_keys: HashMap::new(),
             model,
             layout,
             variant,
@@ -162,32 +158,45 @@ impl App {
                 listener::Event::Input {
                     timestamp,
                     key_code,
-                    value,
+                    kind,
                 } => {
-                    let xkb_code = (key_code.code() + 8).into();
-                    let utf8 = self.xkb_state.key_get_utf8(xkb_code);
-                    let utf8 = (!utf8.is_empty()).then_some(utf8);
+                    let code = key_code.code();
+                    let xkb_code = (code + 8).into();
+                    let text = self.xkb_state.key_get_utf8(xkb_code);
+                    let text = (!text.is_empty()).then_some(text);
 
                     // Decode with the state produced by preceding events, then apply this
                     // event so modifiers and locks affect subsequent key events.
-                    match value {
-                        KeyValue::Down => {
+                    match kind {
+                        KeyEventKind::Press => {
                             self.xkb_state.update_key(xkb_code, xkb::KeyDirection::Down);
                         }
-                        KeyValue::Up => {
+                        KeyEventKind::Release => {
                             self.xkb_state.update_key(xkb_code, xkb::KeyDirection::Up);
                         }
-                        KeyValue::Repeat => {}
+                        KeyEventKind::Repeat => {}
                     }
 
-                    let key_context = KeyContext {
-                        key_code,
-                        utf8,
-                        timestamp,
-                        value,
+                    let key = self
+                        .physical_keys
+                        .entry(code)
+                        .or_insert_with(|| {
+                            let debug_name = format!("{key_code:?}");
+                            let label = debug_name
+                                .strip_prefix("KEY_")
+                                .unwrap_or(&debug_name)
+                                .to_owned();
+                            PhysicalKey::new(code, label)
+                        })
+                        .clone();
+                    let role = if key_code == KeyCode::KEY_BACKSPACE {
+                        KeyRole::Backspace
+                    } else {
+                        KeyRole::Other
                     };
+                    let event = KeyEvent::new(key, text, timestamp, kind, role);
                     for metric in &mut self.metrics {
-                        metric.process(&key_context);
+                        metric.process(&event);
                     }
                 }
             }
@@ -383,6 +392,13 @@ impl eframe::App for App {
                     self.listener = Some(listener::spawn(device_path, self.wake_signal.clone()));
                     self.listener_state = ListenerState::Connecting;
                 }
+
+                ui.separator();
+                if ui.button("Reset session").clicked() {
+                    for metric in &mut self.metrics {
+                        metric.reset();
+                    }
+                }
             });
 
             if request_scan {
@@ -419,7 +435,7 @@ impl eframe::App for App {
 
             ScrollArea::vertical().show(ui, |ui| {
                 for metric in &self.metrics {
-                    metric.ui(ui);
+                    render_metric(ui, metric.as_ref());
                     ui.separator();
                 }
             });

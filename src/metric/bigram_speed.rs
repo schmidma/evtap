@@ -1,95 +1,132 @@
-use std::collections::HashMap;
-use std::time::{Duration, SystemTime};
-
-use eframe::egui::{Grid, Ui};
-use tracing::error;
+use std::{collections::HashMap, time::Duration, time::SystemTime};
 
 use crate::{
-    listener::KeyValue,
-    metric::{KeyContext, Metric},
+    input::{KeyEvent, KeyEventKind},
+    metric::{DurationStats, Metric, MetricDescriptor, MetricReport, ReportSection, ReportValue},
 };
 
-/// Time threshold to consider typing flow
 const TYPING_FLOW_TIMEOUT: Duration = Duration::from_secs(2);
+const MINIMUM_SAMPLES: u64 = 3;
+const DESCRIPTOR: MetricDescriptor = MetricDescriptor {
+    id: "bigram-speed",
+    name: "Bigram Speed",
+    description: "Press-to-press timing for character pairs with at least three samples.",
+};
 
 #[derive(Default)]
 pub struct BigramSpeed {
     last_press: Option<(String, SystemTime)>,
-    // Map "char1 char2" to (total_duration, count)
-    stats: HashMap<(String, String), (Duration, u64)>,
-}
-
-impl Metric for BigramSpeed {
-    fn process(&mut self, ctx: &KeyContext) {
-        if let KeyValue::Down = ctx.value
-            && let Some(current_char) = &ctx.utf8
-        {
-            if let Some((last_char, last_time)) = &self.last_press {
-                let duration_since = match ctx.timestamp.duration_since(*last_time) {
-                    Ok(duration) => duration,
-                    Err(err) => {
-                        error!("failed to compute duration since last release: {err}");
-                        return;
-                    }
-                };
-                if duration_since < TYPING_FLOW_TIMEOUT {
-                    let key = (last_char.clone(), current_char.clone());
-                    let (accumulated_time, count) = self.stats.entry(key).or_default();
-                    *accumulated_time += duration_since;
-                    *count += 1;
-                }
-            }
-            self.last_press = Some((current_char.clone(), ctx.timestamp));
-        }
-    }
-
-    fn ui(&self, ui: &mut Ui) {
-        ui.heading("Bigram Speed (Flow)");
-        ui.small("Speed of specific letter pairs.");
-        ui.add_space(5.0);
-
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.strong("Fastest Pairs");
-                self.render_list(ui, false);
-            });
-            ui.separator();
-            ui.vertical(|ui| {
-                ui.strong("Slowest Pairs");
-                self.render_list(ui, true);
-            });
-        });
-    }
+    stats: HashMap<(String, String), DurationStats>,
 }
 
 impl BigramSpeed {
-    fn render_list(&self, ui: &mut Ui, slowest: bool) {
-        Grid::new(if slowest { "slow_bg" } else { "fast_bg" })
-            .striped(true)
-            .show(ui, |ui| {
-                let mut data: Vec<_> = self
-                    .stats
-                    .iter()
-                    .filter(|(_, (_, count))| *count > 2) // Need at least 3 samples to be relevant
-                    .map(|((c1, c2), (d, c))| {
-                        (
-                            format!("{} -> {}", c1, c2),
-                            d.as_secs_f64() * 1000.0 / *c as f64,
-                        )
-                    })
-                    .collect();
+    fn rows(&self, slowest: bool) -> Vec<Vec<ReportValue>> {
+        let mut data: Vec<_> = self
+            .stats
+            .iter()
+            .filter(|(_, stats)| stats.samples >= MINIMUM_SAMPLES)
+            .collect();
+        data.sort_by(|(left_pair, left), (right_pair, right)| {
+            let order = left
+                .average_milliseconds()
+                .total_cmp(&right.average_milliseconds());
+            let order = if slowest { order.reverse() } else { order };
+            order.then_with(|| left_pair.cmp(right_pair))
+        });
 
-                if slowest {
-                    data.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                } else {
-                    data.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-                }
+        data.into_iter()
+            .take(5)
+            .map(|((first, second), stats)| {
+                vec![
+                    ReportValue::Text(format!("{first} → {second}")),
+                    ReportValue::Milliseconds(stats.average_milliseconds()),
+                    ReportValue::Count(stats.samples),
+                ]
+            })
+            .collect()
+    }
+}
 
-                for (pair, ms) in data.into_iter().take(5) {
-                    ui.label(pair);
-                    ui.label(format!("{:.0} ms", ms));
-                    ui.end_row();
-                }
-            });
+impl Metric for BigramSpeed {
+    fn descriptor(&self) -> &'static MetricDescriptor {
+        &DESCRIPTOR
+    }
+
+    fn process(&mut self, event: &KeyEvent) {
+        if event.kind() != KeyEventKind::Press {
+            return;
+        }
+        let Some(text) = event.text() else {
+            return;
+        };
+
+        if let Some((previous_text, previous_time)) = &self.last_press
+            && let Ok(duration) = event.timestamp().duration_since(*previous_time)
+            && duration < TYPING_FLOW_TIMEOUT
+        {
+            self.stats
+                .entry((previous_text.clone(), text.to_owned()))
+                .or_default()
+                .record(duration);
+        }
+        self.last_press = Some((text.to_owned(), event.timestamp()));
+    }
+
+    fn report(&self) -> MetricReport {
+        MetricReport {
+            sections: vec![
+                ReportSection::Table {
+                    title: Some("Fastest Pairs"),
+                    columns: &["Pair", "Average", "Samples"],
+                    rows: self.rows(false),
+                },
+                ReportSection::Table {
+                    title: Some("Slowest Pairs"),
+                    columns: &["Pair", "Average", "Samples"],
+                    rows: self.rows(true),
+                },
+            ],
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, SystemTime};
+
+    use crate::{
+        input::{KeyEvent, KeyEventKind, KeyRole, PhysicalKey},
+        metric::Metric,
+    };
+
+    use super::BigramSpeed;
+
+    fn press(at_ms: u64, text: &str) -> KeyEvent {
+        KeyEvent::new(
+            PhysicalKey::new(30, text.to_uppercase()),
+            Some(text.to_owned()),
+            SystemTime::UNIX_EPOCH + Duration::from_millis(at_ms),
+            KeyEventKind::Press,
+            KeyRole::Other,
+        )
+    }
+
+    #[test]
+    fn measures_press_to_press_duration() {
+        let mut metric = BigramSpeed::default();
+
+        metric.process(&press(100, "a"));
+        metric.process(&press(180, "b"));
+
+        let key = ("a".to_owned(), "b".to_owned());
+        assert_eq!(metric.stats.get(&key).map(|stats| stats.samples), Some(1));
+        assert_eq!(
+            metric.stats.get(&key).map(|stats| stats.total),
+            Some(Duration::from_millis(80))
+        );
     }
 }

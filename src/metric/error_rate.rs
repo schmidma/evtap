@@ -1,89 +1,149 @@
 use std::collections::{HashMap, VecDeque};
 
-use eframe::egui::{self, Grid, Ui};
-use evdev::KeyCode;
-
 use crate::{
-    listener::KeyValue,
-    metric::{KeyContext, Metric},
+    input::{KeyEvent, KeyEventKind, KeyRole},
+    metric::{Metric, MetricDescriptor, MetricReport, ReportSection, ReportValue},
 };
 
 const HISTORY_SIZE: usize = 10;
+const DESCRIPTOR: MetricDescriptor = MetricDescriptor {
+    id: "corrections",
+    name: "Correction Signals",
+    description: "Backspace-based estimates. A confusion is inferred when text immediately follows a deletion.",
+};
 
 #[derive(Default)]
 pub struct ErrorRate {
-    /// Buffer of recently typed characters (e.g., ['h', 'e', 'l', 'l', 'o'])
     history: VecDeque<String>,
-    /// The character that was just deleted by Backspace, waiting for a correction.
-    last_deleted: Option<String>,
-    /// Counts how often a specific character was deleted.
+    pending_deleted: Option<String>,
     mistakes: HashMap<String, u64>,
-    /// Counts "I typed X instead of Y" (Mistake -> Correction).
     confusions: HashMap<(String, String), u64>,
 }
 
 impl Metric for ErrorRate {
-    fn process(&mut self, ctx: &KeyContext) {
-        if let KeyValue::Up = ctx.value {
+    fn descriptor(&self) -> &'static MetricDescriptor {
+        &DESCRIPTOR
+    }
+
+    fn process(&mut self, event: &KeyEvent) {
+        if event.kind() == KeyEventKind::Release {
             return;
         }
 
-        if ctx.key_code == KeyCode::KEY_BACKSPACE {
+        if event.role() == KeyRole::Backspace {
             if let Some(deleted) = self.history.pop_back() {
-                self.last_deleted = Some(deleted);
+                *self.mistakes.entry(deleted.clone()).or_default() += 1;
+                self.pending_deleted = Some(deleted);
             }
-        } else if let Some(utf8) = &ctx.utf8 {
-            if let Some(mistake) = self.last_deleted.take() {
-                *self.mistakes.entry(mistake.to_string()).or_default() += 1;
-                *self
-                    .confusions
-                    .entry((mistake, utf8.to_string()))
-                    .or_default() += 1;
-            }
+            return;
+        }
 
-            self.history.push_back(utf8.to_string());
-            if self.history.len() > HISTORY_SIZE {
-                self.history.pop_front();
-            }
-        } else {
-            // Non-character key (e.g. Arrows, Shift, Ctrl).
+        let Some(text) = event.text() else {
+            return;
+        };
+        if let Some(deleted) = self.pending_deleted.take() {
+            *self
+                .confusions
+                .entry((deleted, text.to_owned()))
+                .or_default() += 1;
+        }
+
+        self.history.push_back(text.to_owned());
+        if self.history.len() > HISTORY_SIZE {
+            self.history.pop_front();
         }
     }
 
-    fn ui(&self, ui: &mut Ui) {
-        ui.heading("Mistake Analysis");
-        ui.add_space(5.0);
+    fn report(&self) -> MetricReport {
+        let mut mistakes: Vec<_> = self.mistakes.iter().collect();
+        mistakes.sort_by(|(left_key, left), (right_key, right)| {
+            right.cmp(left).then_with(|| left_key.cmp(right_key))
+        });
 
-        egui::Grid::new("error_stats_grid")
-            .striped(true)
-            .show(ui, |ui| {
-                ui.vertical(|ui| {
-                    ui.strong("Most Deleted Keys");
-                    Grid::new("deleted_keys").striped(true).show(ui, |ui| {
-                        let mut sorted_mistakes: Vec<_> = self.mistakes.iter().collect();
-                        sorted_mistakes.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+        let mut confusions: Vec<_> = self.confusions.iter().collect();
+        confusions.sort_by(|(left_pair, left), (right_pair, right)| {
+            right.cmp(left).then_with(|| left_pair.cmp(right_pair))
+        });
 
-                        for (char, count) in sorted_mistakes.into_iter().take(5) {
-                            ui.label(char);
-                            ui.label(format!("{}", count));
-                            ui.end_row();
-                        }
-                    });
-                });
+        MetricReport {
+            sections: vec![
+                ReportSection::Table {
+                    title: Some("Most Deleted Text"),
+                    columns: &["Text", "Deletions"],
+                    rows: mistakes
+                        .into_iter()
+                        .take(5)
+                        .map(|(text, count)| {
+                            vec![ReportValue::Text(text.clone()), ReportValue::Count(*count)]
+                        })
+                        .collect(),
+                },
+                ReportSection::Table {
+                    title: Some("Inferred Corrections"),
+                    columns: &["Deleted → Typed", "Occurrences"],
+                    rows: confusions
+                        .into_iter()
+                        .take(5)
+                        .map(|((deleted, typed), count)| {
+                            vec![
+                                ReportValue::Text(format!("{deleted} → {typed}")),
+                                ReportValue::Count(*count),
+                            ]
+                        })
+                        .collect(),
+                },
+            ],
+        }
+    }
 
-                ui.vertical(|ui| {
-                    ui.strong("Top Confusions (Deleted -> Typed)");
-                    Grid::new("confusions").striped(true).show(ui, |ui| {
-                        let mut sorted_confusions: Vec<_> = self.confusions.iter().collect();
-                        sorted_confusions.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
-                        for ((mistake, correction), count) in sorted_confusions.into_iter().take(5)
-                        {
-                            ui.label(format!("{} -> {}", mistake, correction));
-                            ui.label(format!("{}", count));
-                            ui.end_row();
-                        }
-                    });
-                });
-            });
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::SystemTime;
+
+    use crate::{
+        input::{KeyEvent, KeyEventKind, KeyRole, PhysicalKey},
+        metric::Metric,
+    };
+
+    use super::ErrorRate;
+
+    fn text(value: &str) -> KeyEvent {
+        KeyEvent::new(
+            PhysicalKey::new(30, value.to_uppercase()),
+            Some(value.to_owned()),
+            SystemTime::UNIX_EPOCH,
+            KeyEventKind::Press,
+            KeyRole::Other,
+        )
+    }
+
+    fn backspace() -> KeyEvent {
+        KeyEvent::new(
+            PhysicalKey::new(14, "BACKSPACE"),
+            None,
+            SystemTime::UNIX_EPOCH,
+            KeyEventKind::Press,
+            KeyRole::Backspace,
+        )
+    }
+
+    #[test]
+    fn records_deletion_and_following_correction() {
+        let mut metric = ErrorRate::default();
+
+        metric.process(&text("o"));
+        metric.process(&backspace());
+        metric.process(&text("p"));
+
+        assert_eq!(metric.mistakes.get("o"), Some(&1));
+        assert_eq!(
+            metric.confusions.get(&("o".to_owned(), "p".to_owned())),
+            Some(&1)
+        );
     }
 }

@@ -11,16 +11,9 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 
-use crate::wake::WakeSignal;
+use crate::{input::KeyEventKind, wake::WakeSignal};
 
 const EVENT_CHANNEL_CAPACITY: usize = 2_048;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum KeyValue {
-    Up,
-    Down,
-    Repeat,
-}
 
 #[derive(Debug)]
 pub enum StopReason {
@@ -54,7 +47,7 @@ pub enum Event {
     Input {
         timestamp: SystemTime,
         key_code: KeyCode,
-        value: KeyValue,
+        kind: KeyEventKind,
     },
     Stopped {
         reason: StopReason,
@@ -177,10 +170,10 @@ impl Listener {
         let evdev::EventSummary::Key(key_event, key_code, value) = event.destructure() else {
             return true;
         };
-        let value = match value {
-            0 => KeyValue::Up,
-            1 => KeyValue::Down,
-            2 => KeyValue::Repeat,
+        let kind = match value {
+            0 => KeyEventKind::Release,
+            1 => KeyEventKind::Press,
+            2 => KeyEventKind::Repeat,
             _ => {
                 warn!(?key_code, value, "ignoring unknown key value");
                 return true;
@@ -190,7 +183,7 @@ impl Listener {
         self.send_event(Event::Input {
             timestamp: key_event.timestamp(),
             key_code,
-            value,
+            kind,
         })
         .await
     }

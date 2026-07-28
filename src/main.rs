@@ -5,8 +5,10 @@ use tracing_subscriber::EnvFilter;
 use crate::app::App;
 
 mod app;
+mod input;
 mod listener;
 mod metric;
+mod metric_view;
 mod scanner;
 mod wake;
 mod xkb_helper;
