@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build Linux release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libxkbcommon-dev
+      - name: Install current Rust toolchain
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+      - name: Verify tag matches package version
+        shell: bash
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          package_version="$(cargo metadata --no-deps --format-version 1 | jq --raw-output '.packages[0].version')"
+          if [[ "$tag_version" != "$package_version" ]]; then
+            echo "Tag version $tag_version does not match Cargo package version $package_version" >&2
+            exit 1
+          fi
+      - name: Build release binary
+        run: cargo build --release --locked
+      - name: Package release
+        id: package
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          target="x86_64-unknown-linux-gnu"
+          directory="evtap-${version}-${target}"
+          archive="${directory}.tar.gz"
+
+          install -Dm755 target/release/evtap "dist/${directory}/evtap"
+          install -Dm644 README.md LICENSE-MIT LICENSE-APACHE -t "dist/${directory}"
+          source_date_epoch="$(git show -s --format=%ct HEAD)"
+          tar --sort=name \
+              --mtime="@${source_date_epoch}" \
+              --owner=0 --group=0 --numeric-owner \
+              -C dist -cf - "$directory" | gzip -n > "dist/${archive}"
+          sha256sum "dist/${archive}" > "dist/${archive}.sha256"
+
+          echo "archive=dist/${archive}" >> "$GITHUB_OUTPUT"
+          echo "checksum=dist/${archive}.sha256" >> "$GITHUB_OUTPUT"
+      - name: Create GitHub release
+        shell: bash
+        env:
+          ARCHIVE_PATH: ${{ steps.package.outputs.archive }}
+          CHECKSUM_PATH: ${{ steps.package.outputs.checksum }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          options=(--verify-tag --generate-notes --title "$GITHUB_REF_NAME")
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            options+=(--prerelease)
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            "$ARCHIVE_PATH" \
+            "$CHECKSUM_PATH" \
+            "${options[@]}"
