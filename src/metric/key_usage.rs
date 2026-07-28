@@ -129,7 +129,7 @@ mod tests {
 
     use crate::{
         input::{KeyEvent, KeyEventKind, KeyRole, PhysicalKey},
-        metric::Metric,
+        metric::{Metric, MetricSnapshot},
     };
 
     use super::KeyUsage;
@@ -151,5 +151,37 @@ mod tests {
 
         assert_eq!(metric.counts.get(&a), Some(&1));
         assert_eq!(metric.counts.len(), 2);
+    }
+
+    #[test]
+    fn snapshot_is_deterministic_and_rejects_duplicate_codes() {
+        let a = PhysicalKey::new(30, "A");
+        let b = PhysicalKey::new(48, "B");
+        let mut first = KeyUsage::default();
+        first.process(&event(b.clone(), KeyEventKind::Press));
+        first.process(&event(a.clone(), KeyEventKind::Press));
+        let mut second = KeyUsage::default();
+        second.process(&event(a.clone(), KeyEventKind::Press));
+        second.process(&event(b, KeyEventKind::Press));
+
+        let snapshot = first.snapshot().unwrap();
+        assert_eq!(
+            snapshot.payload_json(),
+            second.snapshot().unwrap().payload_json()
+        );
+
+        let mut restored = KeyUsage::default();
+        restored.restore(&snapshot).unwrap();
+        assert_eq!(restored.counts, first.counts);
+
+        let duplicate = MetricSnapshot::from_json(
+            "key-usage",
+            1,
+            r#"{"keys":[{"code":30,"label":"A","count":1},{"code":30,"label":"OTHER","count":1}]}"#
+                .to_owned(),
+        )
+        .unwrap();
+        assert!(restored.restore(&duplicate).is_err());
+        assert_eq!(restored.counts, first.counts);
     }
 }

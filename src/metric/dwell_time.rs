@@ -186,4 +186,23 @@ mod tests {
         assert_eq!(metric.stats.get("A").map(|stats| stats.samples), Some(1));
         assert_eq!(metric.stats.get("a").map(|stats| stats.samples), None);
     }
+
+    #[test]
+    fn snapshot_does_not_restore_pressed_keys() {
+        let mut metric = DwellTime::default();
+        metric.process(&event(100, KeyEventKind::Press, Some("a")));
+        metric.process(&event(180, KeyEventKind::Release, Some("a")));
+        metric.process(&event(200, KeyEventKind::Press, Some("b")));
+        assert_eq!(metric.pressed_keys.len(), 1);
+
+        let mut restored = DwellTime::default();
+        restored.restore(&metric.snapshot().unwrap()).unwrap();
+        assert_eq!(restored.stats, metric.stats);
+        assert!(restored.pressed_keys.is_empty());
+
+        restored.process(&event(260, KeyEventKind::Release, Some("b")));
+        assert!(!restored.stats.contains_key("b"));
+        restored.reset();
+        assert!(!restored.has_data());
+    }
 }

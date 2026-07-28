@@ -13,6 +13,7 @@ use crate::input::KeyEvent;
 const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_DIMENSION_ENTRIES: usize = 100_000;
 const MAX_DIMENSION_BYTES: usize = 256;
+const MAX_AGGREGATE_COUNT: u64 = i64::MAX as u64;
 const MAX_DURATION_NANOSECONDS: u64 = i64::MAX as u64;
 
 mod bigram_speed;
@@ -229,7 +230,18 @@ fn validate_dimension(metric_id: &str, value: &str) -> Result<(), MetricSnapshot
     Ok(())
 }
 
+fn validate_scalar_count(metric_id: &str, count: u64) -> Result<(), MetricSnapshotError> {
+    if count > MAX_AGGREGATE_COUNT {
+        return Err(MetricSnapshotError::invalid_payload(
+            metric_id,
+            "aggregate count is too large",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_count(metric_id: &str, count: u64) -> Result<(), MetricSnapshotError> {
+    validate_scalar_count(metric_id, count)?;
     if count == 0 {
         return Err(MetricSnapshotError::invalid_payload(
             metric_id,
@@ -305,7 +317,11 @@ mod tests {
 
     use serde::{Deserialize, Serialize};
 
-    use super::{MetricSnapshot, MetricSnapshotError, default_metrics};
+    use super::{
+        DurationStats, MAX_AGGREGATE_COUNT, MAX_DIMENSION_BYTES, MAX_DIMENSION_ENTRIES,
+        MAX_DURATION_NANOSECONDS, MetricSnapshot, MetricSnapshotError, default_metrics,
+        validate_count, validate_dimension, validate_entry_count, validate_scalar_count,
+    };
 
     #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
     struct TestPayload {
@@ -351,6 +367,34 @@ mod tests {
             MetricSnapshot::from_json("test", 1, "x".repeat(super::MAX_SNAPSHOT_BYTES + 1)),
             Err(MetricSnapshotError::PayloadTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn validators_reject_unsafe_aggregate_values() {
+        assert!(validate_scalar_count("test", 0).is_ok());
+        assert!(validate_scalar_count("test", MAX_AGGREGATE_COUNT + 1).is_err());
+        assert!(validate_count("test", 1).is_ok());
+        assert!(validate_count("test", 0).is_err());
+        assert!(validate_dimension("test", &"x".repeat(MAX_DIMENSION_BYTES)).is_ok());
+        assert!(validate_dimension("test", &"x".repeat(MAX_DIMENSION_BYTES + 1)).is_err());
+        assert!(validate_entry_count("test", MAX_DIMENSION_ENTRIES).is_ok());
+        assert!(validate_entry_count("test", MAX_DIMENSION_ENTRIES + 1).is_err());
+        assert!(DurationStats::from_snapshot_parts("test", 1, 1).is_ok());
+        assert!(
+            DurationStats::from_snapshot_parts("test", MAX_DURATION_NANOSECONDS + 1, 1).is_err()
+        );
+    }
+
+    #[test]
+    fn failed_restore_does_not_change_default_metrics() {
+        for mut metric in default_metrics() {
+            let before = metric.report();
+            let malformed =
+                MetricSnapshot::from_json(metric.descriptor().id, 1, "{".to_owned()).unwrap();
+
+            assert!(metric.restore(&malformed).is_err());
+            assert_eq!(metric.report(), before);
+        }
     }
 
     #[test]

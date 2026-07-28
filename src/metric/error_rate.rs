@@ -276,4 +276,42 @@ mod tests {
             Some(&1)
         );
     }
+
+    #[test]
+    fn snapshot_restores_aggregates_without_transient_text_context() {
+        let mut metric = ErrorRate::default();
+        metric.process(&text("o"));
+        metric.process(&backspace());
+        assert_eq!(metric.pending_deleted.as_deref(), Some("o"));
+
+        let snapshot = metric.snapshot().unwrap();
+        let mut restored = ErrorRate::default();
+        restored.restore(&snapshot).unwrap();
+
+        assert_eq!(restored.mistakes.get("o"), Some(&1));
+        assert!(restored.history.is_empty());
+        assert!(restored.pending_deleted.is_none());
+        restored.process(&text("p"));
+        assert!(restored.confusions.is_empty());
+
+        restored.process(&backspace());
+        assert_eq!(restored.mistakes.get("p"), Some(&1));
+        restored.reset();
+        assert!(!restored.has_data());
+        assert!(restored.history.is_empty());
+    }
+
+    #[test]
+    fn snapshot_round_trips_correction_counts() {
+        let mut metric = ErrorRate::default();
+        metric.process(&text("o"));
+        metric.process(&backspace());
+        metric.process(&text("p"));
+
+        let mut restored = ErrorRate::default();
+        restored.restore(&metric.snapshot().unwrap()).unwrap();
+
+        assert_eq!(restored.mistakes, metric.mistakes);
+        assert_eq!(restored.confusions, metric.confusions);
+    }
 }

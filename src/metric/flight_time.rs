@@ -182,4 +182,26 @@ mod tests {
             Some(Duration::from_millis(75))
         );
     }
+
+    #[test]
+    fn snapshot_does_not_bridge_release_context_across_restore() {
+        let mut metric = FlightTime::default();
+        metric.process(&event(100, KeyEventKind::Release, Some("a")));
+        metric.process(&event(175, KeyEventKind::Press, Some("b")));
+        metric.process(&event(200, KeyEventKind::Release, Some("b")));
+
+        let mut restored = FlightTime::default();
+        restored.restore(&metric.snapshot().unwrap()).unwrap();
+        assert_eq!(restored.stats, metric.stats);
+        assert!(restored.last_release.is_none());
+
+        restored.process(&event(250, KeyEventKind::Press, Some("c")));
+        assert!(!restored.stats.contains_key("c"));
+        restored.process(&event(300, KeyEventKind::Release, Some("c")));
+        restored.process(&event(350, KeyEventKind::Press, Some("d")));
+        assert_eq!(restored.stats.get("d").map(|stats| stats.samples), Some(1));
+
+        restored.reset();
+        assert!(!restored.has_data());
+    }
 }

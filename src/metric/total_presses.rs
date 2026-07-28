@@ -4,7 +4,7 @@ use crate::{
     input::{KeyEvent, KeyEventKind},
     metric::{
         Metric, MetricDescriptor, MetricReport, MetricSnapshot, MetricSnapshotError, ReportSection,
-        ReportValue,
+        ReportValue, validate_scalar_count,
     },
 };
 
@@ -51,6 +51,7 @@ impl Metric for TotalPresses {
     }
 
     fn snapshot(&self) -> Result<MetricSnapshot, MetricSnapshotError> {
+        validate_scalar_count(DESCRIPTOR.id, self.count)?;
         MetricSnapshot::encode(
             DESCRIPTOR.id,
             SNAPSHOT_VERSION,
@@ -60,6 +61,7 @@ impl Metric for TotalPresses {
 
     fn restore(&mut self, snapshot: &MetricSnapshot) -> Result<(), MetricSnapshotError> {
         let state: SnapshotV1 = snapshot.decode(DESCRIPTOR.id, SNAPSHOT_VERSION)?;
+        validate_scalar_count(DESCRIPTOR.id, state.count)?;
         self.count = state.count;
         Ok(())
     }
@@ -75,7 +77,7 @@ mod tests {
 
     use crate::{
         input::{KeyEvent, KeyEventKind, KeyRole, PhysicalKey},
-        metric::Metric,
+        metric::{Metric, MetricSnapshot},
     };
 
     use super::TotalPresses;
@@ -99,5 +101,39 @@ mod tests {
         metric.process(&event(KeyEventKind::Release));
 
         assert_eq!(metric.count, 1);
+    }
+
+    #[test]
+    fn snapshot_round_trips_and_restore_is_all_or_nothing() {
+        let mut metric = TotalPresses::default();
+        metric.process(&event(KeyEventKind::Press));
+        let snapshot = metric.snapshot().unwrap();
+
+        let mut restored = TotalPresses::default();
+        restored.restore(&snapshot).unwrap();
+        assert!(restored.has_data());
+        assert_eq!(restored.count, 1);
+
+        let invalid = MetricSnapshot::from_json(
+            "total-presses",
+            1,
+            r#"{"count":2,"unknown":true}"#.to_owned(),
+        )
+        .unwrap();
+        assert!(restored.restore(&invalid).is_err());
+        assert_eq!(restored.count, 1);
+
+        let overflowing = MetricSnapshot::from_json(
+            "total-presses",
+            1,
+            r#"{"count":9223372036854775808}"#.to_owned(),
+        )
+        .unwrap();
+        assert!(restored.restore(&overflowing).is_err());
+        assert_eq!(restored.count, 1);
+
+        restored.reset();
+        assert!(!restored.has_data());
+        assert_eq!(restored.count, 0);
     }
 }

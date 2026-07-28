@@ -207,4 +207,34 @@ mod tests {
             Some(Duration::from_millis(80))
         );
     }
+
+    #[test]
+    fn snapshot_does_not_bridge_bigram_context_across_restore() {
+        let mut metric = BigramSpeed::default();
+        metric.process(&press(100, "a"));
+        metric.process(&press(180, "b"));
+
+        let mut restored = BigramSpeed::default();
+        restored.restore(&metric.snapshot().unwrap()).unwrap();
+        assert_eq!(restored.stats, metric.stats);
+        assert!(restored.last_press.is_none());
+
+        restored.process(&press(250, "c"));
+        assert!(
+            !restored
+                .stats
+                .contains_key(&("b".to_owned(), "c".to_owned()))
+        );
+        restored.process(&press(300, "d"));
+        assert_eq!(
+            restored
+                .stats
+                .get(&("c".to_owned(), "d".to_owned()))
+                .map(|stats| stats.samples),
+            Some(1)
+        );
+
+        restored.reset();
+        assert!(!restored.has_data());
+    }
 }
