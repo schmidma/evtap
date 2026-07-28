@@ -14,6 +14,7 @@ mod paths;
 mod scanner;
 mod session;
 mod settings;
+mod storage;
 mod wake;
 mod xkb_helper;
 
