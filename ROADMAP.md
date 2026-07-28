@@ -32,7 +32,13 @@ The `0.1.x` goal is a trustworthy Linux-only beta for personal use.
 - [ ] Validate at least one permission-denied and reconnect workflow interactively
 - [ ] Publish and test a GitHub prerelease before the final `v0.1.0` tag
 
-## After 0.1
+## 0.2 — opt-in aggregate persistence
+
+The [accepted persistence specification](docs/persistence-spec.md) defines local, versioned aggregate storage without raw event history. Implementation has not started.
+
+The planned scope includes resumable active sessions, completed-session history, retention and deletion controls, privacy-sensitive settings, and separate eframe window-state persistence.
+
+## After 0.2
 
 Potential directions, ordered only loosely:
 
@@ -41,7 +47,6 @@ Potential directions, ordered only loosely:
 - Better automatic desktop XKB configuration detection
 - Device hotplug monitoring and smoother reconnect behavior
 - More robust correction and editing analysis with explicit uncertainty
-- Optional aggregate persistence designed with a new privacy review
 - Optional aggregate export designed with a stable data schema
 - A deliberately public library or plugin API if external consumers emerge
 - Additional operating systems only when capture and permission models can be supported responsibly
