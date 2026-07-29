@@ -7,13 +7,13 @@
 > [!WARNING]
 > evtap observes global keyboard input from the selected device while listening. Treat it like a keylogger even though it processes data locally and does not save raw input. Read the [privacy model](docs/privacy.md) before use.
 
-evtap is pre-1.0 software. `0.1.x` is the session-only baseline; the current `0.2` development line adds explicitly opt-in local aggregate persistence. Interfaces and behavior may still change between minor versions.
+evtap is pre-1.0 software. `0.1.x` is the process-only baseline; the current `0.2` development line adds resumable sessions with optional local aggregate saves. Interfaces and behavior may still change between minor versions.
 
 ## Current scope
 
 - Linux desktop application using evdev input devices
 - One explicitly selected keyboard at a time
-- In-memory analytics by default, with optional local aggregate session history
+- One mutable working session, with manual saves, optional autosave, and saved-session switching
 - No raw-event persistence, export, telemetry, cloud account, or network requests
 - Ranked key-usage table rather than a physical keyboard heatmap
 - Manual XKB model, layout, and variant selection
@@ -98,20 +98,20 @@ If evtap cannot inspect any input devices, it displays a permission message rath
 
 ## Usage
 
-1. Start evtap and wait for keyboard scanning to finish.
-2. Select a readable keyboard.
-3. Select the XKB model, layout, and variant matching that keyboard. Blank model/layout values use XKB defaults.
-4. Choose **Start listening**.
-5. Type normally in other applications; evtap updates when global events arrive.
-6. Choose **Stop listening** to pause capture while retaining the active session.
-7. Choose **Discard current session** when persistence is off. With persistence enabled, use **Finish session** to archive it or **Discard session** to delete it.
-8. Open **History** to inspect or delete completed sessions when persistence is enabled.
+1. Start evtap and wait for keyboard scanning to finish. evtap loads the last-selected saved session when one exists; otherwise it starts with an untitled in-memory session.
+2. Select a readable keyboard and the matching XKB model, layout, and variant. Remembered session values are suggestions rather than restrictions.
+3. Choose **Start listening**.
+4. Type normally in other applications; evtap updates when global events arrive.
+5. Choose **Stop listening** to pause capture while keeping the same working session.
+6. Choose **Save now** to write the current aggregate state. The first save displays a sensitivity disclosure.
+7. Optionally enable **Autosave sessions** for 30-second periodic saves and automatic saves on Stop, session switch, and normal close.
+8. Use the session selector or **New session** to change working sessions. With autosave off, dirty switches and closes offer Save, Discard, or Cancel.
 
-Keyboard and XKB configuration become fixed when a capture session starts. A recovered session resumes paused and never starts capture automatically.
+Saved sessions remain mutable and resumable until explicitly deleted. There is no finish or history state. A restored or newly selected session is always paused; capture never starts automatically.
 
-## Optional aggregate persistence
+## Optional aggregate saves
 
-Persistence is off by default. Enabling it requires an in-app disclosure explaining that aggregate labels can still be sensitive. When enabled, evtap stores versioned metric snapshots in a local, unencrypted SQLite database and uses a 90-day completed-session retention policy by default. Available retention choices are 30, 90, or 365 days, or forever.
+Every session begins in memory. Manual save and autosave write versioned metric snapshots to a local, unencrypted SQLite database. The first operation that can write analytics requires an in-app disclosure explaining that aggregate labels remain sensitive. Session names are optional, and autosave is an editor-like preference rather than a separate application mode.
 
 Expected Linux locations are:
 
@@ -121,9 +121,9 @@ $XDG_DATA_HOME/evtap/app.ron
 $XDG_DATA_HOME/evtap/evtap.sqlite3
 ```
 
-with the usual `~/.config` and `~/.local/share` fallbacks. `settings.json` records consent, retention, and XKB preferences. `app.ron` contains native window state only. `evtap.sqlite3` contains session metadata and aggregate metric snapshots. evtap creates private application directories and files with restrictive Unix permissions, but the database is not encrypted and filesystem backups or privileged processes can still read it.
+with the usual `~/.config` and `~/.local/share` fallbacks. `settings.json` records the one-time storage disclosure acknowledgement, autosave, last-selected session ID, and fallback XKB preferences. `app.ron` contains native window state only. `evtap.sqlite3` contains saved session metadata and aggregate metric snapshots. evtap creates private application directories and files with restrictive Unix permissions, but the database is not encrypted and filesystem backups or privileged processes can still read it.
 
-Active sessions are checkpointed approximately every 30 seconds while dirty, immediately after capture stops, during finishing, and during graceful exit. A crash can lose changes after the latest committed checkpoint. See the [persistence specification](docs/persistence-spec.md) and [privacy model](docs/privacy.md) for exact fields and lifecycle behavior.
+With autosave enabled, dirty sessions are saved approximately every 30 seconds during capture and at Stop, switch, and normal-close boundaries. With autosave disabled, only explicit saves write analytics; dirty switches and closes prompt before dropping state. A crash can lose changes after the latest acknowledged save. See the [persistence specification](docs/persistence-spec.md) and [privacy model](docs/privacy.md) for exact fields and lifecycle behavior.
 
 ## Keyboard layout behavior
 
@@ -139,9 +139,9 @@ evtap:
 - computes aggregate metrics locally;
 - keeps bounded transient state needed for timing and correction inference;
 - never persists raw events, ordered text, event timestamps, pressed-key state, or transient correction history;
-- can optionally persist sensitive aggregate labels, counts, and duration totals;
+- can manually or automatically save sensitive aggregate labels, counts, and duration totals;
 - does not export, transmit, or send telemetry;
-- discards the active session on exit when persistence is off, or checkpoints it for paused recovery when persistence is enabled.
+- prompts before dropping dirty state when autosave is off and restores only an explicitly saved session.
 
 More detail is available in [docs/privacy.md](docs/privacy.md).
 

@@ -9,39 +9,18 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-const SETTINGS_SCHEMA_VERSION: u32 = 1;
-const DEFAULT_RETENTION_DAYS: u32 = 90;
+use crate::session::SessionId;
+
+const SETTINGS_SCHEMA_VERSION: u32 = 2;
 const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
 const MAX_KEYBOARD_VALUE_BYTES: usize = 256;
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RetentionPolicy {
-    Days(u32),
-    Forever,
-}
-
-impl RetentionPolicy {
-    pub fn days(self) -> Option<u32> {
-        match self {
-            Self::Days(days) => Some(days),
-            Self::Forever => None,
-        }
-    }
-
-    fn validate(self) -> Result<(), SettingsError> {
-        match self {
-            Self::Days(30 | 90 | 365) | Self::Forever => Ok(()),
-            Self::Days(_) => Err(SettingsError::InvalidRetention),
-        }
-    }
-}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 pub struct Settings {
     schema_version: u32,
-    persistence: PersistenceSettings,
+    storage: StorageSettings,
     keyboard: KeyboardSettings,
 }
 
@@ -49,31 +28,35 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             schema_version: SETTINGS_SCHEMA_VERSION,
-            persistence: PersistenceSettings::default(),
+            storage: StorageSettings::default(),
             keyboard: KeyboardSettings::default(),
         }
     }
 }
 
 impl Settings {
-    pub fn persistence_enabled(&self) -> bool {
-        self.persistence.enabled
+    pub fn storage_disclosure_acknowledged(&self) -> bool {
+        self.storage.disclosure_acknowledged
     }
 
-    pub fn set_persistence_enabled(&mut self, enabled: bool) {
-        self.persistence.enabled = enabled;
+    pub fn acknowledge_storage_disclosure(&mut self) {
+        self.storage.disclosure_acknowledged = true;
     }
 
-    pub fn retention(&self) -> RetentionPolicy {
-        self.persistence
-            .retention_days
-            .map_or(RetentionPolicy::Forever, RetentionPolicy::Days)
+    pub fn autosave_enabled(&self) -> bool {
+        self.storage.autosave_enabled
     }
 
-    pub fn set_retention(&mut self, retention: RetentionPolicy) -> Result<(), SettingsError> {
-        retention.validate()?;
-        self.persistence.retention_days = retention.days();
-        Ok(())
+    pub fn set_autosave_enabled(&mut self, enabled: bool) {
+        self.storage.autosave_enabled = enabled;
+    }
+
+    pub fn last_session_id(&self) -> Option<SessionId> {
+        self.storage.last_session_id.and_then(SessionId::new)
+    }
+
+    pub fn set_last_session_id(&mut self, session_id: Option<SessionId>) {
+        self.storage.last_session_id = session_id.map(SessionId::get);
     }
 
     pub fn keyboard_model(&self) -> &str {
@@ -103,7 +86,9 @@ impl Settings {
                 actual: self.schema_version,
             });
         }
-        self.retention().validate()?;
+        if self.storage.last_session_id.is_some_and(|id| id <= 0) {
+            return Err(SettingsError::InvalidSessionId);
+        }
         for value in [
             &self.keyboard.model,
             &self.keyboard.layout,
@@ -117,20 +102,12 @@ impl Settings {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
-struct PersistenceSettings {
-    enabled: bool,
-    retention_days: Option<u32>,
-}
-
-impl Default for PersistenceSettings {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            retention_days: Some(DEFAULT_RETENTION_DAYS),
-        }
-    }
+struct StorageSettings {
+    disclosure_acknowledged: bool,
+    autosave_enabled: bool,
+    last_session_id: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -152,15 +129,15 @@ impl SettingsStore {
     }
 
     pub fn load(&self) -> Result<Settings, SettingsError> {
-        let metadata = match fs::symlink_metadata(&self.path) {
+        let metadata = match fs::metadata(&self.path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(Settings::default());
             }
             Err(source) => return Err(SettingsError::ReadMetadata { source }),
         };
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(SettingsError::UnsafePath);
+        if !metadata.is_file() {
+            return Err(SettingsError::NotRegularFile);
         }
         if metadata.len() > MAX_SETTINGS_BYTES {
             return Err(SettingsError::FileTooLarge);
@@ -195,7 +172,6 @@ impl SettingsStore {
 
         let parent = self.path.parent().ok_or(SettingsError::MissingParent)?;
         ensure_private_directory(parent)?;
-        reject_existing_symlink(&self.path)?;
 
         let file_name = self
             .path
@@ -237,10 +213,10 @@ impl SettingsStore {
 }
 
 fn ensure_private_directory(path: &Path) -> Result<(), SettingsError> {
-    match fs::symlink_metadata(path) {
+    match fs::metadata(path) {
         Ok(metadata) => {
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                return Err(SettingsError::UnsafeDirectory);
+            if !metadata.is_dir() {
+                return Err(SettingsError::NotDirectory);
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -255,17 +231,6 @@ fn ensure_private_directory(path: &Path) -> Result<(), SettingsError> {
     set_private_permissions(path, 0o700)
 }
 
-fn reject_existing_symlink(path: &Path) -> Result<(), SettingsError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            Err(SettingsError::UnsafePath)
-        }
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(SettingsError::ReadMetadata { source }),
-    }
-}
-
 fn set_private_permissions(path: &Path, mode: u32) -> Result<(), SettingsError> {
     fs::set_permissions(path, fs::Permissions::from_mode(mode))
         .map_err(|source| SettingsError::SetPermissions { source })
@@ -277,16 +242,16 @@ pub enum SettingsError {
     MissingParent,
     #[error("settings path has an invalid file name")]
     InvalidFileName,
-    #[error("settings path is a symbolic link or not a regular file")]
-    UnsafePath,
-    #[error("settings directory is a symbolic link or not a directory")]
-    UnsafeDirectory,
+    #[error("settings path is not a regular file")]
+    NotRegularFile,
+    #[error("settings directory path is not a directory")]
+    NotDirectory,
     #[error("settings file exceeds the size limit")]
     FileTooLarge,
     #[error("settings schema version {actual} is unsupported; expected {supported}")]
     UnsupportedSchemaVersion { supported: u32, actual: u32 },
-    #[error("settings retention must be 30, 90, 365 days, or forever")]
-    InvalidRetention,
+    #[error("last session ID is invalid")]
+    InvalidSessionId,
     #[error("keyboard setting exceeds the size limit")]
     KeyboardValueTooLong,
     #[error("failed to read settings metadata")]
@@ -358,14 +323,13 @@ pub enum SettingsError {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        os::unix::fs::{PermissionsExt as _, symlink},
-    };
+    use std::{fs, os::unix::fs::PermissionsExt as _};
 
     use tempfile::tempdir;
 
-    use super::{RetentionPolicy, Settings, SettingsError, SettingsStore};
+    use crate::session::SessionId;
+
+    use super::{Settings, SettingsError, SettingsStore};
 
     #[test]
     fn missing_settings_use_defaults_without_creating_files() {
@@ -375,10 +339,10 @@ mod tests {
 
         let settings = store.load().unwrap();
 
-        assert!(!settings.persistence_enabled());
-        assert_eq!(settings.retention(), RetentionPolicy::Days(90));
+        assert!(!settings.storage_disclosure_acknowledged());
+        assert!(!settings.autosave_enabled());
+        assert_eq!(settings.last_session_id(), None);
         assert!(!path.exists());
-        assert!(!path.parent().unwrap().exists());
     }
 
     #[test]
@@ -387,8 +351,9 @@ mod tests {
         let path = temporary.path().join("config/evtap/settings.json");
         let store = SettingsStore::new(path.clone());
         let mut settings = Settings::default();
-        settings.set_persistence_enabled(true);
-        settings.set_retention(RetentionPolicy::Forever).unwrap();
+        settings.acknowledge_storage_disclosure();
+        settings.set_autosave_enabled(true);
+        settings.set_last_session_id(SessionId::new(7));
         settings.set_keyboard("pc105".to_owned(), "de".to_owned(), "nodeadkeys".to_owned());
 
         store.save(&settings).unwrap();
@@ -412,51 +377,35 @@ mod tests {
     fn unsupported_schema_is_not_silently_replaced() {
         let temporary = tempdir().unwrap();
         let path = temporary.path().join("settings.json");
-        fs::write(
-            &path,
-            r#"{"schema_version":2,"persistence":{"enabled":true,"retention_days":90}}"#,
-        )
-        .unwrap();
+        fs::write(&path, r#"{"schema_version":1}"#).unwrap();
         let original = fs::read(&path).unwrap();
         let store = SettingsStore::new(path.clone());
 
         assert!(matches!(
             store.load(),
-            Err(SettingsError::UnsupportedSchemaVersion { actual: 2, .. })
+            Err(SettingsError::UnsupportedSchemaVersion { actual: 1, .. })
         ));
         assert_eq!(fs::read(path).unwrap(), original);
     }
 
     #[test]
-    fn rejects_symlinked_and_oversized_settings_without_modifying_them() {
+    fn follows_symlinked_settings_and_rejects_oversized_files() {
         let temporary = tempdir().unwrap();
         let target = temporary.path().join("target.json");
         let path = temporary.path().join("settings.json");
-        fs::write(&target, b"sensitive target").unwrap();
-        symlink(&target, &path).unwrap();
-        let store = SettingsStore::new(path);
+        fs::write(&target, serde_json::to_vec(&Settings::default()).unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
 
-        assert!(matches!(store.load(), Err(SettingsError::UnsafePath)));
-        assert!(matches!(
-            store.save(&Settings::default()),
-            Err(SettingsError::UnsafePath)
-        ));
-        assert_eq!(fs::read(&target).unwrap(), b"sensitive target");
+        assert_eq!(
+            SettingsStore::new(path).load().unwrap(),
+            Settings::default()
+        );
 
         let oversized = temporary.path().join("oversized.json");
         fs::write(&oversized, vec![b' '; 1024 * 1024 + 1]).unwrap();
         assert!(matches!(
             SettingsStore::new(oversized).load(),
             Err(SettingsError::FileTooLarge)
-        ));
-    }
-
-    #[test]
-    fn rejects_unsupported_retention() {
-        let mut settings = Settings::default();
-        assert!(matches!(
-            settings.set_retention(RetentionPolicy::Days(7)),
-            Err(SettingsError::InvalidRetention)
         ));
     }
 }

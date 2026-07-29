@@ -202,6 +202,7 @@ pub trait Metric {
     fn has_data(&self) -> bool;
     fn snapshot(&self) -> Result<MetricSnapshot, MetricSnapshotError>;
     fn restore(&mut self, snapshot: &MetricSnapshot) -> Result<(), MetricSnapshotError>;
+    fn clear_in_flight(&mut self) {}
     fn reset(&mut self);
 }
 

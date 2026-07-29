@@ -1,379 +1,266 @@
-# Aggregate persistence specification
+# Resumable session persistence specification
 
-**Status:** Accepted  
-**Target:** evtap 0.2.0  
+**Status:** Accepted, revised
+**Target:** evtap 0.2.0
 **Last updated:** 2026-07-28
 
-This document specifies local persistence for evtap. It is a design artifact, not a description of behavior available in 0.1.x.
+This document specifies optional local disk backing for evtap sessions. It is a design artifact, not behavior available in the stable 0.1.x release.
 
 ## 1. Summary
 
-evtap 0.2.0 will optionally persist aggregate session analytics in a local SQLite database. Persistence is disabled by default and requires an explicit privacy disclosure. The database will never contain raw key events, event order, event timestamps, recent text history, or pressed-key state.
+evtap always operates on one loaded, mutable working session. A session accumulates aggregate keyboard metrics across any number of capture runs and may be resumed indefinitely. Users may save sessions, switch between saved sessions, rename them, reset them, or delete them.
 
-The first persistence release will support:
+Disk storage is not a separate session mode. Without saving, the same session workflow operates entirely in memory and disappears when the process exits. A manual save or autosave writes the working session to a local, unencrypted SQLite database.
 
-- crash-safe checkpoints of the active session;
-- resuming aggregate state after restarting evtap;
-- finalized session history;
-- per-session detail views using existing metric reports;
-- configurable retention;
-- individual deletion and complete analytics deletion;
-- remembered XKB preferences in a separate settings file.
+There are no completed sessions, finalization, history, or retention policies. Session lifetime is controlled exclusively by explicit user deletion.
 
-Cross-session charts, export, synchronization, accounts, telemetry, and encryption are not part of this release.
+## 2. Product model
 
-## 2. Motivation
+### 2.1 Session
 
-Session-only analysis makes it impossible to inspect earlier sessions, compare observations over time, or recover from an application restart. Persistence should add those capabilities without turning evtap into a raw key logger or coupling storage to Linux evdev events.
+A session is a mutable statistics bucket with:
 
-The design must preserve these architectural properties:
+- an internal identity after its first save;
+- an optional user-facing name;
+- creation and update times;
+- accumulated active-capture duration;
+- remembered keyboard display name and XKB configuration;
+- versioned durable snapshots for every metric.
 
-1. Capture produces normalized `KeyEvent`s.
-2. Metrics consume events and own their aggregate algorithms.
-3. Persistence receives only versioned aggregate snapshots.
-4. Rendering consumes UI-neutral metric reports.
-5. Raw input never crosses into the storage subsystem.
+A name is optional. The UI renders a missing name as **Untitled session** and uses metadata to distinguish multiple untitled saved sessions. Nonempty names must be unique as a usability safeguard; internal IDs remain authoritative.
 
-## 3. Accepted product decisions
+A session is not tied to a workplace, device, or layout by enforcement. Remembered keyboard and XKB values are defaults only. Users may intentionally accumulate events from any readable keyboard or configuration into any session.
 
-1. Persistence is opt-in and disabled by default.
-2. Once enabled, all aggregate metrics are persisted, including character labels, bigrams, deleted-character counts, and correction pairs.
-3. Raw events and transient metric context are never persisted.
-4. An active session resumes across process restarts.
-5. Stopping capture pauses a session; finishing archives it; discarding deletes it.
-6. Completed sessions are retained for 90 days by default.
-7. Storage is an unencrypted SQLite database protected by restrictive filesystem permissions.
-8. The first history UI provides a session list and per-session details, not trends.
-9. XKB model, layout, and variant preferences are remembered; evdev paths are not.
-10. Persistence is a 0.2.0 feature and changes the documented 0.1.x privacy contract.
+### 2.2 Working session
 
-## 4. Terminology
+Exactly one session is loaded into memory at a time. It may be:
 
-- **Capture run:** one continuous interval between starting and stopping the listener.
-- **Active session:** the mutable analysis session receiving zero or more capture runs.
-- **Completed session:** an immutable session finalized by the user.
-- **Checkpoint:** an atomic database update containing all durable state for the active session.
-- **Aggregate state:** counts, exact duration totals, sample counts, and their dimensions.
-- **Transient state:** context needed only to interpret adjacent events, such as pressed keys or the previous character.
-- **Dirty generation:** a monotonically increasing in-memory revision indicating changes not yet acknowledged by storage.
+- a new unsaved session with no database identity;
+- a clean copy of a saved session; or
+- a saved session with unsaved changes.
 
-## 5. Goals
+There is never an unselected application state. If no requested saved session can be loaded, evtap creates a new untitled in-memory session.
 
-### 5.1 Functional goals
+Other sessions in the selector are saved database records, not additional mutable in-memory metric registries.
 
-- Preserve the current session's aggregate values across restart.
-- Keep completed sessions until retention or explicit deletion removes them.
-- Render restored sessions through the existing generic metric-report UI.
-- Keep capture responsive while storage performs blocking I/O.
-- Make storage health and unsaved state visible.
-- Permit metric implementations and payload schemas to evolve independently.
-- Preserve unknown metric snapshots rather than silently deleting them.
+### 2.3 Capture
 
-### 5.2 Privacy and safety goals
+Start and Stop control only the listener. Repeated capture runs add to the same working session. Capture never starts automatically after startup or a session switch.
 
-- Make persistence an informed opt-in.
-- Prevent raw events from entering the storage API by architecture.
-- Store the minimum context needed to reproduce aggregate reports.
-- Never log metric payloads, labels, or SQL parameter values containing analytics.
-- Use private directories and files.
-- Offer understandable retention and deletion controls.
-- Fail without corrupting an existing database or interrupting capture.
+The keyboard display name and XKB model, layout, and variant used most recently are remembered with the session. They are suggestions and do not prevent the user from selecting another input setup.
 
-## 6. Non-goals
+## 3. Storage controls
 
-The first persistence release will not provide:
+### 3.1 Manual save
 
-- raw key-event or ordered text storage;
-- event replay;
-- import or export;
-- cross-session trends, comparisons, merging, or lifetime totals;
-- cloud or local-network synchronization;
-- user accounts;
-- telemetry or crash-report uploads;
-- encryption at rest;
-- operating-system keyring integration;
-- a stable public database or payload format;
-- concurrent access by multiple evtap processes;
-- retention based on individual metric rows;
-- physical keyboard heatmap history.
+**Save now** writes the complete current working session. A first save assigns an internal database ID. An untitled session may be saved without forcing a name.
 
-## 7. Privacy model
+The first operation that can write analytics displays a privacy disclosure. Confirming it records a non-analytics `storage_disclosure_acknowledged` preference so the warning is not repeatedly shown.
 
-### 7.1 Data classification
+Manual save remains available whether autosave is on or off.
 
-#### Class A: never persisted
+### 3.2 Autosave
 
-- `KeyEvent` values;
-- event sequence or per-event timestamp;
-- evdev event paths;
+Autosave is an editor-like preference, not an application or session state. When enabled, evtap saves dirty state:
+
+- approximately 30 seconds after metric changes during capture;
+- after Stop is acknowledged;
+- before switching sessions;
+- during normal application close.
+
+The initial interval is fixed at 30 seconds and may become configurable later. Autosave never writes per key event.
+
+Enabling autosave requires the same disclosure as a first manual save. The `autosave_enabled` preference is stored in `settings.json`.
+
+### 3.3 Saved and dirty state
+
+The working session is dirty when its durable representation differs from the last acknowledged database save. Causes include:
+
+- metric aggregate changes;
+- accumulated capture-duration changes;
+- rename;
+- reset;
+- remembered keyboard or XKB changes.
+
+Storage status is visible as:
+
+- `Unsaved session`;
+- `Saved`;
+- `Unsaved changes`;
+- `Saving…`;
+- `Could not save — Retry`.
+
+Only acknowledgement of the matching dirty generation may display `Saved`.
+
+## 4. Startup
+
+On startup:
+
+1. load settings;
+2. scan keyboards;
+3. if a recognized database exists, open it without creating a new one;
+4. read the `last_session_id` preference;
+5. load exactly that session if it still exists;
+6. otherwise create a new untitled in-memory session;
+7. restore durable metric state;
+8. clear all in-flight context;
+9. remain paused.
+
+Do not fall back to an older saved session when the last-selected ID is missing. Loading an unexpected older session is less clear than starting an untitled session.
+
+Saved sessions are loadable whether autosave is enabled or disabled. Autosave controls automatic writes, not reads. Selecting a saved session may immediately update `last_session_id` in `settings.json`; this preference write is not an analytics checkpoint.
+
+The analytics database is not created merely by starting evtap, scanning devices, changing preferences, or using an unsaved session.
+
+## 5. Switching and creating sessions
+
+### 5.1 Boundary behavior
+
+Switching includes selecting another saved session or choosing **New session**. If capture is running, evtap first stops the listener and clears in-flight context.
+
+For a dirty session with autosave disabled, show:
+
+- **Save and switch**;
+- **Discard changes and switch**;
+- **Cancel**.
+
+For an unsaved session, the discard label is **Discard session and switch**. Choosing save invokes the disclosure if necessary. Untitled sessions may remain untitled when saved.
+
+With autosave enabled, save automatically before switching. A failed save blocks the switch and preserves the working state in memory.
+
+A clean session switches without a prompt.
+
+### 5.2 New session
+
+Creating a new session passes through the same dirty-state boundary. After that boundary succeeds, evtap creates an untitled in-memory session with zero aggregates and no database ID. It does not write a database row until saved.
+
+### 5.3 Transient boundary
+
+Stop, switch, listener failure, process exit, and restart clear all in-flight context. No timing, adjacency, dwell, or correction observation may bridge one of these boundaries.
+
+## 6. Close behavior
+
+On normal close:
+
+- stop capture and account for the final capture segment;
+- clear in-flight context;
+- if clean, close normally;
+- if dirty with autosave enabled, save before closing;
+- if dirty with autosave disabled, offer **Save and exit**, **Exit without saving**, and **Cancel**.
+
+A failed automatic or requested save cancels close and leaves the application open with retryable in-memory state. A graceful save/shutdown has a three-second storage timeout. Forced termination or power loss can still lose changes after the last acknowledged save.
+
+Window-state persistence remains independent and may write `app.ron` during a normal close.
+
+## 7. Session management
+
+The initial session-management UI provides:
+
+- session selector;
+- **New session**;
+- **Save now**;
+- **Rename**;
+- **Reset statistics**;
+- **Delete session**;
+- **Delete all saved sessions**;
+- **Autosave sessions**.
+
+Saved sessions are ordered by most recently selected/opened. Rows show enough metadata to distinguish duplicate-looking untitled entries, including update time and keyboard name where available.
+
+### 7.1 Rename
+
+Names are optional Unicode strings of at most 80 UTF-8 characters after trimming. An empty name becomes unnamed. Nonempty names must not duplicate another saved session name. Rename changes the in-memory working session and marks it dirty; it does not bypass normal save behavior.
+
+### 7.2 Reset
+
+Reset requires confirmation, clears all metric aggregates, accumulated capture duration, and in-flight context, and leaves the session identity, optional name, and remembered setup intact. It is an ordinary dirty change. Autosave may subsequently persist it; otherwise it waits for manual save or a save boundary.
+
+### 7.3 Delete
+
+Deletion is explicit and immediate even when autosave is disabled. It requires confirmation and transactionally removes session metadata and metric snapshots.
+
+Deleting the current saved session warns that both its saved copy and any unsaved changes will be lost. After acknowledgement, evtap creates a new untitled in-memory session rather than loading an older session.
+
+Deleting all saved sessions removes every database session. The working session becomes a new untitled in-memory session. SQLite sidecars are checkpointed and storage pages reclaimed where practical. The UI describes filesystem deletion as best effort rather than guaranteed forensic erasure.
+
+There is no retention cleanup. Saved sessions remain until explicit deletion.
+
+## 8. Privacy model
+
+### 8.1 Durable metric state
+
+Durable state is the minimum cumulative state needed for a metric to continue producing the same aggregate report:
+
+| Metric | Durable state |
+| --- | --- |
+| Total presses | count |
+| Key usage | physical code, display label, count |
+| Corrections | deletion-label counts and correction-pair counts |
+| Flight time | label, total duration, sample count |
+| Dwell time | label, total duration, sample count |
+| Bigram speed | pair labels, total duration, sample count |
+
+Sensitive aggregate labels remain local and unencrypted.
+
+### 8.2 In-flight context
+
+In-flight context interprets unfinished or adjacent events and is never written to disk:
+
+- raw `KeyEvent` values;
+- event order and per-event timestamps;
+- evdev paths;
 - currently pressed keys;
-- previous press or release timestamps;
-- the correction metric's recent-text queue;
-- a pending deleted-to-typed inference;
-- listener channel contents;
-- logs of physical keys or produced text.
+- unfinished press/release observations;
+- previous-event timing context;
+- recent ordered correction context;
+- pending correction inference;
+- listener channel contents.
 
-#### Class B: persisted aggregate analytics
+In-flight context belongs only to the loaded working session while capture is active. It is cleared at every capture/session/process boundary. A restored metric continues its aggregate totals, but its first new event starts fresh context.
 
-- total physical press count;
-- physical key code, display label, and count;
-- deleted text labels and counts;
-- inferred deleted-to-typed labels and counts;
-- character labels with exact duration totals and sample counts;
-- character-pair labels with exact duration totals and sample counts.
+The storage subsystem accepts only validated session metadata and versioned metric snapshots. It has no raw-input command or event API.
 
-Class B remains sensitive. Character frequencies, bigrams, and corrections can reveal a language, habits, or fragments of activity even though they cannot reconstruct an ordered input stream reliably.
+### 8.3 Disclosure
 
-#### Class C: persisted session metadata
+Before the first analytics write, explain that:
 
-- creation, update, and completion times;
-- accumulated capture duration;
-- evtap version;
-- keyboard display name, when available;
-- XKB model, layout, and variant;
-- metric IDs and schema versions.
+- evtap reads global keyboard input while listening;
+- character, bigram, correction, key-usage, count, and timing aggregates can be sensitive;
+- the database is local and unencrypted;
+- raw event sequences and in-flight context are not stored;
+- files readable by the user, privileged processes, backups, or snapshots can expose saved data;
+- evtap performs no telemetry, synchronization, or network transfer.
 
-The keyboard display name may identify hardware. Device paths, serial numbers, vendor/product IDs, and stable hardware fingerprints are excluded.
+### 8.4 Filesystem policy
 
-#### Class D: non-analytics preferences
+Expected Linux modes remain:
 
-- persistence enabled state;
-- retention policy;
-- last selected XKB model, layout, and variant.
+- application configuration and data directories: `0700`;
+- `settings.json` and `evtap.sqlite3`: `0600`.
 
-Class D is stored separately so evtap can remember that persistence was disabled while retaining an existing database.
+The application does not impose special symlink rejection. Normal operating-system path resolution and I/O errors apply. These permissions protect mainly against other unprivileged local users; they do not protect against root or code running as the same user.
 
-### 7.2 Opt-in disclosure
-
-Before creating the analytics database, the UI must explain:
-
-- aggregate character labels, bigrams, and correction pairs will be written to disk;
-- data is local and unencrypted;
-- no raw event sequence is written;
-- the default retention period is 90 days;
-- anyone who can read the user's files may read the database;
-- filesystem backups or snapshots may retain deleted data.
-
-Enabling persistence requires an affirmative action. It must not be bundled with starting capture or accepting input permissions.
-
-### 7.3 Filesystem protection
-
-On Linux:
-
-- the data and configuration directories are created with mode `0700`;
-- settings and database files are created with mode `0600`;
-- SQLite sidecar files remain protected by the containing `0700` directory;
-- permissions are checked after opening and tightened when owned by the current user;
-- unsafe ownership or an inability to establish private access produces a storage error.
-
-These controls protect primarily against other unprivileged local users. They do not protect against root, malware running as the same user, memory inspection, backups, or a compromised machine.
-
-### 7.4 Encryption decision
-
-The initial implementation will not encrypt the database. Encryption would require a defensible key-storage and recovery design; embedding a key or deriving one without user authentication would provide misleading protection. Encryption can be specified separately if the threat model later requires it.
-
-### 7.5 Deletion limits
-
-`PRAGMA secure_delete = ON` will be enabled before analytics are written. Deletion operations will checkpoint the WAL and reclaim pages where practical. Complete deletion will close SQLite and remove the database, WAL, and shared-memory files.
-
-The UI and documentation must describe deletion as a best effort, not guaranteed forensic erasure. SSD behavior, filesystem snapshots, swap, backups, and external copies remain outside evtap's control.
-
-## 8. Session lifecycle
-
-### 8.1 States
-
-The application-level session state machine is:
-
-```text
-Empty
-  └─ Start listening ─▶ ActiveListening
-
-ActiveListening
-  ├─ Stop listening ─▶ ActivePaused
-  ├─ listener failure ─▶ ActivePaused + capture error
-  └─ Finish requested ─▶ StoppingForFinish ─▶ Finishing ─▶ Empty
-
-ActivePaused
-  ├─ Start listening ─▶ ActiveListening
-  ├─ Finish session ─▶ Finishing ─▶ Empty
-  └─ Discard session ─▶ Discarding ─▶ Empty
-```
-
-Storage status (`Disabled`, `Loading`, `Saved`, `Dirty`, `Saving`, or `Failed`) is tracked separately from capture and session state.
-
-### 8.2 Session creation
-
-- An empty in-memory session exists without creating a database row.
-- The configuration becomes fixed when the first capture run starts.
-- With persistence enabled, the active database row is created at first start.
-- Starting and stopping repeatedly continues the same active session.
-- Only one active session may exist in a database.
-
-### 8.3 Finishing
-
-- Finishing while listening first performs a graceful listener stop.
-- The latest complete aggregate snapshot and `completed` status are committed in one transaction.
-- A session does not appear as completed until that transaction succeeds.
-- After acknowledgement, the application creates a new empty in-memory session.
-- A failed finish leaves the session active and dirty, with retry available.
-
-### 8.4 Discarding
-
-- Discard is unavailable while the listener is stopping.
-- Discarding an active persisted session deletes its database row and metric snapshots transactionally.
-- In-memory aggregate and transient state are reset only after storage acknowledges deletion.
-- When persistence is disabled, discard is equivalent to the old reset behavior.
-- The action requires confirmation whenever the session contains samples.
-
-### 8.5 Restart and recovery
-
-On startup with persistence enabled:
-
-1. open and migrate the database;
-2. apply retention to completed sessions;
-3. load the single active session, if present;
-4. instantiate metrics from the registry;
-5. restore durable aggregate state;
-6. clear all transient state;
-7. display the session as resumed and paused.
-
-Capture never starts automatically. No timing or correction sample may bridge a process restart.
-
-### 8.6 Configuration changes
-
-- Device and XKB controls remain editable while the session is empty.
-- After the first capture run, changing the device, model, layout, or variant requires finishing or discarding the session.
-- The UI explains that mixing configurations would make persisted dimensions ambiguous.
-- Device paths are used only to open the current listener and are never checkpointed.
-
-### 8.7 Enabling or disabling persistence mid-session
-
-Enabling persistence while a non-empty in-memory session exists offers:
-
-- **Save current session:** create an active row and checkpoint current aggregates.
-- **Start persistence with a new session:** discard current in-memory aggregates after confirmation.
-- **Cancel.**
-
-Disabling persistence requires capture to be stopped and offers:
-
-- **Finish current session and keep history:** finalize the latest snapshot, then disable future persistence.
-- **Delete all stored analytics and disable.**
-- **Cancel.**
-
-A persisted active row must not be abandoned when persistence is disabled.
-
-## 9. User interface requirements
-
-### 9.1 Session controls
-
-When persistence is enabled, replace the ambiguous `Reset session` action with:
-
-- **Finish session**;
-- **Discard session**;
-- **New session**, shown only when no active data exists or after finishing;
-- **History**.
-
-Start and Stop continue to control capture only.
-
-When persistence is disabled, retain a clearly named **Discard current session** action and no history controls.
-
-### 9.2 Storage status
-
-The current-session view shows one of:
-
-- `Persistence off`
-- `Loading saved session…`
-- `Saved`
-- `Unsaved changes`
-- `Saving…`
-- `Could not save — Retry`
-
-The UI must not display `Saved` until the worker acknowledges the corresponding dirty generation.
-
-### 9.3 Settings
-
-The settings UI provides:
-
-- persistence enable/disable;
-- retention: 30, 90, 365 days, or forever;
-- storage location;
-- delete all stored analytics;
-- currently used disk space, if inexpensive to calculate;
-- the privacy disclosure and a link to the local privacy documentation.
-
-### 9.4 History list
-
-Each completed-session row shows:
-
-- local start date and time;
-- accumulated capture duration;
-- total physical presses;
-- keyboard display name, if stored;
-- XKB layout and variant;
-- completion state;
-- open and delete actions.
-
-Sort newest first. Empty history has an explanatory empty state.
-
-### 9.5 Session detail
-
-Opening a completed session shows:
-
-- immutable session metadata;
-- all restorable metric reports through the generic renderer;
-- a message for unknown or unsupported metric versions;
-- delete action with confirmation.
-
-Viewing history must not replace or mutate the active metric instances.
-
-## 10. Storage locations and settings
-
-### 10.1 State ownership
-
-Persistence is split into three deliberately separate domains:
+## 9. Storage domains
 
 | Domain | Owner | Location | Contents |
 | --- | --- | --- | --- |
-| Window state | eframe | `app.ron` | Native window size, position, and maximized state only |
-| Application settings | evtap | `settings.json` | Persistence consent, retention, and XKB preferences |
-| Aggregate analytics | evtap | `evtap.sqlite3` | Active and completed session metadata and metric snapshots |
+| Window state | eframe | `$XDG_DATA_HOME/evtap/app.ron` | Window size, position, and maximized state only |
+| Preferences | evtap | `$XDG_CONFIG_HOME/evtap/settings.json` | Disclosure acknowledgement, autosave, last session ID, fallback XKB preferences |
+| Session analytics | evtap | `$XDG_DATA_HOME/evtap/evtap.sqlite3` | Saved session metadata and aggregate metric snapshots |
 
-eframe's `persistence` feature will be enabled for native window restoration. Keep `NativeOptions::persist_window` enabled and override `App::persist_egui_memory` to return `false`. Arbitrary egui widget memory is not persisted in the initial release.
+Use the usual `~/.config` and `~/.local/share` fallbacks. `App::persist_egui_memory` remains false; arbitrary widget memory and analytics must not enter `app.ron`.
 
-evtap must not use `App::save` or eframe's string key/value storage for privacy-sensitive application settings or analytics. The native eframe store rewrites a best-effort RON file, reports failures through logs, and does not provide the atomic writes, permission guarantees, migrations, transactional updates, or application-visible acknowledgements required by this specification.
+Settings writes remain schema-versioned, validated, size-limited, synchronized, private, and atomic through a same-directory temporary file, flush, rename, and directory synchronization where supported.
 
-`app.ron` may exist while analytics persistence is disabled. It must contain no evtap settings, metric values, captured labels, or raw input. Failure to save window state must not affect settings, analytics state, or storage status.
-
-### 10.2 Paths and settings format
-
-Use an XDG-aware project-directory library for evtap-owned files. Configure eframe's application ID or persistence path so its native state uses the same application data directory without sharing a file with evtap storage.
-
-On Linux, expected paths are:
-
-```text
-$XDG_CONFIG_HOME/evtap/settings.json
-$XDG_DATA_HOME/evtap/app.ron
-$XDG_DATA_HOME/evtap/evtap.sqlite3
-```
-
-with fallbacks:
-
-```text
-~/.config/evtap/settings.json
-~/.local/share/evtap/app.ron
-~/.local/share/evtap/evtap.sqlite3
-```
-
-The settings file has an independent schema version and is written atomically using a temporary file in the same directory, flush, rename, and directory synchronization where supported.
-
-Initial logical settings format:
+Logical settings schema:
 
 ```json
 {
-  "schema_version": 1,
-  "persistence": {
-    "enabled": false,
-    "retention_days": 90
+  "schema_version": 2,
+  "storage": {
+    "disclosure_acknowledged": false,
+    "autosave_enabled": false,
+    "last_session_id": null
   },
   "keyboard": {
     "model": "",
@@ -383,42 +270,32 @@ Initial logical settings format:
 }
 ```
 
-`null` retention means keep completed sessions until explicitly deleted. Unknown settings fields are tolerated. Unsupported newer schema versions produce a non-destructive warning and privacy-preserving defaults; they are not overwritten automatically.
+Unknown fields are tolerated. Unsupported schema versions produce a non-destructive generic error and are not overwritten automatically.
 
-The analytics database must not be created merely to remember settings.
+## 10. SQLite design
 
-## 11. SQLite design
+Use bundled SQLite through `rusqlite`, owned by one storage-worker thread. Configure:
 
-### 11.1 Library direction
+- read-write/create flags only when a write is requested;
+- evtap `application_id`;
+- foreign keys;
+- WAL journal mode;
+- `synchronous = NORMAL`;
+- `secure_delete = ON`;
+- bounded busy timeout;
+- immediate transactions for saves and deletion.
 
-Use `rusqlite` with its bundled SQLite feature to avoid adding a system SQLite dependency and to keep release behavior consistent. Select the newest release that passes the Rust 1.92 MSRV job; do not raise the project MSRV implicitly. Use `serde` and `serde_json` for versioned metric payloads and an XDG-aware directory crate for paths.
+### 10.1 Schema
 
-Schema migrations are a small ordered list of embedded SQL migrations driven by `PRAGMA user_version`. A separate migration framework is not required initially. All migrations are forward-only and transactional.
-
-### 11.2 Connection configuration
-
-The storage worker owns one read/write connection configured with:
-
-- read-write/create flags;
-- `PRAGMA application_id` set to evtap's assigned constant;
-- `PRAGMA foreign_keys = ON`;
-- `PRAGMA journal_mode = WAL`;
-- `PRAGMA synchronous = NORMAL`;
-- `PRAGMA secure_delete = ON`;
-- a bounded busy timeout;
-- immediate transactions for checkpoints and lifecycle changes.
-
-The chosen settings and SQLite version must be covered by integration tests. Opening a database with a newer `user_version` disables writes and shows an error rather than attempting a downgrade.
-
-### 11.3 Schema version 1
+The redesigned prerelease schema uses `user_version = 2`:
 
 ```sql
 CREATE TABLE sessions (
     id                    INTEGER PRIMARY KEY,
-    status                TEXT NOT NULL CHECK (status IN ('active', 'completed')),
+    name                  TEXT,
     created_at_ms         INTEGER NOT NULL,
     updated_at_ms         INTEGER NOT NULL,
-    completed_at_ms       INTEGER,
+    last_opened_at_ms     INTEGER NOT NULL,
     captured_duration_ns  INTEGER NOT NULL DEFAULT 0
                              CHECK (captured_duration_ns >= 0),
     application_version   TEXT NOT NULL,
@@ -426,19 +303,15 @@ CREATE TABLE sessions (
     xkb_model             TEXT NOT NULL,
     xkb_layout            TEXT NOT NULL,
     xkb_variant           TEXT NOT NULL,
-    CHECK (
-        (status = 'active' AND completed_at_ms IS NULL) OR
-        (status = 'completed' AND completed_at_ms IS NOT NULL)
-    )
+    CHECK (name IS NULL OR length(name) > 0)
 );
 
-CREATE UNIQUE INDEX sessions_one_active
-    ON sessions(status)
-    WHERE status = 'active';
+CREATE UNIQUE INDEX sessions_unique_name
+    ON sessions(name)
+    WHERE name IS NOT NULL;
 
-CREATE INDEX sessions_completed_at
-    ON sessions(completed_at_ms DESC)
-    WHERE status = 'completed';
+CREATE INDEX sessions_recently_opened
+    ON sessions(last_opened_at_ms DESC, id DESC);
 
 CREATE TABLE metric_snapshots (
     session_id             INTEGER NOT NULL
@@ -450,412 +323,179 @@ CREATE TABLE metric_snapshots (
     updated_at_ms          INTEGER NOT NULL,
     PRIMARY KEY (session_id, metric_id)
 ) WITHOUT ROWID;
+
+PRAGMA user_version = 2;
 ```
 
-All timestamps are UTC Unix-epoch milliseconds. Capture duration is exact accumulated nanoseconds represented as a checked signed 64-bit integer. Session IDs are local database identities and are not a public interchange format.
+All timestamps are UTC Unix-epoch milliseconds. Capture duration uses checked signed nanoseconds. Session IDs are local implementation details.
 
-### 11.4 Atomic checkpoint
+### 10.2 Save transaction
 
-One immediate transaction performs:
+One immediate transaction:
 
-1. insert or update the active session metadata;
-2. upsert every known metric snapshot;
-3. leave unknown existing metric rows untouched;
-4. update the session's `updated_at_ms`;
-5. commit;
-6. acknowledge the saved dirty generation.
+1. validates and serializes all known metric snapshots;
+2. inserts a new session or updates the matching session;
+3. upserts every known metric snapshot;
+4. preserves unknown existing metric rows;
+5. updates metadata and `updated_at_ms`;
+6. commits;
+7. acknowledges the exact dirty generation and assigned ID.
 
-A partial metric checkpoint must never become visible. Serialization is completed before beginning the transaction so serialization errors cannot leave a transaction open.
+No partial multi-metric state may become visible. Serialization finishes before opening the transaction.
 
-### 11.5 Finalization
+### 10.3 Loading and listing
 
-Finalization uses the same checkpoint transaction and additionally sets:
+Listing reads lightweight session metadata ordered by `last_opened_at_ms`. Loading one session reads all its metric snapshots into a fresh default metric registry. Unknown, malformed, duplicated, or unsupported metric snapshots are isolated; valid metrics still restore.
 
-- `status = 'completed'`;
-- `completed_at_ms`;
-- final capture duration.
+Selecting a session updates its `last_opened_at_ms` as an explicit metadata operation and updates `last_session_id` in settings.
 
-The unique active-session index then permits a new active row.
+### 10.4 Incompatible databases
+
+No compatibility or migration code is provided for unreleased experimental schemas. Empty databases initialize directly to schema version 2. A nonempty database with the wrong application identity or any unsupported schema version is left unchanged and produces a generic error containing the database path, for example:
+
+```text
+The evtap database at … uses an incompatible schema. Move or delete it to start fresh.
+```
+
+The implementation must not detect or name a particular experimental version. This exact-version check is the same defensive mechanism used for arbitrary incompatible or future schemas, not a compatibility layer. Reuse the `evtap.sqlite3` filename after manual deletion.
+
+Once a schema ships in a stable release, future migrations require an explicit new specification and tests.
+
+## 11. Worker protocol
+
+The worker owns SQLite and communicates with the UI through bounded commands/events and `WakeSignal`. Commands operate on session snapshots and IDs only.
+
+Required operations:
+
+- inspect/open an existing database;
+- list saved sessions;
+- load one session;
+- save the working session;
+- mark a session opened;
+- delete one session;
+- delete all sessions;
+- reclaim after deletion;
+- shutdown with an optional final save.
+
+At most one save is in flight. Dirty generations advance independently; acknowledgement of an older generation cannot mark newer state saved. A retry serializes a fresh latest snapshot.
+
+Storage failures never stop capture or clear metrics. Errors contain operation and safe path context but no metric payloads, labels, SQL values, or input data.
 
 ## 12. Metric snapshot contract
 
-### 12.1 Interface direction
-
-The metric boundary gains object-safe operations conceptually equivalent to:
-
-```rust
-fn has_data(&self) -> bool;
-fn snapshot(&self) -> Result<MetricSnapshot, SnapshotError>;
-fn restore(&mut self, snapshot: &MetricSnapshot) -> Result<(), RestoreError>;
-```
-
-`MetricSnapshot` contains:
-
-```text
-metric_id
-metric_schema_version
-payload bytes or JSON value
-```
-
-The stable descriptor ID remains the database key. Each metric owns its payload version and validates all restored values before mutating itself. Restore is all-or-nothing.
-
-### 12.2 Durable versus transient state
-
-| Metric | Durable | Never persisted |
-| --- | --- | --- |
-| Total presses | count | none |
-| Key usage | physical code, label, count | cached application key objects beyond those dimensions |
-| Corrections | deletion and correction counts | recent history, pending deletion |
-| Flight time | label, total duration, samples | last release timestamp |
-| Dwell time | label, total duration, samples | pressed-key map and press timestamps |
-| Bigram speed | pair, total duration, samples | previous press text and timestamp |
-
-### 12.3 Initial payload shapes
+Each metric provides object-safe snapshot and restore operations keyed by a stable metric ID and independent metric schema version. Payloads remain deterministic and validated before mutation.
+
+Initial limits remain:
+
+- at most 16 MiB per metric payload;
+- at most 100,000 dimensions per metric;
+- at most 256 UTF-8 bytes per dimension string;
+- no duplicate dimensions;
+- no zero-sample duration entries;
+- checked counts and duration totals;
+- exact metric ID and supported payload version.
+
+Arrays are canonically ordered. Rounded averages are never stored. Unknown existing metric rows survive a save so temporarily removed metrics are not silently erased.
+
+## 13. Error behavior
+
+- Settings and database errors preserve existing files.
+- Corrupt, unidentified, and incompatible databases are not replaced, truncated, renamed, or silently reset.
+- Failed saves leave working state dirty and retryable.
+- Failed delete operations leave the session visible.
+- Failed automatic save blocks the requested switch or close.
+- A process kill may lose unsaved state but a committed SQLite transaction is all-or-nothing.
+- Logs never contain captured labels, metric payloads, or raw input.
+
+## 14. Testing requirements
+
+### Metric tests
+
+- deterministic aggregate snapshots;
+- round-trip restoration;
+- malformed, duplicate, unsupported, and overflowing payload rejection;
+- isolated restoration failures;
+- resumed processing adds to aggregates;
+- in-flight context is absent and cannot bridge restore.
+
+### Repository tests
+
+- initialize schema version 2;
+- generic rejection of schema version 1, future versions, wrong identity, and unidentified nonempty files without modification;
+- insert and update multiple mutable sessions;
+- save and restore untitled sessions;
+- enforce unique nonempty names by ID-independent validation;
+- atomic multi-metric saves and rollback;
+- preserve unknown snapshots;
+- list by recent-open order;
+- individual and complete deletion;
+- WAL recovery;
+- private Linux permissions.
+
+### Worker tests
+
+- save acknowledgement and assigned ID;
+- generation changes during an in-flight save;
+- explicit load/list/open/delete operations;
+- retry after failure;
+- autosave scheduling boundaries;
+- bounded shutdown;
+- repaint wake events;
+- no dependency on raw input types.
+
+### UI and lifecycle tests
+
+- fresh untitled session without a database;
+- disclosure on first manual save or autosave enable;
+- startup loads only the last-selected saved ID;
+- missing last ID creates an untitled session rather than loading an older one;
+- clean switch;
+- dirty Save/Discard/Cancel switch;
+- autosaved switch and blocked failed switch;
+- dirty Save/Discard/Cancel close;
+- rename, reset, and immediate deletion;
+- remembered setup remains flexible;
+- no Finish, History, or Retention controls.
+
+### Privacy tests
+
+- no event or ordering table;
+- no raw-input storage command;
+- no event timestamps, device paths, pressed keys, or recent correction context in snapshots;
+- settings contain no analytics;
+- `app.ron` contains no settings or analytics;
+- payload-free logs;
+- no telemetry or network behavior.
+
+## 15. Acceptance criteria
+
+The redesign is complete when:
+
+1. evtap always has one loaded session and behaves the same before and after its first save.
+2. A fresh run creates no analytics database until manual save or autosave performs a write.
+3. First disk write requires the aggregate-storage disclosure.
+4. Manual save and autosave restore identical aggregate reports after restart.
+5. Startup loads only the last-selected saved session and remains paused.
+6. Switching and close never silently lose dirty state.
+7. Untitled sessions can be saved without artificial naming barriers.
+8. Session setup values are remembered but never enforced against another device.
+9. No aggregate or timing context bleeds between sessions or process boundaries.
+10. Finalization, history, retention, and migration code are absent.
+11. Generic incompatible-schema handling leaves old development data untouched.
+12. Session deletion is explicit, immediate, and acknowledged.
+13. Storage remains transactional, private, responsive, and payload-free on errors.
+14. Format, strict Clippy, tests, Rust 1.92, RustSec, diagnostics, release build, and manual lifecycle validation pass.
 
-Version 1 payloads use deterministic arrays rather than JSON object keys for tuple or user-derived dimensions.
+## 16. Deferred work
 
-```json
-{"count": 123}
-```
-
-```json
-{
-  "keys": [
-    {"code": 30, "label": "A", "count": 12}
-  ]
-}
-```
+Separate designs are required for:
 
-```json
-{
-  "deletions": [
-    {"text": "x", "count": 3}
-  ],
-  "corrections": [
-    {"deleted": "x", "typed": "y", "count": 2}
-  ]
-}
-```
-
-```json
-{
-  "entries": [
-    {"text": "a", "total_ns": 240000000, "samples": 4}
-  ]
-}
-```
-
-```json
-{
-  "pairs": [
-    {"first": "t", "second": "h", "total_ns": 300000000, "samples": 5}
-  ]
-}
-```
-
-Arrays are sorted canonically before serialization to make tests and diagnostics deterministic. A duration entry with zero samples is invalid. Rounded averages are never stored.
-
-### 12.4 Validation limits
-
-Restoration rejects, without partially applying:
-
-- payloads larger than 16 MiB per metric;
-- more than 100,000 dimension entries per metric;
-- dimension strings larger than 256 UTF-8 bytes;
-- zero-sample duration entries;
-- overflowing counts or durations;
-- duplicate dimensions;
-- a metric ID mismatch;
-- unsupported payload versions.
-
-A rejected historical metric is shown as unavailable. The original database row remains untouched.
-
-### 12.5 Evolution
-
-- Database schema and metric payload versions evolve independently.
-- Metric code must read every payload version it still claims to support.
-- Payload conversion occurs in memory.
-- Completed rows are not eagerly rewritten merely because they were viewed.
-- Active state may be rewritten in the newest format on its next successful checkpoint.
-- Removed or unknown metrics remain in the database and count toward retention/deletion.
-- Semantic algorithm changes increment the metric payload version when restored values would otherwise be misinterpreted.
-
-## 13. Storage worker and checkpoint protocol
-
-### 13.1 Isolation
-
-A dedicated worker thread owns the SQLite connection. The egui thread communicates through command and event channels following the scanner/listener pattern and uses `WakeSignal` for repaint requests.
-
-The storage module operates on `SessionSnapshot` and storage commands. It must not import or expose `KeyEvent`.
-
-### 13.2 Dirty tracking
-
-- The app increments a dirty generation after processing input that may affect metrics or capture duration.
-- At most one checkpoint is in flight.
-- While one is in flight, additional events advance the generation but do not enqueue more snapshots.
-- An acknowledgement marks only its generation saved.
-- If the current generation is newer, the UI remains dirty and a later checkpoint is scheduled.
-
-### 13.3 Schedule
-
-Checkpoint:
-
-- after 30 seconds of dirty active capture;
-- immediately after Stop is acknowledged;
-- as part of Finish;
-- before disabling persistence;
-- during graceful application exit.
-
-Do not write per key event. A process or power failure may lose changes after the most recently committed checkpoint, bounded during continuous capture to approximately 30 seconds.
-
-### 13.4 Shutdown
-
-On graceful exit:
-
-1. stop capture;
-2. serialize the newest aggregate state;
-3. request final checkpoint and storage shutdown;
-4. wait for acknowledgement with a finite timeout;
-5. log only success or a payload-free error.
-
-A timed-out exit may lose unsaved changes but must not hang indefinitely. The exact timeout is an implementation constant covered by tests.
-
-### 13.5 Errors
-
-- Storage failure never stops capture or clears in-memory metrics.
-- Failed writes leave the generation dirty.
-- Retry uses a fresh snapshot of the latest generation.
-- Error messages include operation and path where safe, never SQL values or serialized payloads.
-- Corrupt databases are not replaced, truncated, or automatically renamed.
-- A migration failure rolls back and opens no writable storage session.
-
-## 14. Retention and deletion
-
-### 14.1 Retention
-
-Available policies:
-
-- 30 days;
-- 90 days, default;
-- 365 days;
-- forever.
-
-Retention uses `completed_at_ms`, never `created_at_ms`, and never deletes an active session. It runs:
-
-- after opening and migrating the database;
-- after finalizing a session;
-- immediately after shortening the retention setting.
-
-The history UI refreshes only after deletion acknowledgement.
-
-### 14.2 Individual deletion
-
-Deleting a completed session removes the session and cascades its metric snapshots in one transaction. A WAL checkpoint is requested after deletion. Failure leaves the history item visible and retryable.
-
-### 14.3 Delete all analytics
-
-The worker:
-
-1. stops accepting writes;
-2. closes the SQLite connection;
-3. removes the database, `-wal`, and `-shm` files;
-4. reports any path it could not remove;
-5. creates a fresh empty database only if persistence remains enabled.
-
-The settings file is retained unless the user separately resets preferences.
-
-## 15. History loading
-
-- History-list queries return metadata and total presses without loading every payload.
-- Opening a detail view loads all snapshots for that session.
-- The app creates a separate default metric registry and restores into those instances.
-- The active registry is never replaced or mutated.
-- Unknown metric rows produce an `Unsupported metric: <id>` entry.
-- Known metrics with unsupported versions produce a version-specific message.
-- A malformed snapshot affects only that metric's detail section.
-
-The total press count may be denormalized into a future schema if list performance requires it. Version 1 can read the small total-presses payload for each displayed page.
-
-History is paginated; the initial page size is 50 sessions.
-
-## 16. Configuration and time handling
-
-- Database timestamps are UTC Unix milliseconds.
-- UI timestamps are converted to the local timezone only for display.
-- Clock changes can make wall-clock session timestamps non-monotonic; capture duration is accumulated from monotonic process time and persisted separately.
-- An active capture segment's elapsed duration is included in each checkpoint.
-- No timing metric bridges process restart, even if the session resumes.
-- Time-formatting dependencies must pass Rust 1.92 before adoption.
-
-## 17. Dependency constraints
-
-Anticipated direct dependencies and feature changes:
-
-- eframe's `persistence` feature for native window state only;
-- `rusqlite` with bundled SQLite;
-- `serde` with derive;
-- `serde_json`;
-- an XDG/project-directory crate;
-- a timezone-aware display-time crate if the standard library is insufficient.
-
-Before adoption, each dependency must pass:
-
-- Rust 1.92 build;
-- RustSec audit;
-- license compatibility review;
-- default-feature review;
-- Linux release build;
-- transitive dependency inspection.
-
-No dependency choice in this specification authorizes an MSRV increase.
-
-## 18. Testing requirements
-
-### 18.1 Metric snapshot tests
-
-For every metric:
-
-- deterministic version 1 serialization;
-- aggregate round trip;
-- reset after restore;
-- rejection of wrong ID/version;
-- rejection of malformed and overflowing values;
-- confirmation that transient state is absent;
-- resumed processing adds to restored aggregates correctly;
-- no cross-restart timing or correction inference.
-
-### 18.2 Database tests
-
-Using private temporary directories:
-
-- create schema from an empty path;
-- apply every migration from each earlier version;
-- reject a newer schema version;
-- reject wrong `application_id` without modifying it;
-- enforce one active session;
-- atomic multi-metric checkpoint;
-- rollback on injected failure;
-- finalize and create a new active session;
-- cascade individual deletion;
-- complete database-file deletion;
-- retention boundaries at exactly 30, 90, and 365 days;
-- preserve active sessions during retention;
-- preserve unknown metric rows during checkpoints;
-- WAL reopen after simulated unclean shutdown;
-- file and directory permissions on Linux.
-
-### 18.3 Worker tests
-
-- dirty-generation acknowledgement;
-- events arriving during an in-flight checkpoint;
-- retry after write failure;
-- finish waits for latest generation;
-- discard waits for storage acknowledgement;
-- bounded graceful shutdown;
-- repaint wake on storage events;
-- no capture interruption on storage failure.
-
-### 18.4 UI tests
-
-- disclosure before first enable;
-- enable with existing in-memory samples;
-- disable keep/delete choices;
-- finish while listening;
-- configuration lock after session starts;
-- saved/dirty/saving/error status transitions;
-- history empty/loading/error states;
-- unsupported metric display;
-- delete confirmations;
-- retention setting behavior.
-
-### 18.5 Privacy regression tests
-
-- storage APIs have no raw-event command;
-- active transient fields are not serialized;
-- logs from success and failure paths contain no payloads;
-- database schema has no event table or ordering column;
-- settings contain no keyboard path or analytics;
-- eframe widget-memory persistence is disabled;
-- `app.ron` contains no evtap settings or analytics;
-- synthetic event timestamps do not occur in snapshot payloads.
-
-## 19. Acceptance criteria
-
-The persistence feature is complete only when:
-
-1. A fresh install creates no analytics database before opt-in.
-2. Enabling persistence displays and records informed consent.
-3. Aggregate results survive restart with identical reports.
-4. Pressed-key, adjacency, and correction context do not survive restart.
-5. Continuous capture checkpoints at the documented interval without UI stalls.
-6. Stop, Finish, Discard, and restart obey the state model.
-7. Completed sessions render independently from the active session.
-8. Retention and deletion behave transactionally.
-9. Storage errors remain visible and never silently discard in-memory state.
-10. Unknown and malformed metrics do not make the whole history inaccessible.
-11. Database/configuration permissions are private on Linux.
-12. Privacy, metric, troubleshooting, README, roadmap, and changelog documentation are updated.
-13. Format, strict Clippy, all tests, doctests, Rust 1.92, RustSec, LSP diagnostics, release build, and GUI smoke tests pass.
-14. Manual testing covers restart, crash recovery, disk-full/write-denied behavior, retention, and deletion.
-15. eframe restores native window state without persisting arbitrary egui widget memory.
-16. A 0.2.0 prerelease is tested before the final tag.
-
-## 20. Delivery milestones
-
-### Milestone A — snapshot foundation
-
-- Add owned, versioned snapshot types.
-- Separate each metric's durable and transient state explicitly.
-- Implement and test snapshot/restore for every metric.
-- Add session aggregate and metadata types.
-
-### Milestone B — settings and storage core
-
-- Add XDG path resolution and atomic settings.
-- Add SQLite connection hardening and schema migrations.
-- Add transactional repository operations and retention.
-- Verify MSRV, licenses, and RustSec.
-
-### Milestone C — worker and recovery
-
-- Add dedicated storage worker and event protocol.
-- Add dirty generations and periodic checkpointing.
-- Restore active sessions on startup.
-- Add graceful flush and failure recovery.
-
-### Milestone D — lifecycle UI
-
-- Separate capture controls from session controls.
-- Add enable/disable disclosure flows.
-- Lock configuration after a session begins.
-- Add storage status and retry behavior.
-
-### Milestone E — history and deletion
-
-- Add paginated history list and detail view.
-- Add individual deletion, delete-all, and retention controls.
-- Render unsupported metric states safely.
-
-### Milestone F — release hardening
-
-- Complete privacy and fault-injection tests.
-- Update all user and contributor documentation.
-- Perform manual lifecycle and recovery validation.
-- Build and test a 0.2.0 prerelease.
-
-Each milestone must pass the full repository checks before being committed. Storage must not be enabled in a release until milestones A through F are complete.
-
-## 21. Deferred questions for later versions
-
-The following require separate specifications:
-
+- configurable autosave interval;
+- multiple simultaneously loaded dirty sessions;
+- import, export, synchronization, or accounts;
+- trends and comparisons;
 - encryption and key management;
-- aggregate export/import format;
-- trend and comparison semantics;
-- merging sessions or devices;
-- lifetime aggregate caches;
+- session merge or duplication;
 - database backup and restore;
-- multi-process access;
-- opt-in persistence subsets by metric;
-- physical keyboard geometry history;
-- public library or plugin persistence contracts.
+- concurrent access by multiple evtap processes;
+- public persistence APIs.

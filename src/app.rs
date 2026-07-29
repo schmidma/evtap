@@ -21,11 +21,11 @@ use crate::{
     scanner::{self, DeviceMetadata, ScannerHandle},
     session::{
         KeyboardContext, MetricRecoveryIssue, SessionId, SessionMetadata, SessionSnapshot,
-        SessionSummary, StoredSession, recover_default_metrics,
+        StoredSession, recover_default_metrics,
     },
-    settings::{RetentionPolicy, Settings, SettingsStore},
+    settings::{Settings, SettingsStore},
     storage::{
-        CheckpointRequest, CheckpointSchedule, DirtyTracker, StorageCommand, StorageEvent,
+        CheckpointSchedule, DirtyTracker, SaveRequest, StorageCommand, StorageEvent,
         StorageOperation, StorageStatus, StorageWorker,
     },
     wake::WakeSignal,
@@ -34,7 +34,7 @@ use crate::{
 
 const HACK_FONT_NAME: &str = "Hack";
 const LISTENER_EXIT_WAIT: Duration = Duration::from_millis(500);
-const HISTORY_PAGE_SIZE: u32 = 50;
+const MAX_SESSION_NAME_BYTES: usize = 80;
 
 pub struct App {
     devices: Option<Vec<DeviceMetadata>>,
@@ -63,38 +63,34 @@ pub struct App {
     settings: Settings,
     settings_error: Option<String>,
     settings_load_failed: bool,
+
     storage: Option<StorageWorker>,
+    storage_initialized: bool,
     storage_tracker: DirtyTracker,
     checkpoint_schedule: CheckpointSchedule,
     storage_error: Option<String>,
-    storage_open_intent: Option<StorageOpenIntent>,
-    storage_needs_reopen: bool,
-    storage_finished: bool,
-    checkpoint_when_available: bool,
+    last_failed_operation: Option<StorageOperation>,
+    sessions: Vec<SessionMetadata>,
+    list_request_id: u64,
+    load_request_id: u64,
+    loading_session: bool,
 
     session: CurrentSession,
     recovery_messages: Vec<String>,
-    pending_finish: Option<PendingFinish>,
-    discarding: bool,
-    deleting_all_to_disable: bool,
-    deleting_all: bool,
-    shutting_down_storage: bool,
-    confirm_discard: bool,
-    confirm_delete_all: bool,
-    enable_prompt: Option<EnablePrompt>,
-    disable_prompt: bool,
+    after_save: Option<BoundaryTarget>,
+    deferred_boundary: Option<BoundaryTarget>,
+    boundary_prompt: Option<BoundaryTarget>,
+    disclosure_prompt: Option<DisclosureIntent>,
+    allow_close: bool,
 
-    history_open: bool,
-    history_sessions: Vec<SessionSummary>,
-    history_offset: u32,
-    history_has_more: bool,
-    history_loading: bool,
-    history_error: Option<String>,
-    history_list_request_id: u64,
-    history_detail_request_id: u64,
-    history_detail: Option<HistoryDetail>,
-    confirm_history_delete: Option<SessionId>,
-    deleting_completed: Option<SessionId>,
+    rename_open: bool,
+    rename_buffer: String,
+    rename_error: Option<String>,
+    confirm_reset: bool,
+    confirm_delete: bool,
+    deleting_session: bool,
+    confirm_delete_all: bool,
+    deleting_all: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -106,19 +102,39 @@ enum ListenerState {
     Failed,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct CurrentSession {
     id: Option<SessionId>,
-    created_at_ms: Option<i64>,
+    name: Option<String>,
+    created_at_ms: i64,
+    last_opened_at_ms: i64,
     captured_duration: Duration,
     capture_started_at: Option<Instant>,
-    keyboard: Option<KeyboardContext>,
-    resumed: bool,
+    keyboard: KeyboardContext,
+    restored: bool,
 }
 
 impl CurrentSession {
-    fn is_active(&self) -> bool {
-        self.keyboard.is_some()
+    fn untitled(now_ms: i64, model: String, layout: String, variant: String) -> Self {
+        Self {
+            id: None,
+            name: None,
+            created_at_ms: now_ms,
+            last_opened_at_ms: now_ms,
+            captured_duration: Duration::ZERO,
+            capture_started_at: None,
+            keyboard: KeyboardContext {
+                display_name: None,
+                model,
+                layout,
+                variant,
+            },
+            restored: false,
+        }
+    }
+
+    fn display_name(&self) -> &str {
+        self.name.as_deref().unwrap_or("Untitled session")
     }
 
     fn duration(&self) -> Duration {
@@ -128,34 +144,33 @@ impl CurrentSession {
             })
     }
 
-    fn finish_capture_segment(&mut self) {
-        if let Some(started) = self.capture_started_at.take() {
-            self.captured_duration = self.captured_duration.saturating_add(started.elapsed());
-        }
+    fn finish_capture_segment(&mut self) -> bool {
+        let Some(started) = self.capture_started_at.take() else {
+            return false;
+        };
+        self.captured_duration = self.captured_duration.saturating_add(started.elapsed());
+        true
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum StorageOpenIntent {
-    Restore,
-    PreserveCurrent,
+enum BoundaryTarget {
+    New,
+    Load(SessionId),
+    Exit,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PendingFinish {
-    disable_after: bool,
+enum DisclosureIntent {
+    Save(Option<BoundaryTarget>),
+    EnableAutosave,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum EnablePrompt {
-    Disclosure,
-    ExistingSession,
-}
-
-struct HistoryDetail {
-    metadata: SessionMetadata,
-    metrics: Vec<Box<dyn Metric>>,
-    messages: Vec<String>,
+enum BoundaryPolicy {
+    Proceed,
+    Save,
+    Prompt,
 }
 
 impl App {
@@ -173,7 +188,7 @@ impl App {
             Err(error) => (
                 Settings::default(),
                 Some(format!(
-                    "Could not load settings; privacy-preserving defaults are in use and the existing file will not be overwritten: {error}"
+                    "Could not load settings; safe defaults are in use and the existing file will not be overwritten: {error}"
                 )),
                 true,
             ),
@@ -185,8 +200,16 @@ impl App {
         let available_layouts = xkb_helper::get_layouts();
         let available_variants = xkb_helper::get_variants(&layout);
         let xkb_state = init_keyboard_state(&model, &layout, &variant)?;
+        let now_ms = unix_now_ms().unwrap_or_default();
+        let mut storage_tracker = DirtyTracker::default();
+        storage_tracker.begin_loading();
+        let storage = StorageWorker::spawn(
+            paths.database_file(),
+            settings.last_session_id(),
+            wake_signal.clone(),
+        )?;
 
-        let mut app = Self {
+        Ok(Self {
             devices: None,
             selected_device: None,
             scan_warning: None,
@@ -198,9 +221,9 @@ impl App {
             wake_signal,
             metrics: default_metrics(),
             physical_keys: HashMap::new(),
-            model,
-            layout,
-            variant,
+            model: model.clone(),
+            layout: layout.clone(),
+            variant: variant.clone(),
             keyboard_error: None,
             available_models,
             available_layouts,
@@ -211,41 +234,32 @@ impl App {
             settings,
             settings_error,
             settings_load_failed,
-            storage: None,
-            storage_tracker: DirtyTracker::default(),
+            storage: Some(storage),
+            storage_initialized: false,
+            storage_tracker,
             checkpoint_schedule: CheckpointSchedule::default(),
             storage_error: None,
-            storage_open_intent: None,
-            storage_needs_reopen: false,
-            storage_finished: false,
-            checkpoint_when_available: false,
-            session: CurrentSession::default(),
+            last_failed_operation: None,
+            sessions: Vec::new(),
+            list_request_id: 0,
+            load_request_id: 0,
+            loading_session: false,
+            session: CurrentSession::untitled(now_ms, model, layout, variant),
             recovery_messages: Vec::new(),
-            pending_finish: None,
-            discarding: false,
-            deleting_all_to_disable: false,
-            deleting_all: false,
-            shutting_down_storage: false,
-            confirm_discard: false,
+            after_save: None,
+            deferred_boundary: None,
+            boundary_prompt: None,
+            disclosure_prompt: None,
+            allow_close: false,
+            rename_open: false,
+            rename_buffer: String::new(),
+            rename_error: None,
+            confirm_reset: false,
+            confirm_delete: false,
+            deleting_session: false,
             confirm_delete_all: false,
-            enable_prompt: None,
-            disable_prompt: false,
-            history_open: false,
-            history_sessions: Vec::new(),
-            history_offset: 0,
-            history_has_more: false,
-            history_loading: false,
-            history_error: None,
-            history_list_request_id: 0,
-            history_detail_request_id: 0,
-            history_detail: None,
-            confirm_history_delete: None,
-            deleting_completed: None,
-        };
-        if app.settings.persistence_enabled() {
-            app.start_storage(StorageOpenIntent::Restore);
-        }
-        Ok(app)
+            deleting_all: false,
+        })
     }
 
     fn request_scan(&mut self) {
@@ -278,7 +292,7 @@ impl App {
                         };
                         self.scan_error = None;
                         self.devices = Some(report.devices);
-                        self.selected_device = None;
+                        self.select_remembered_device();
                     }
                     Err(error) => {
                         self.devices = Some(Vec::new());
@@ -289,6 +303,26 @@ impl App {
                 },
             }
         }
+    }
+
+    fn select_remembered_device(&mut self) {
+        let Some(name) = self.session.keyboard.display_name.as_deref() else {
+            return;
+        };
+        let Some(devices) = &self.devices else {
+            return;
+        };
+        let mut matches = devices
+            .iter()
+            .enumerate()
+            .filter(|(_, device)| device.name == name)
+            .map(|(index, _)| index);
+        let first = matches.next();
+        self.selected_device = if first.is_some() && matches.next().is_none() {
+            first
+        } else {
+            None
+        };
     }
 
     fn drain_listener_events(&mut self) {
@@ -308,7 +342,10 @@ impl App {
                     let is_error = reason.is_error();
                     let message = reason.to_string();
                     self.listener = None;
-                    self.session.finish_capture_segment();
+                    if self.session.finish_capture_segment() {
+                        self.note_session_dirty();
+                    }
+                    self.clear_in_flight();
                     self.listener_state = if is_error {
                         self.capture_error = Some(message.clone());
                         ListenerState::Failed
@@ -316,11 +353,10 @@ impl App {
                         self.capture_error = None;
                         ListenerState::Idle
                     };
-                    self.note_session_dirty();
-                    if self.pending_finish.is_some() {
-                        self.request_finalize();
-                    } else {
-                        self.request_checkpoint();
+                    if let Some(target) = self.deferred_boundary.take() {
+                        self.continue_boundary(target);
+                    } else if self.settings.autosave_enabled() && self.working_dirty() {
+                        self.request_save(None);
                     }
                     info!(%message, "listener stopped");
                 }
@@ -328,9 +364,7 @@ impl App {
                     timestamp,
                     key_code,
                     kind,
-                } => {
-                    self.process_input(timestamp, key_code, kind);
-                }
+                } => self.process_input(timestamp, key_code, kind),
             }
         }
     }
@@ -375,6 +409,14 @@ impl App {
         self.note_session_dirty();
     }
 
+    fn clear_in_flight(&mut self) {
+        for metric in &mut self.metrics {
+            metric.clear_in_flight();
+        }
+        self.physical_keys.clear();
+        self.reinit_xkb();
+    }
+
     fn drain_storage_events(&mut self) {
         loop {
             let event = match self.storage.as_ref().map(StorageWorker::try_recv) {
@@ -388,250 +430,137 @@ impl App {
             };
             self.handle_storage_event(event);
         }
-        if self.storage_finished {
-            self.storage = None;
-            self.storage_finished = false;
-        }
     }
 
     fn handle_storage_event(&mut self, event: StorageEvent) {
         match event {
-            StorageEvent::Opened {
-                active,
-                retained_sessions,
-            } => {
-                if retained_sessions > 0 {
-                    info!(retained_sessions, "removed expired completed sessions");
-                }
-                self.storage_tracker.loaded();
-                self.storage_needs_reopen = false;
+            StorageEvent::Opened { sessions, selected } => {
+                let first_open = !self.storage_initialized;
+                self.storage_initialized = true;
+                self.sessions = sessions;
                 self.storage_error = None;
-                let intent = self
-                    .storage_open_intent
-                    .take()
-                    .unwrap_or(StorageOpenIntent::Restore);
-                match (intent, active) {
-                    (StorageOpenIntent::PreserveCurrent, Some(_)) if self.session.is_active() => {
-                        self.storage_tracker.set_failed();
-                        self.storage_error = Some(
-                            "A different active session already exists in local storage. The current in-memory session was not changed."
-                                .to_owned(),
-                        );
+                self.last_failed_operation = None;
+                if first_open {
+                    if let Some(selected) = selected {
+                        self.restore_session(selected);
+                        self.storage_tracker.loaded(true);
+                    } else {
+                        self.storage_tracker.loaded(false);
+                        if self.settings.last_session_id().is_some() {
+                            self.settings.set_last_session_id(None);
+                            self.save_settings();
+                        }
                     }
-                    (_, Some(active)) => self.restore_active_session(active),
-                    (StorageOpenIntent::PreserveCurrent, None) if self.session.is_active() => {
+                } else {
+                    self.storage_tracker.loaded(self.session.id.is_some());
+                    if self.session.id.is_none() && self.session_has_content() {
                         self.note_session_dirty();
-                        self.request_checkpoint();
                     }
-                    (_, None) => {}
-                }
-                if self.history_open {
-                    self.request_history_page(self.history_offset);
                 }
             }
-            StorageEvent::Checkpointed {
+            StorageEvent::Saved {
                 generation,
                 session_id,
             } => {
                 self.session.id = Some(session_id);
-                if self.storage_tracker.in_flight() == Some(generation)
-                    && let Err(error) = self.storage_tracker.acknowledge(generation)
-                {
-                    self.storage_error = Some(format!("Invalid storage acknowledgement: {error}"));
-                }
-                if self.pending_finish.is_some()
-                    && self.listener.is_none()
-                    && self.storage_tracker.in_flight().is_none()
-                {
-                    self.request_finalize();
-                } else if self.checkpoint_when_available
-                    && self.storage_tracker.in_flight().is_none()
-                {
-                    self.request_checkpoint();
-                }
-            }
-            StorageEvent::Finalized {
-                generation,
-                session_id,
-            } => {
-                if self.session.id != Some(session_id) {
-                    self.storage_error = Some(
-                        "Storage finalized an unexpected session; in-memory aggregates were preserved."
-                            .to_owned(),
-                    );
+                if let Err(error) = self.storage_tracker.acknowledge(generation) {
+                    self.storage_error = Some(format!("Unexpected save acknowledgement: {error}"));
+                    self.storage_tracker.set_failed();
+                    self.after_save = None;
                     return;
                 }
-                if self.storage_tracker.in_flight() == Some(generation) {
-                    let _ = self.storage_tracker.acknowledge(generation);
-                }
-                let disable_after = self
-                    .pending_finish
-                    .take()
-                    .is_some_and(|pending| pending.disable_after);
-                self.reset_current_session();
-                if self.history_open {
-                    self.request_history_page(0);
-                }
-                if disable_after {
-                    self.disable_persistence_now();
+                self.settings.set_last_session_id(Some(session_id));
+                self.save_settings();
+                self.storage_error = None;
+                self.last_failed_operation = None;
+                self.request_session_list();
+                if self.storage_tracker.is_dirty() {
+                    if let Some(target) = self.after_save {
+                        self.begin_save(Some(target));
+                    }
+                } else if let Some(target) = self.after_save.take() {
+                    self.execute_boundary(target);
                 }
             }
-            StorageEvent::Discarded {
-                session_id,
-                deleted,
-            } => {
-                self.discarding = false;
-                if self.session.id != Some(session_id) {
-                    self.storage_error =
-                        Some("Storage acknowledged discard for an unexpected session.".to_owned());
-                } else if deleted {
-                    self.reset_current_session();
-                } else {
-                    self.storage_error =
-                        Some("The active session no longer exists in storage.".to_owned());
-                }
-            }
-            StorageEvent::RetentionApplied { deleted_sessions } => {
-                if deleted_sessions > 0 && self.history_open {
-                    self.request_history_page(self.history_offset);
-                }
-            }
-            StorageEvent::AllDeleted { reopened } => {
-                let disable_after = self.deleting_all_to_disable;
-                if reopened == disable_after {
-                    self.storage_error = Some(
-                        "Storage deletion completed with an unexpected reopen state.".to_owned(),
-                    );
-                }
-                self.deleting_all_to_disable = false;
-                self.deleting_all = false;
-                self.confirm_delete_all = false;
-                self.history_sessions.clear();
-                self.history_detail = None;
-                self.confirm_history_delete = None;
-                self.deleting_completed = None;
-                self.history_open = false;
-                self.reset_current_session();
-                if disable_after {
-                    self.disable_persistence_now();
-                }
-            }
-            StorageEvent::HistoryLoaded {
+            StorageEvent::SessionsListed {
                 request_id,
-                offset,
-                mut sessions,
+                sessions,
             } => {
-                if request_id == self.history_list_request_id {
-                    self.history_has_more = sessions.len() > HISTORY_PAGE_SIZE as usize;
-                    sessions.truncate(HISTORY_PAGE_SIZE as usize);
-                    self.history_sessions = sessions;
-                    self.history_offset = offset;
-                    self.history_loading = false;
-                    self.history_error = None;
+                if request_id == self.list_request_id {
+                    self.sessions = sessions;
                 }
             }
-            StorageEvent::CompletedLoaded {
+            StorageEvent::SessionLoaded {
                 request_id,
                 session,
             } => {
-                if request_id == self.history_detail_request_id {
-                    self.history_loading = false;
-                    match session {
-                        Some(stored) => {
-                            let recovered = recover_default_metrics(&stored.metrics);
-                            self.history_detail = Some(HistoryDetail {
-                                metadata: stored.metadata,
-                                metrics: recovered.metrics,
-                                messages: recovered
-                                    .issues
-                                    .iter()
-                                    .map(metric_recovery_message)
-                                    .collect(),
-                            });
-                            self.history_error = None;
-                        }
-                        None => {
-                            self.history_detail = None;
-                            self.history_error =
-                                Some("The selected completed session no longer exists.".to_owned());
-                        }
+                if request_id != self.load_request_id {
+                    return;
+                }
+                self.loading_session = false;
+                match session {
+                    Some(session) => {
+                        let id = session.metadata.id;
+                        self.restore_session(session);
+                        self.storage_tracker.loaded(true);
+                        self.settings.set_last_session_id(Some(id));
+                        self.save_settings();
+                        self.request_session_list();
+                    }
+                    None => {
+                        self.new_working_session();
+                        self.storage_error = Some(
+                            "The selected session no longer exists; started an untitled session."
+                                .to_owned(),
+                        );
                     }
                 }
             }
-            StorageEvent::CompletedDeleted {
+            StorageEvent::SessionDeleted {
                 session_id,
                 deleted,
             } => {
-                self.deleting_completed = None;
-                self.confirm_history_delete = None;
-                if deleted {
-                    self.history_sessions
-                        .retain(|summary| summary.metadata.id != session_id);
-                    if self
-                        .history_detail
-                        .as_ref()
-                        .is_some_and(|detail| detail.metadata.id == session_id)
-                    {
-                        self.history_detail = None;
-                    }
-                    if self.history_open {
-                        self.request_history_page(self.history_offset);
-                    }
-                } else {
-                    self.history_error =
-                        Some("The selected completed session no longer exists.".to_owned());
+                self.deleting_session = false;
+                if deleted && self.session.id == Some(session_id) {
+                    self.new_working_session();
                 }
+                self.request_session_list();
+            }
+            StorageEvent::AllDeleted => {
+                self.deleting_all = false;
+                self.sessions.clear();
+                self.new_working_session();
             }
             StorageEvent::Failed(failure) => {
-                if let Some(generation) = failure.generation
-                    && self.storage_tracker.in_flight() == Some(generation)
-                {
-                    let _ = self.storage_tracker.fail(generation);
-                    self.checkpoint_schedule.retry_later(Instant::now());
-                } else if failure.operation == StorageOperation::Open {
-                    let _ = self.storage_tracker.fail_loading();
-                    self.storage_needs_reopen = true;
-                }
-                if failure.operation == StorageOperation::Discard {
-                    self.discarding = false;
-                }
-                if failure.operation == StorageOperation::DeleteAll {
-                    self.deleting_all_to_disable = false;
-                    self.deleting_all = false;
-                }
-                if matches!(
-                    failure.operation,
-                    StorageOperation::HistoryList | StorageOperation::HistoryDetail
-                ) {
-                    self.history_loading = false;
-                    self.history_error = Some(failure.details.clone());
-                }
-                if failure.operation == StorageOperation::DeleteCompleted {
-                    self.deleting_completed = None;
-                    self.history_error = Some(failure.details.clone());
-                }
+                let label = storage_operation_label(failure.operation);
                 self.storage_error = Some(format!(
-                    "{} ({}): {}",
-                    storage_operation_label(failure.operation),
+                    "{label} at {}: {}",
                     failure.database_path.display(),
                     failure.details
                 ));
-            }
-            StorageEvent::ShutdownComplete {
-                final_generation: _,
-                final_checkpoint_saved,
-            } => {
-                if !final_checkpoint_saved {
-                    warn!("storage shutdown completed without saving the final checkpoint");
+                self.last_failed_operation = Some(failure.operation);
+                if let Some(generation) = failure.generation {
+                    let _ = self.storage_tracker.fail(generation);
+                    self.after_save = None;
+                } else if failure.operation == StorageOperation::Open {
+                    self.storage_initialized = true;
+                    self.storage_tracker.set_failed();
                 }
-                self.storage_tracker.disable();
-                self.shutting_down_storage = false;
-                self.storage_finished = true;
+                if failure.operation == StorageOperation::Load {
+                    self.loading_session = false;
+                }
+                if failure.operation == StorageOperation::Delete {
+                    self.deleting_session = false;
+                }
+                if failure.operation == StorageOperation::DeleteAll {
+                    self.deleting_all = false;
+                }
             }
+            StorageEvent::ShutdownComplete { .. } => {}
         }
     }
 
-    fn restore_active_session(&mut self, stored: StoredSession) {
+    fn restore_session(&mut self, stored: StoredSession) {
         let recovered = recover_default_metrics(&stored.metrics);
         self.recovery_messages = recovered
             .issues
@@ -647,60 +576,101 @@ impl App {
         self.reinit_xkb();
         self.session = CurrentSession {
             id: Some(metadata.id),
-            created_at_ms: Some(metadata.created_at_ms),
+            name: metadata.name,
+            created_at_ms: metadata.created_at_ms,
+            last_opened_at_ms: metadata.last_opened_at_ms,
             captured_duration: Duration::from_nanos(
                 u64::try_from(metadata.captured_duration_ns).unwrap_or_default(),
             ),
             capture_started_at: None,
-            keyboard: Some(metadata.keyboard),
-            resumed: true,
+            keyboard: metadata.keyboard,
+            restored: true,
         };
         self.listener = None;
         self.listener_state = ListenerState::Idle;
+        self.clear_in_flight();
+        self.select_remembered_device();
     }
 
-    fn start_storage(&mut self, intent: StorageOpenIntent) {
-        self.storage_tracker.begin_loading();
-        self.storage_open_intent = Some(intent);
-        self.storage_needs_reopen = false;
-        self.storage_error = None;
+    fn new_working_session(&mut self) {
         let now_ms = unix_now_ms().unwrap_or_default();
-        match StorageWorker::spawn(
-            self.paths.database_file(),
-            self.settings.retention(),
+        self.metrics = default_metrics();
+        self.physical_keys.clear();
+        self.session = CurrentSession::untitled(
             now_ms,
-            self.wake_signal.clone(),
-        ) {
-            Ok(worker) => self.storage = Some(worker),
-            Err(error) => {
-                self.storage_tracker.set_failed();
-                self.storage_error = Some(format!("Could not start storage: {error}"));
-            }
-        }
+            self.model.clone(),
+            self.layout.clone(),
+            self.variant.clone(),
+        );
+        self.listener = None;
+        self.listener_state = ListenerState::Idle;
+        self.storage_tracker.loaded(false);
+        self.checkpoint_schedule.clear();
+        self.recovery_messages.clear();
+        self.settings.set_last_session_id(None);
+        self.save_settings();
     }
 
     fn note_session_dirty(&mut self) {
-        if !self.settings.persistence_enabled() {
+        if let Err(error) = self.storage_tracker.mark_dirty() {
+            self.storage_error = Some(format!("Could not track unsaved changes: {error}"));
             return;
         }
-        match self.storage_tracker.mark_dirty() {
-            Ok(_) => self.checkpoint_schedule.note_dirty(Instant::now()),
-            Err(_error) if self.storage_tracker.status() == StorageStatus::Loading => {}
-            Err(error) => {
-                self.storage_error = Some(format!("Could not track unsaved changes: {error}"));
-            }
+        if self.settings.autosave_enabled() {
+            self.checkpoint_schedule.note_dirty(Instant::now());
         }
     }
 
-    fn request_checkpoint(&mut self) {
-        if !self.settings.persistence_enabled() || !self.session.is_active() {
+    fn working_dirty(&self) -> bool {
+        if self.session.id.is_some() {
+            self.storage_tracker.is_dirty()
+        } else {
+            self.session_has_content()
+        }
+    }
+
+    fn session_has_content(&self) -> bool {
+        self.session.name.is_some()
+            || !self.session.captured_duration.is_zero()
+            || self.session.capture_started_at.is_some()
+            || self.metrics.iter().any(|metric| metric.has_data())
+    }
+
+    fn request_save(&mut self, after: Option<BoundaryTarget>) {
+        if !self.settings.storage_disclosure_acknowledged() {
+            self.disclosure_prompt = Some(DisclosureIntent::Save(after));
             return;
         }
-        let Some(generation) = self.storage_tracker.begin_checkpoint() else {
-            if self.storage_tracker.in_flight().is_some() {
-                self.checkpoint_when_available = true;
+        self.begin_save(after);
+    }
+
+    fn begin_save(&mut self, after: Option<BoundaryTarget>) {
+        if self.storage_tracker.in_flight().is_some() {
+            if after.is_some() {
+                self.after_save = after;
             }
             return;
+        }
+        if self.session.id.is_none()
+            && matches!(
+                self.storage_tracker.status(),
+                StorageStatus::Failed | StorageStatus::Saved
+            )
+        {
+            let _ = self.storage_tracker.mark_dirty();
+        }
+        let generation = match self.storage_tracker.begin_save() {
+            Ok(Some(generation)) => generation,
+            Ok(None) => {
+                if let Some(target) = after {
+                    self.execute_boundary(target);
+                }
+                return;
+            }
+            Err(error) => {
+                self.storage_error = Some(format!("Could not begin save: {error}"));
+                return;
+            }
         };
         let snapshot = match self.session_snapshot() {
             Ok(snapshot) => snapshot,
@@ -710,97 +680,100 @@ impl App {
                 return;
             }
         };
-        let send_result = self
-            .storage
-            .as_ref()
-            .ok_or_else(|| "storage worker is unavailable".to_owned())
-            .and_then(|worker| {
-                worker
-                    .send(StorageCommand::Checkpoint(CheckpointRequest {
-                        generation,
-                        snapshot,
-                    }))
-                    .map_err(|error| error.to_string())
-            });
-        match send_result {
-            Ok(()) => {
-                self.checkpoint_when_available = false;
-                self.checkpoint_schedule.checkpoint_started();
-            }
-            Err(error) => {
+        self.after_save = after;
+        let command = StorageCommand::Save(SaveRequest {
+            generation,
+            snapshot,
+        });
+        match self.storage.as_ref().map(|worker| worker.send(command)) {
+            Some(Ok(())) => self.checkpoint_schedule.save_started(),
+            Some(Err(error)) => {
                 let _ = self.storage_tracker.fail(generation);
-                self.checkpoint_schedule.retry_later(Instant::now());
-                self.storage_error = Some(format!("Could not request checkpoint: {error}"));
+                self.storage_error = Some(format!("Could not request save: {error}"));
+                self.after_save = None;
             }
-        }
-    }
-
-    fn request_finalize(&mut self) {
-        if !self.settings.persistence_enabled() || !self.session.is_active() {
-            return;
-        }
-        let Some(generation) = self.storage_tracker.begin_checkpoint() else {
-            return;
-        };
-        let snapshot = match self.session_snapshot() {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
+            None => {
                 let _ = self.storage_tracker.fail(generation);
-                self.storage_error = Some(error);
-                return;
-            }
-        };
-        let completed_at_ms = unix_now_ms().unwrap_or(snapshot.updated_at_ms);
-        let command = StorageCommand::Finalize {
-            checkpoint: CheckpointRequest {
-                generation,
-                snapshot,
-            },
-            completed_at_ms,
-            retention: self.settings.retention(),
-            retention_now_ms: completed_at_ms,
-        };
-        let send_result = self
-            .storage
-            .as_ref()
-            .ok_or_else(|| "storage worker is unavailable".to_owned())
-            .and_then(|worker| worker.send(command).map_err(|error| error.to_string()));
-        match send_result {
-            Ok(()) => self.checkpoint_schedule.checkpoint_started(),
-            Err(error) => {
-                let _ = self.storage_tracker.fail(generation);
-                self.storage_error = Some(format!("Could not finish session: {error}"));
+                self.storage_error = Some("Storage worker is unavailable".to_owned());
+                self.after_save = None;
             }
         }
     }
 
     fn session_snapshot(&self) -> Result<SessionSnapshot, String> {
-        let keyboard = self
-            .session
-            .keyboard
-            .clone()
-            .ok_or_else(|| "current session has no fixed keyboard configuration".to_owned())?;
-        let created_at_ms = self
-            .session
-            .created_at_ms
-            .ok_or_else(|| "current session has no creation time".to_owned())?;
-        let updated_at_ms = unix_now_ms()?;
-        let captured_duration_ns = i64::try_from(self.session.duration().as_nanos())
-            .map_err(|_| "captured session duration is too large to save".to_owned())?;
+        let duration_ns = i64::try_from(self.session.duration().as_nanos())
+            .map_err(|_| "Capture duration exceeds the storage range".to_owned())?;
         let metrics = self
             .metrics
             .iter()
             .map(|metric| metric.snapshot().map_err(|error| error.to_string()))
             .collect::<Result<Vec<_>, _>>()?;
+        let now_ms = unix_now_ms()?;
         Ok(SessionSnapshot {
             id: self.session.id,
-            created_at_ms,
-            updated_at_ms: updated_at_ms.max(created_at_ms),
-            captured_duration_ns,
+            name: self.session.name.clone(),
+            created_at_ms: self.session.created_at_ms,
+            updated_at_ms: now_ms,
+            last_opened_at_ms: self.session.last_opened_at_ms.max(now_ms),
+            captured_duration_ns: duration_ns,
             application_version: env!("CARGO_PKG_VERSION").to_owned(),
-            keyboard,
+            keyboard: self.session.keyboard.clone(),
             metrics,
         })
+    }
+
+    fn request_session_list(&mut self) {
+        self.list_request_id = self.list_request_id.wrapping_add(1);
+        if let Some(worker) = &self.storage {
+            let _ = worker.send(StorageCommand::ListSessions {
+                request_id: self.list_request_id,
+            });
+        }
+    }
+
+    fn request_boundary(&mut self, target: BoundaryTarget) {
+        if self.listener.is_some() {
+            self.deferred_boundary = Some(target);
+            self.stop_listener();
+        } else {
+            self.clear_in_flight();
+            self.continue_boundary(target);
+        }
+    }
+
+    fn continue_boundary(&mut self, target: BoundaryTarget) {
+        match boundary_policy(self.working_dirty(), self.settings.autosave_enabled()) {
+            BoundaryPolicy::Proceed => self.execute_boundary(target),
+            BoundaryPolicy::Save => self.request_save(Some(target)),
+            BoundaryPolicy::Prompt => self.boundary_prompt = Some(target),
+        }
+    }
+
+    fn execute_boundary(&mut self, target: BoundaryTarget) {
+        self.after_save = None;
+        self.boundary_prompt = None;
+        match target {
+            BoundaryTarget::New => self.new_working_session(),
+            BoundaryTarget::Load(session_id) => {
+                self.load_request_id = self.load_request_id.wrapping_add(1);
+                self.loading_session = true;
+                let command = StorageCommand::LoadSession {
+                    request_id: self.load_request_id,
+                    session_id,
+                    opened_at_ms: unix_now_ms().unwrap_or_default(),
+                };
+                if let Some(worker) = &self.storage
+                    && let Err(error) = worker.send(command)
+                {
+                    self.loading_session = false;
+                    self.storage_tracker.set_failed();
+                    self.storage_error = Some(format!("Could not request session load: {error}"));
+                }
+            }
+            BoundaryTarget::Exit => {
+                self.allow_close = true;
+            }
+        }
     }
 
     fn update_variants(&mut self) {
@@ -815,10 +788,6 @@ impl App {
             Ok(state) => {
                 self.xkb_state = state;
                 self.keyboard_error = None;
-                info!(
-                    "Re-initialized XKB: {} / {} / {}",
-                    self.model, self.layout, self.variant
-                );
             }
             Err(error) => {
                 let message = format!("Could not apply keyboard configuration: {error:#}");
@@ -857,7 +826,7 @@ impl App {
         }
     }
 
-    fn begin_session_and_listen(&mut self, device_index: usize) {
+    fn begin_listening(&mut self, device_index: usize) {
         let Some(device) = self
             .devices
             .as_ref()
@@ -866,36 +835,15 @@ impl App {
         else {
             return;
         };
-        if let Some(keyboard) = &self.session.keyboard
-            && keyboard
-                .display_name
-                .as_deref()
-                .is_some_and(|name| name != device.name)
-        {
-            self.storage_error = Some(
-                "Select the same keyboard model used by the active session, or finish/discard it."
-                    .to_owned(),
-            );
-            return;
-        }
-        if !self.session.is_active() {
-            let now_ms = unix_now_ms().unwrap_or_default();
-            self.session = CurrentSession {
-                id: None,
-                created_at_ms: Some(now_ms),
-                captured_duration: Duration::ZERO,
-                capture_started_at: None,
-                keyboard: Some(KeyboardContext {
-                    display_name: Some(device.name.clone()),
-                    model: self.model.clone(),
-                    layout: self.layout.clone(),
-                    variant: self.variant.clone(),
-                }),
-                resumed: false,
-            };
-            self.note_session_dirty();
-            self.request_checkpoint();
-        }
+        self.session.keyboard = KeyboardContext {
+            display_name: Some(device.name.clone()),
+            model: self.model.clone(),
+            layout: self.layout.clone(),
+            variant: self.variant.clone(),
+        };
+        self.session.last_opened_at_ms = unix_now_ms().unwrap_or(self.session.last_opened_at_ms);
+        self.session.restored = false;
+        self.note_session_dirty();
         self.listener = Some(listener::spawn(device.path, self.wake_signal.clone()));
         self.listener_state = ListenerState::Connecting;
         self.capture_error = None;
@@ -907,247 +855,221 @@ impl App {
             Some(Ok(())) => self.listener_state = ListenerState::Stopping,
             Some(Err(error)) => {
                 self.listener = None;
-                self.session.finish_capture_segment();
+                if self.session.finish_capture_segment() {
+                    self.note_session_dirty();
+                }
+                self.clear_in_flight();
                 self.listener_state = ListenerState::Failed;
                 self.capture_error = Some(format!("Could not stop listener: {error:#}"));
-                self.note_session_dirty();
-                if self.pending_finish.is_some() {
-                    self.request_finalize();
-                } else {
-                    self.request_checkpoint();
+                if let Some(target) = self.deferred_boundary.take() {
+                    self.continue_boundary(target);
+                } else if self.settings.autosave_enabled() && self.working_dirty() {
+                    self.request_save(None);
                 }
             }
             None => {}
         }
     }
 
-    fn begin_finish(&mut self, disable_after: bool) {
-        self.pending_finish = Some(PendingFinish { disable_after });
-        self.note_session_dirty();
-        if self.listener.is_some() {
-            self.stop_listener();
-        } else {
-            self.request_finalize();
+    fn apply_rename(&mut self) {
+        let trimmed = self.rename_buffer.trim();
+        if trimmed.len() > MAX_SESSION_NAME_BYTES {
+            self.rename_error = Some("Session name is longer than 80 UTF-8 bytes.".to_owned());
+            return;
         }
+        let name = (!trimmed.is_empty()).then(|| trimmed.to_owned());
+        if let Some(name) = &name
+            && self.sessions.iter().any(|session| {
+                Some(session.id) != self.session.id && session.name.as_ref() == Some(name)
+            })
+        {
+            self.rename_error = Some("Another saved session already uses that name.".to_owned());
+            return;
+        }
+        if self.session.name != name {
+            self.session.name = name;
+            self.note_session_dirty();
+        }
+        self.rename_open = false;
+        self.rename_error = None;
     }
 
-    fn begin_discard(&mut self) {
-        self.confirm_discard = false;
-        if self.listener.is_some() || matches!(self.listener_state, ListenerState::Stopping) {
-            return;
-        }
-        if !self.settings.persistence_enabled() {
-            self.reset_current_session();
-            return;
-        }
-        if self.storage_tracker.in_flight().is_some() {
-            self.storage_error = Some("Wait for the current save before discarding.".to_owned());
-            return;
-        }
-        match self.session.id {
-            Some(session_id) => {
-                let result = self
-                    .storage
-                    .as_ref()
-                    .ok_or_else(|| "storage worker is unavailable".to_owned())
-                    .and_then(|worker| {
-                        worker
-                            .send(StorageCommand::DiscardActive { session_id })
-                            .map_err(|error| error.to_string())
-                    });
-                match result {
-                    Ok(()) => self.discarding = true,
-                    Err(error) => {
-                        self.storage_error = Some(format!("Could not discard session: {error}"));
-                    }
-                }
-            }
-            None => self.reset_current_session(),
-        }
-    }
-
-    fn reset_current_session(&mut self) {
+    fn reset_statistics(&mut self) {
         for metric in &mut self.metrics {
             metric.reset();
         }
-        self.metrics = default_metrics();
         self.physical_keys.clear();
-        self.session = CurrentSession::default();
-        self.pending_finish = None;
-        self.discarding = false;
-        self.confirm_discard = false;
-        self.recovery_messages.clear();
-        self.checkpoint_schedule.clear();
-        self.checkpoint_when_available = false;
-        if self.settings.persistence_enabled()
-            && self.storage_tracker.status() != StorageStatus::Failed
+        self.session.captured_duration = Duration::ZERO;
+        self.session.capture_started_at = None;
+        self.note_session_dirty();
+        self.confirm_reset = false;
+    }
+
+    fn delete_current_session(&mut self) {
+        self.confirm_delete = false;
+        let Some(session_id) = self.session.id else {
+            self.new_working_session();
+            return;
+        };
+        self.deleting_session = true;
+        if let Some(worker) = &self.storage
+            && let Err(error) = worker.send(StorageCommand::DeleteSession { session_id })
         {
-            self.storage_tracker.loaded();
+            self.deleting_session = false;
+            self.storage_error = Some(format!("Could not request session deletion: {error}"));
         }
-        self.model = self.settings.keyboard_model().to_owned();
-        self.layout = self.settings.keyboard_layout().to_owned();
-        self.variant = self.settings.keyboard_variant().to_owned();
-        self.available_variants = xkb_helper::get_variants(&self.layout);
-        self.reinit_xkb();
     }
 
-    fn has_samples(&self) -> bool {
-        self.session.duration() > Duration::ZERO
-            || self.metrics.iter().any(|metric| metric.has_data())
+    fn delete_all_sessions(&mut self) {
+        self.confirm_delete_all = false;
+        self.deleting_all = true;
+        if let Some(worker) = &self.storage
+            && let Err(error) = worker.send(StorageCommand::DeleteAll)
+        {
+            self.deleting_all = false;
+            self.storage_error = Some(format!("Could not request complete deletion: {error}"));
+        }
     }
 
-    fn enable_persistence(&mut self, intent: StorageOpenIntent) {
-        self.settings.set_persistence_enabled(true);
-        if !self.save_settings() {
-            self.settings.set_persistence_enabled(false);
-            return;
-        }
-        self.enable_prompt = None;
-        self.start_storage(intent);
-    }
-
-    fn disable_persistence_now(&mut self) {
-        self.settings.set_persistence_enabled(false);
-        if !self.save_settings() {
-            self.settings.set_persistence_enabled(true);
-            return;
-        }
-        self.disable_prompt = false;
-        self.history_open = false;
-        self.history_detail = None;
-        self.shutting_down_storage = true;
-        match &self.storage {
-            Some(worker) => {
-                if let Err(error) = worker.request_shutdown(None) {
-                    self.storage_error = Some(format!("Could not stop storage: {error}"));
-                    self.shutting_down_storage = false;
+    fn render_session_management(&mut self, ui: &mut egui::Ui) {
+        ui.group(|ui| {
+            ui.set_width(ui.available_width());
+            ui.heading("Session");
+            let busy = self.loading_session
+                || self.storage_tracker.in_flight().is_some()
+                || self.deleting_session
+                || self.deleting_all
+                || self.listener_state == ListenerState::Stopping;
+            let mut requested_target = None;
+            ui.horizontal_wrapped(|ui| {
+                ui.add_enabled_ui(!busy, |ui| {
+                    egui::ComboBox::from_label("Current")
+                        .selected_text(self.session.display_name())
+                        .show_ui(ui, |ui| {
+                            for saved in &self.sessions {
+                                let selected = self.session.id == Some(saved.id);
+                                let label = session_selector_label(saved);
+                                if ui.selectable_label(selected, label).clicked() && !selected {
+                                    requested_target = Some(BoundaryTarget::Load(saved.id));
+                                }
+                            }
+                        });
+                });
+                if ui
+                    .add_enabled(!busy, egui::Button::new("New session"))
+                    .clicked()
+                {
+                    requested_target = Some(BoundaryTarget::New);
                 }
-            }
-            None => {
-                self.storage_tracker.disable();
-                self.shutting_down_storage = false;
-            }
-        }
-    }
-
-    fn delete_all_and_disable(&mut self) {
-        let Some(worker) = &self.storage else {
-            self.storage_error =
-                Some("Storage worker is unavailable; analytics were not deleted.".to_owned());
-            return;
-        };
-        let now_ms = unix_now_ms().unwrap_or_default();
-        match worker.send(StorageCommand::DeleteAll {
-            reopen: false,
-            retention: self.settings.retention(),
-            now_ms,
-        }) {
-            Ok(()) => {
-                self.deleting_all_to_disable = true;
-                self.deleting_all = true;
-                self.disable_prompt = false;
-            }
-            Err(error) => {
-                self.storage_error = Some(format!("Could not request analytics deletion: {error}"));
-            }
-        }
-    }
-
-    fn delete_all_analytics(&mut self) {
-        let Some(worker) = &self.storage else {
-            self.history_error =
-                Some("Storage worker is unavailable; analytics were not deleted.".to_owned());
-            return;
-        };
-        match worker.send(StorageCommand::DeleteAll {
-            reopen: true,
-            retention: self.settings.retention(),
-            now_ms: unix_now_ms().unwrap_or_default(),
-        }) {
-            Ok(()) => {
-                self.deleting_all = true;
-                self.confirm_delete_all = false;
-            }
-            Err(error) => {
-                self.history_error = Some(format!("Could not request analytics deletion: {error}"));
-            }
-        }
-    }
-
-    fn change_retention(&mut self, retention: RetentionPolicy) {
-        let previous = self.settings.retention();
-        if self.settings.set_retention(retention).is_err() {
-            return;
-        }
-        if !self.save_settings() {
-            let _ = self.settings.set_retention(previous);
-            return;
-        }
-        if let Some(worker) = &self.storage {
-            let _ = worker.send(StorageCommand::ApplyRetention {
-                retention,
-                now_ms: unix_now_ms().unwrap_or_default(),
+                if ui
+                    .add_enabled(!busy, egui::Button::new("Save now"))
+                    .clicked()
+                {
+                    self.request_save(None);
+                }
+                if ui.add_enabled(!busy, egui::Button::new("Rename")).clicked() {
+                    self.rename_buffer = self.session.name.clone().unwrap_or_default();
+                    self.rename_open = true;
+                    self.rename_error = None;
+                }
+                if ui
+                    .add_enabled(
+                        self.listener.is_none() && !busy,
+                        egui::Button::new("Reset statistics"),
+                    )
+                    .clicked()
+                {
+                    self.confirm_reset = true;
+                }
+                if ui
+                    .add_enabled(
+                        self.listener.is_none() && !busy,
+                        egui::Button::new("Delete session"),
+                    )
+                    .clicked()
+                {
+                    self.confirm_delete = true;
+                }
             });
-        }
-    }
-
-    fn request_history_page(&mut self, offset: u32) {
-        self.history_list_request_id = self.history_list_request_id.wrapping_add(1).max(1);
-        self.history_loading = true;
-        self.history_error = None;
-        let command = StorageCommand::ListCompleted {
-            request_id: self.history_list_request_id,
-            limit: HISTORY_PAGE_SIZE + 1,
-            offset,
-        };
-        if let Err(error) = self
-            .storage
-            .as_ref()
-            .ok_or_else(|| "storage worker is unavailable".to_owned())
-            .and_then(|worker| worker.send(command).map_err(|error| error.to_string()))
-        {
-            self.history_loading = false;
-            self.history_error = Some(format!("Could not load history: {error}"));
-        }
-    }
-
-    fn request_history_detail(&mut self, session_id: SessionId) {
-        self.history_detail_request_id = self.history_detail_request_id.wrapping_add(1).max(1);
-        self.history_loading = true;
-        self.history_error = None;
-        let command = StorageCommand::LoadCompleted {
-            request_id: self.history_detail_request_id,
-            session_id,
-        };
-        if let Err(error) = self
-            .storage
-            .as_ref()
-            .ok_or_else(|| "storage worker is unavailable".to_owned())
-            .and_then(|worker| worker.send(command).map_err(|error| error.to_string()))
-        {
-            self.history_loading = false;
-            self.history_error = Some(format!("Could not load session details: {error}"));
-        }
-    }
-
-    fn delete_completed_session(&mut self, session_id: SessionId) {
-        self.confirm_history_delete = None;
-        let command = StorageCommand::DeleteCompleted { session_id };
-        match self
-            .storage
-            .as_ref()
-            .ok_or_else(|| "storage worker is unavailable".to_owned())
-            .and_then(|worker| worker.send(command).map_err(|error| error.to_string()))
-        {
-            Ok(()) => self.deleting_completed = Some(session_id),
-            Err(error) => {
-                self.history_error = Some(format!("Could not delete completed session: {error}"));
+            if let Some(target) = requested_target {
+                self.request_boundary(target);
             }
-        }
-    }
-}
 
-impl App {
+            ui.horizontal_wrapped(|ui| {
+                let mut autosave = self.settings.autosave_enabled();
+                if ui.checkbox(&mut autosave, "Autosave sessions").changed() {
+                    if autosave {
+                        if self.settings.storage_disclosure_acknowledged() {
+                            self.settings.set_autosave_enabled(true);
+                            if self.save_settings() {
+                                if self.working_dirty() {
+                                    self.request_save(None);
+                                }
+                            } else {
+                                self.settings.set_autosave_enabled(false);
+                            }
+                        } else {
+                            self.disclosure_prompt = Some(DisclosureIntent::EnableAutosave);
+                        }
+                    } else {
+                        self.settings.set_autosave_enabled(false);
+                        if self.save_settings() {
+                            self.checkpoint_schedule.clear();
+                        } else {
+                            self.settings.set_autosave_enabled(true);
+                        }
+                    }
+                }
+                ui.label(storage_status_label(
+                    self.storage_tracker.status(),
+                    self.session.id.is_some(),
+                ));
+                let retryable = matches!(
+                    self.last_failed_operation,
+                    Some(StorageOperation::Open | StorageOperation::Save)
+                );
+                if retryable && ui.button("Retry storage operation").clicked() {
+                    if self.last_failed_operation == Some(StorageOperation::Open) {
+                        if let Some(worker) = &self.storage {
+                            let _ = worker.send(StorageCommand::RetryOpen {
+                                last_session_id: self.settings.last_session_id(),
+                            });
+                        }
+                    } else {
+                        self.request_save(None);
+                    }
+                }
+            });
+            ui.small(format!(
+                "Capture duration: {} · Created: {}",
+                format_duration(self.session.duration()),
+                format_local_timestamp(self.session.created_at_ms)
+            ));
+            if self.session.restored {
+                ui.weak("Restored from disk; capture is paused until you start listening.");
+            }
+            if let Some(error) = &self.storage_error {
+                ui.colored_label(egui::Color32::RED, error);
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.small(format!(
+                    "Storage: {} ({})",
+                    self.paths.database_file().display(),
+                    format_byte_size(database_disk_usage(&self.paths.database_file()))
+                ));
+                if ui
+                    .add_enabled(
+                        !self.sessions.is_empty() && !busy,
+                        egui::Button::new("Delete all saved sessions"),
+                    )
+                    .clicked()
+                {
+                    self.confirm_delete_all = true;
+                }
+            });
+        });
+    }
+
     fn render_capture_setup(&mut self, ui: &mut egui::Ui) {
         ui.group(|ui| {
             ui.set_width(ui.available_width());
@@ -1156,22 +1078,15 @@ impl App {
             ui.add_space(4.0);
             self.render_keyboard_configuration(ui);
             ui.add_space(4.0);
-            self.render_session_controls(ui);
+            self.render_capture_controls(ui);
             self.render_capture_status(ui);
         });
     }
 
     fn render_device_picker(&mut self, ui: &mut egui::Ui) {
-        let configuration_locked = self.session.is_active();
-        let needs_runtime_device = configuration_locked && self.selected_device.is_none();
         let picker_enabled = self.listener.is_none()
-            && (!configuration_locked || needs_runtime_device)
-            && !matches!(self.listener_state, ListenerState::Stopping);
-        let required_name = self
-            .session
-            .keyboard
-            .as_ref()
-            .and_then(|keyboard| keyboard.display_name.as_deref());
+            && !matches!(self.listener_state, ListenerState::Stopping)
+            && !self.loading_session;
         let mut request_scan = false;
         ui.horizontal_wrapped(|ui| {
             match &self.devices {
@@ -1192,22 +1107,16 @@ impl App {
                             .selected_text(text)
                             .show_ui(ui, |ui| {
                                 for (index, device) in devices.iter().enumerate() {
-                                    let compatible =
-                                        required_name.is_none_or(|name| name == device.name);
-                                    ui.add_enabled_ui(compatible, |ui| {
-                                        ui.selectable_value(
-                                            &mut self.selected_device,
-                                            Some(index),
-                                            &device.name,
-                                        )
-                                        .on_hover_ui(
-                                            |ui| {
-                                                ui.label(format!(
-                                                    "{} ({})",
-                                                    device.physical_path, device.path
-                                                ));
-                                            },
-                                        );
+                                    ui.selectable_value(
+                                        &mut self.selected_device,
+                                        Some(index),
+                                        &device.name,
+                                    )
+                                    .on_hover_ui(|ui| {
+                                        ui.label(format!(
+                                            "{} ({})",
+                                            device.physical_path, device.path
+                                        ));
                                     });
                                 }
                             });
@@ -1224,8 +1133,8 @@ impl App {
                 request_scan = true;
             }
         });
-        if configuration_locked {
-            ui.weak("Keyboard and XKB configuration are fixed for the active session.");
+        if self.session.keyboard.display_name.is_some() {
+            ui.weak("The session's remembered keyboard is a suggestion; any readable keyboard may be used.");
         }
         if request_scan {
             self.request_scan();
@@ -1233,22 +1142,18 @@ impl App {
     }
 
     fn render_keyboard_configuration(&mut self, ui: &mut egui::Ui) {
-        let enabled = self.listener.is_none() && !self.session.is_active();
-        let mut save_settings = false;
+        let enabled = self.listener.is_none() && !self.loading_session;
+        let mut changed = false;
         ui.add_enabled_ui(enabled, |ui| {
             ui.horizontal_wrapped(|ui| {
-                let mut changed = false;
                 egui::ComboBox::from_label("Model")
                     .width(80.0)
                     .selected_text(&self.model)
                     .show_ui(ui, |ui| {
                         for model in &self.available_models {
-                            if ui
+                            changed |= ui
                                 .selectable_value(&mut self.model, model.clone(), model)
-                                .clicked()
-                            {
-                                changed = true;
-                            }
+                                .clicked();
                         }
                     });
                 egui::ComboBox::from_label("Layout")
@@ -1276,36 +1181,34 @@ impl App {
                 egui::ComboBox::from_label("Variant")
                     .selected_text(variant_text)
                     .show_ui(ui, |ui| {
-                        if ui
+                        changed |= ui
                             .selectable_value(&mut self.variant, String::new(), "Default")
-                            .clicked()
-                        {
-                            changed = true;
-                        }
+                            .clicked();
                         for variant in &self.available_variants {
-                            if !variant.is_empty()
-                                && ui
+                            if !variant.is_empty() {
+                                changed |= ui
                                     .selectable_value(&mut self.variant, variant.clone(), variant)
-                                    .clicked()
-                            {
-                                changed = true;
+                                    .clicked();
                             }
                         }
                     });
-                if changed {
-                    self.reinit_xkb();
-                    save_settings = true;
-                }
             });
         });
-        if save_settings {
+        if changed {
+            self.reinit_xkb();
             self.save_keyboard_settings();
+            self.session.keyboard.model.clone_from(&self.model);
+            self.session.keyboard.layout.clone_from(&self.layout);
+            self.session.keyboard.variant.clone_from(&self.variant);
+            if self.session.id.is_some() || self.session_has_content() {
+                self.note_session_dirty();
+            }
         }
     }
 
-    fn render_session_controls(&mut self, ui: &mut egui::Ui) {
-        let busy = self.pending_finish.is_some()
-            || self.discarding
+    fn render_capture_controls(&mut self, ui: &mut egui::Ui) {
+        let busy = self.loading_session
+            || self.deleting_session
             || self.deleting_all
             || matches!(self.listener_state, ListenerState::Stopping);
         ui.horizontal_wrapped(|ui| {
@@ -1318,517 +1221,223 @@ impl App {
                 }
             } else {
                 let selected_index = self.selected_device;
-                let storage_ready = self.storage_tracker.status() != StorageStatus::Loading;
                 if ui
                     .add_enabled(
-                        selected_index.is_some() && !busy && storage_ready,
+                        selected_index.is_some() && !busy,
                         egui::Button::new("Start listening"),
                     )
                     .clicked()
                     && let Some(index) = selected_index
                 {
-                    self.begin_session_and_listen(index);
-                }
-            }
-
-            if self.settings.persistence_enabled()
-                && ui
-                    .add_enabled(
-                        self.session.is_active() && !busy,
-                        egui::Button::new("Finish session"),
-                    )
-                    .clicked()
-            {
-                self.begin_finish(false);
-            }
-            let discard_label = if self.settings.persistence_enabled() {
-                "Discard session"
-            } else {
-                "Discard current session"
-            };
-            if ui
-                .add_enabled(
-                    self.session.is_active()
-                        && self.listener.is_none()
-                        && !busy
-                        && self.storage_tracker.in_flight().is_none(),
-                    egui::Button::new(discard_label),
-                )
-                .clicked()
-            {
-                if self.has_samples() {
-                    self.confirm_discard = true;
-                } else {
-                    self.begin_discard();
+                    self.begin_listening(index);
                 }
             }
         });
-
-        if self.confirm_discard {
-            ui.colored_label(
-                egui::Color32::YELLOW,
-                "Discard all aggregates in the current session? This cannot be undone.",
-            );
-            ui.horizontal(|ui| {
-                if ui.button("Discard permanently").clicked() {
-                    self.begin_discard();
-                }
-                if ui.button("Cancel").clicked() {
-                    self.confirm_discard = false;
-                }
-            });
-        }
     }
 
-    fn render_capture_status(&mut self, ui: &mut egui::Ui) {
-        if let Some(error) = &self.scan_error {
+    fn render_capture_status(&self, ui: &mut egui::Ui) {
+        for error in [
+            self.scan_error.as_ref(),
+            self.keyboard_error.as_ref(),
+            self.settings_error.as_ref(),
+            self.capture_error.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
             ui.colored_label(egui::Color32::RED, error);
         }
         if let Some(warning) = &self.scan_warning {
             ui.colored_label(egui::Color32::YELLOW, warning);
         }
-        if let Some(error) = &self.keyboard_error {
-            ui.colored_label(egui::Color32::RED, error);
-        }
-        if let Some(error) = &self.settings_error {
-            ui.colored_label(egui::Color32::RED, error);
-        }
-        if let Some(error) = &self.capture_error {
-            ui.colored_label(egui::Color32::RED, error);
-        }
-
         match self.listener_state {
-            ListenerState::Idle => {
-                if self.session.resumed {
-                    ui.weak("Saved session resumed — capture is paused");
-                } else {
-                    ui.weak("Not listening");
-                }
-            }
-            ListenerState::Connecting => {
-                ui.label("Connecting to keyboard…");
-            }
-            ListenerState::Listening => {
-                ui.colored_label(egui::Color32::GREEN, "Listening");
-            }
-            ListenerState::Stopping => {
-                ui.label("Stopping listener…");
-            }
+            ListenerState::Idle => ui.weak("Not listening"),
+            ListenerState::Connecting => ui.label("Connecting to keyboard…"),
+            ListenerState::Listening => ui.colored_label(egui::Color32::GREEN, "Listening"),
+            ListenerState::Stopping => ui.label("Stopping listener…"),
             ListenerState::Failed => {
-                ui.colored_label(egui::Color32::RED, "Capture stopped because of an error");
+                ui.colored_label(egui::Color32::RED, "Capture stopped because of an error")
             }
-        }
-        if self.pending_finish.is_some() {
-            ui.label("Finishing session…");
-        } else if self.discarding {
-            ui.label("Discarding session…");
-        }
-    }
-
-    fn render_persistence_settings(&mut self, ui: &mut egui::Ui) {
-        ui.group(|ui| {
-            ui.set_width(ui.available_width());
-            ui.heading("Local aggregate history");
-            if self.settings.persistence_enabled() {
-                ui.label("Enabled — versioned aggregate snapshots are stored locally in an unencrypted SQLite database.");
-                ui.small(format!("Storage: {}", self.paths.database_file().display()));
-                ui.small("Privacy details: docs/privacy.md in the evtap source distribution.");
-                let mut retention = self.settings.retention();
-                egui::ComboBox::from_label("Retention")
-                    .selected_text(retention_label(retention))
-                    .show_ui(ui, |ui| {
-                        for option in [
-                            RetentionPolicy::Days(30),
-                            RetentionPolicy::Days(90),
-                            RetentionPolicy::Days(365),
-                            RetentionPolicy::Forever,
-                        ] {
-                            ui.selectable_value(&mut retention, option, retention_label(option));
-                        }
-                    });
-                if retention != self.settings.retention() {
-                    self.change_retention(retention);
-                }
-                ui.small(format!(
-                    "Current disk usage: {}",
-                    format_byte_size(database_disk_usage(&self.paths.database_file()))
-                ));
-                if ui
-                    .add_enabled(
-                        self.storage_tracker.status() != StorageStatus::Loading,
-                        egui::Button::new(if self.history_open {
-                            "Hide history"
-                        } else {
-                            "History"
-                        }),
-                    )
-                    .clicked()
-                {
-                    self.history_open = !self.history_open;
-                    if self.history_open {
-                        self.request_history_page(0);
-                    } else {
-                        self.history_detail = None;
-                    }
-                }
-                if ui
-                    .add_enabled(
-                        self.listener.is_none()
-                            && self.storage_tracker.in_flight().is_none()
-                            && !self.deleting_all,
-                        egui::Button::new("Delete all stored analytics…"),
-                    )
-                    .clicked()
-                {
-                    self.confirm_delete_all = true;
-                }
-                if ui
-                    .add_enabled(
-                        self.listener.is_none()
-                            && !self.shutting_down_storage
-                            && !self.deleting_all,
-                        egui::Button::new("Disable persistence…"),
-                    )
-                    .clicked()
-                {
-                    if self.session.is_active() {
-                        self.disable_prompt = true;
-                    } else {
-                        self.disable_persistence_now();
-                    }
-                }
-            } else {
-                ui.label("Off — session aggregates remain only in memory and are discarded on exit.");
-                if ui.button("Enable persistence…").clicked() {
-                    self.enable_prompt = Some(EnablePrompt::Disclosure);
-                }
-            }
-            if self.confirm_delete_all {
-                ui.colored_label(
-                    egui::Color32::YELLOW,
-                    "Delete the active session, all completed sessions, and every aggregate snapshot? Settings are retained. This cannot be undone.",
-                );
-                ui.horizontal(|ui| {
-                    if ui.button("Delete all analytics permanently").clicked() {
-                        self.delete_all_analytics();
-                    }
-                    if ui.button("Cancel").clicked() {
-                        self.confirm_delete_all = false;
-                    }
-                });
-            }
-            if self.deleting_all {
-                ui.label("Deleting all stored analytics…");
-            }
-            self.render_storage_status(ui);
-            self.render_persistence_prompts(ui);
-        });
-    }
-
-    fn render_storage_status(&mut self, ui: &mut egui::Ui) {
-        let label = match self.storage_tracker.status() {
-            StorageStatus::Disabled => "Persistence off",
-            StorageStatus::Loading => "Loading saved session…",
-            StorageStatus::Saved => "Saved",
-            StorageStatus::Dirty => "Unsaved changes",
-            StorageStatus::Saving => "Saving…",
-            StorageStatus::Failed => "Could not save",
         };
-        ui.weak(label);
-        if let Some(error) = &self.storage_error {
-            ui.colored_label(egui::Color32::RED, error);
-        }
-        if self.storage_tracker.status() == StorageStatus::Failed
-            && self.settings.persistence_enabled()
-            && ui.button("Retry storage operation").clicked()
-        {
-            if self.storage.is_none() {
-                self.start_storage(if self.session.is_active() {
-                    StorageOpenIntent::PreserveCurrent
-                } else {
-                    StorageOpenIntent::Restore
-                });
-            } else if self.storage_needs_reopen {
-                self.storage_tracker.begin_loading();
-                self.storage_open_intent = Some(if self.session.is_active() {
-                    StorageOpenIntent::PreserveCurrent
-                } else {
-                    StorageOpenIntent::Restore
-                });
-                let result = self.storage.as_ref().map_or_else(
-                    || Err("storage worker is unavailable".to_owned()),
-                    |worker| {
-                        worker
-                            .send(StorageCommand::RetryOpen {
-                                retention: self.settings.retention(),
-                                now_ms: unix_now_ms().unwrap_or_default(),
-                            })
-                            .map_err(|error| error.to_string())
-                    },
-                );
-                if let Err(error) = result {
-                    self.storage_tracker.set_failed();
-                    self.storage_error = Some(format!("Could not retry storage: {error}"));
-                }
-            } else if self.pending_finish.is_some() {
-                self.request_finalize();
-            } else {
-                self.request_checkpoint();
-            }
-        }
     }
 
-    fn render_history(&mut self, ui: &mut egui::Ui) {
-        ui.group(|ui| {
-            ui.set_width(ui.available_width());
-            ui.heading("Completed-session history");
-            ScrollArea::vertical()
-                .id_salt("completed-session-history")
-                .max_height(600.0)
-                .show(ui, |ui| self.render_history_contents(ui));
-        });
-    }
-
-    fn render_history_contents(&mut self, ui: &mut egui::Ui) {
-        if self.history_loading {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label("Loading history…");
-            });
-        }
-        if let Some(error) = &self.history_error {
-            ui.colored_label(egui::Color32::RED, error);
-        }
-
-        let mut open_session = None;
-        let mut request_delete = None;
-        if self.history_sessions.is_empty() && !self.history_loading {
-            ui.weak("No completed sessions are stored on this page.");
-        }
-        for summary in &self.history_sessions {
-            ui.group(|ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal_wrapped(|ui| {
-                    ui.strong(format_local_timestamp(summary.metadata.created_at_ms));
-                    ui.label(format!(
-                        "Capture duration: {}",
-                        format_duration_ns(summary.metadata.captured_duration_ns)
-                    ));
-                    ui.label(match summary.total_presses {
-                        Some(count) => format!("Physical presses: {count}"),
-                        None => "Physical presses unavailable".to_owned(),
+    fn render_prompts(&mut self, ctx: &egui::Context) {
+        if let Some(intent) = self.disclosure_prompt {
+            egui::Window::new("Save sensitive aggregate statistics?")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.label("evtap reads global keyboard input while listening. Saving writes sensitive character, bigram, correction, key-usage, count, and timing aggregates to a local, unencrypted SQLite database.");
+                    ui.label("Raw event sequences, device paths, pressed-key state, and unfinished timing or correction context are not stored. No telemetry or synchronization is performed.");
+                    ui.colored_label(egui::Color32::YELLOW, "Anyone who can read your files, including backups or privileged processes, may read the saved aggregates.");
+                    ui.horizontal(|ui| {
+                        if ui.button("Allow local saves").clicked() {
+                            self.settings.acknowledge_storage_disclosure();
+                            if self.save_settings() {
+                                self.disclosure_prompt = None;
+                                match intent {
+                                    DisclosureIntent::Save(after) => self.begin_save(after),
+                                    DisclosureIntent::EnableAutosave => {
+                                        self.settings.set_autosave_enabled(true);
+                                        if self.save_settings() {
+                                            if self.working_dirty() {
+                                                self.begin_save(None);
+                                            }
+                                        } else {
+                                            self.settings.set_autosave_enabled(false);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.disclosure_prompt = None;
+                        }
                     });
                 });
-                ui.small(format!(
-                    "{} · layout {}{}",
-                    summary
-                        .metadata
-                        .keyboard
-                        .display_name
-                        .as_deref()
-                        .unwrap_or("Unnamed keyboard"),
-                    summary.metadata.keyboard.layout,
-                    if summary.metadata.keyboard.variant.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" / {}", summary.metadata.keyboard.variant)
-                    }
+        }
+
+        if let Some(target) = self.boundary_prompt {
+            let exiting = target == BoundaryTarget::Exit;
+            egui::Window::new(if exiting {
+                "Save changes before exiting?"
+            } else {
+                "Save changes before switching sessions?"
+            })
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "{} has unsaved changes.",
+                    self.session.display_name()
                 ));
                 ui.horizontal(|ui| {
-                    if ui.button("Open").clicked() {
-                        open_session = Some(summary.metadata.id);
-                    }
                     if ui
-                        .add_enabled(
-                            self.deleting_completed != Some(summary.metadata.id),
-                            egui::Button::new("Delete"),
-                        )
+                        .button(if exiting {
+                            "Save and exit"
+                        } else {
+                            "Save and switch"
+                        })
                         .clicked()
                     {
-                        request_delete = Some(summary.metadata.id);
+                        self.boundary_prompt = None;
+                        self.request_save(Some(target));
+                    }
+                    if ui
+                        .button(if self.session.id.is_some() {
+                            "Discard changes"
+                        } else {
+                            "Discard session"
+                        })
+                        .clicked()
+                    {
+                        self.boundary_prompt = None;
+                        self.execute_boundary(target);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.boundary_prompt = None;
                     }
                 });
             });
-            ui.add_space(4.0);
         }
 
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    self.history_offset > 0 && !self.history_loading,
-                    egui::Button::new("Previous page"),
-                )
-                .clicked()
-            {
-                self.request_history_page(self.history_offset.saturating_sub(HISTORY_PAGE_SIZE));
-            }
-            ui.label(format!(
-                "Page {}",
-                self.history_offset / HISTORY_PAGE_SIZE + 1
-            ));
-            if ui
-                .add_enabled(
-                    self.history_has_more && !self.history_loading,
-                    egui::Button::new("Next page"),
-                )
-                .clicked()
-            {
-                self.request_history_page(self.history_offset.saturating_add(HISTORY_PAGE_SIZE));
-            }
-        });
-
-        if let Some(session_id) = open_session {
-            self.request_history_detail(session_id);
-        }
-        if let Some(session_id) = request_delete {
-            self.confirm_history_delete = Some(session_id);
-        }
-
-        let mut close_detail = false;
-        let mut delete_detail = None;
-        if let Some(detail) = &self.history_detail {
-            ui.separator();
-            ui.heading("Completed session details");
-            ui.label(format!(
-                "Started: {}",
-                format_local_timestamp(detail.metadata.created_at_ms)
-            ));
-            if let Some(completed_at_ms) = detail.metadata.completed_at_ms {
-                ui.label(format!(
-                    "Completed: {}",
-                    format_local_timestamp(completed_at_ms)
-                ));
-            }
-            ui.label(format!(
-                "Captured: {}",
-                format_duration_ns(detail.metadata.captured_duration_ns)
-            ));
-            ui.label(format!(
-                "Keyboard: {} · model {} · layout {}{}",
-                detail
-                    .metadata
-                    .keyboard
-                    .display_name
-                    .as_deref()
-                    .unwrap_or("Unnamed keyboard"),
-                detail.metadata.keyboard.model,
-                detail.metadata.keyboard.layout,
-                if detail.metadata.keyboard.variant.is_empty() {
-                    String::new()
-                } else {
-                    format!(" / {}", detail.metadata.keyboard.variant)
-                }
-            ));
-            ui.small(format!(
-                "Captured by evtap {}",
-                detail.metadata.application_version
-            ));
-            for message in &detail.messages {
-                ui.colored_label(egui::Color32::YELLOW, message);
-            }
-            for metric in &detail.metrics {
-                ui.group(|ui| {
-                    ui.set_width(ui.available_width());
-                    render_metric(ui, metric.as_ref());
+        if self.rename_open {
+            egui::Window::new("Rename session")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.label("Leave the name empty to keep this session untitled.");
+                    ui.text_edit_singleline(&mut self.rename_buffer);
+                    if let Some(error) = &self.rename_error {
+                        ui.colored_label(egui::Color32::RED, error);
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Apply").clicked() {
+                            self.apply_rename();
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.rename_open = false;
+                            self.rename_error = None;
+                        }
+                    });
                 });
-                ui.add_space(4.0);
-            }
-            ui.horizontal(|ui| {
-                if ui.button("Close details").clicked() {
-                    close_detail = true;
-                }
-                if ui.button("Delete this session").clicked() {
-                    delete_detail = Some(detail.metadata.id);
-                }
-            });
-        }
-        if close_detail {
-            self.history_detail = None;
-        }
-        if let Some(session_id) = delete_detail {
-            self.confirm_history_delete = Some(session_id);
         }
 
-        if let Some(session_id) = self.confirm_history_delete {
-            ui.separator();
-            ui.colored_label(
-                    egui::Color32::YELLOW,
-                    "Delete this completed session and all of its aggregate snapshots? This cannot be undone.",
-                );
-            ui.horizontal(|ui| {
-                if ui.button("Delete permanently").clicked() {
-                    self.delete_completed_session(session_id);
-                }
-                if ui.button("Cancel").clicked() {
-                    self.confirm_history_delete = None;
-                }
-            });
+        if self.confirm_reset {
+            egui::Window::new("Reset statistics?")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.label("All aggregate statistics and capture duration in the current session will be reset.");
+                    ui.horizontal(|ui| {
+                        if ui.button("Reset statistics").clicked() {
+                            self.reset_statistics();
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.confirm_reset = false;
+                        }
+                    });
+                });
+        }
+
+        if self.confirm_delete {
+            egui::Window::new("Delete session?")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ctx, |ui| {
+                    if self.session.id.is_some() {
+                        ui.label("The saved copy and all current unsaved changes will be deleted. This cannot be undone.");
+                    } else {
+                        ui.label("The current in-memory session will be discarded. This cannot be undone.");
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Delete permanently").clicked() {
+                            self.delete_current_session();
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.confirm_delete = false;
+                        }
+                    });
+                });
+        }
+
+        if self.confirm_delete_all {
+            egui::Window::new("Delete all saved sessions?")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.label("Every saved session and the current working state will be removed. Filesystem backups and snapshots may retain copies.");
+                    ui.horizontal(|ui| {
+                        if ui.button("Delete all permanently").clicked() {
+                            self.delete_all_sessions();
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.confirm_delete_all = false;
+                        }
+                    });
+                });
         }
     }
 
-    fn render_persistence_prompts(&mut self, ui: &mut egui::Ui) {
-        match self.enable_prompt {
-            Some(EnablePrompt::Disclosure) => {
-                ui.separator();
-                ui.colored_label(egui::Color32::YELLOW, "Review before enabling");
-                ui.label("evtap will store local aggregate character labels, ranked physical keys, bigram pairs, correction pairs, counts, and timing totals. It never stores raw key events, ordered text, event timestamps, or pressed-key state.");
-                ui.label("The SQLite database is local and unencrypted. Completed sessions are retained for 90 days by default and can be deleted in evtap.");
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("Continue").clicked() {
-                        if self.session.is_active() {
-                            self.enable_prompt = Some(EnablePrompt::ExistingSession);
-                        } else {
-                            self.enable_persistence(StorageOpenIntent::Restore);
-                        }
-                    }
-                    if ui.button("Cancel").clicked() {
-                        self.enable_prompt = None;
-                    }
-                });
+    fn handle_close_request(&mut self, ctx: &egui::Context) {
+        let close_requested = ctx.input(|input| input.viewport().close_requested());
+        if close_requested && !self.allow_close {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if self.boundary_prompt.is_none()
+                && self.disclosure_prompt.is_none()
+                && self.after_save.is_none()
+            {
+                self.request_boundary(BoundaryTarget::Exit);
             }
-            Some(EnablePrompt::ExistingSession) => {
-                ui.separator();
-                ui.label("Choose what to do with the current in-memory session:");
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("Save current session").clicked() {
-                        self.enable_persistence(StorageOpenIntent::PreserveCurrent);
-                    }
-                    if ui
-                        .add_enabled(
-                            self.listener.is_none(),
-                            egui::Button::new("Start persistence with a new session"),
-                        )
-                        .clicked()
-                    {
-                        self.reset_current_session();
-                        self.enable_persistence(StorageOpenIntent::Restore);
-                    }
-                    if ui.button("Cancel").clicked() {
-                        self.enable_prompt = None;
-                    }
-                });
-                if self.listener.is_some() {
-                    ui.weak("Stop capture before discarding the current session.");
-                }
-            }
-            None => {}
         }
-
-        if self.disable_prompt {
-            ui.separator();
-            ui.label("Resolve the active session before disabling persistence:");
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("Finish session and keep history").clicked() {
-                    self.disable_prompt = false;
-                    self.begin_finish(true);
-                }
-                if ui.button("Delete all analytics and disable").clicked() {
-                    self.delete_all_and_disable();
-                }
-                if ui.button("Cancel").clicked() {
-                    self.disable_prompt = false;
-                }
-            });
+        if self.allow_close {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 }
@@ -1884,18 +1493,29 @@ fn metric_recovery_message(issue: &MetricRecoveryIssue) -> String {
 
 fn storage_operation_label(operation: StorageOperation) -> &'static str {
     match operation {
-        StorageOperation::Open => "Could not open aggregate storage",
-        StorageOperation::Checkpoint => "Could not save aggregate checkpoint",
-        StorageOperation::Finalize => "Could not finish saved session",
-        StorageOperation::Discard => "Could not discard saved session",
-        StorageOperation::Retention => "Could not apply retention",
-        StorageOperation::DeleteAll => "Could not delete aggregate storage",
-        StorageOperation::HistoryList => "Could not load session history",
-        StorageOperation::HistoryDetail => "Could not load session details",
-        StorageOperation::DeleteCompleted => "Could not delete completed session",
+        StorageOperation::Open => "Could not open session storage",
+        StorageOperation::Save => "Could not save session",
+        StorageOperation::List => "Could not list saved sessions",
+        StorageOperation::Load => "Could not load session",
+        StorageOperation::Delete => "Could not delete session",
+        StorageOperation::DeleteAll => "Could not delete saved sessions",
         StorageOperation::Maintenance => "Could not reclaim deleted storage",
-        StorageOperation::ShutdownCheckpoint => "Could not save final aggregate checkpoint",
+        StorageOperation::ShutdownSave => "Could not save before shutdown",
     }
+}
+
+fn session_selector_label(metadata: &SessionMetadata) -> String {
+    let keyboard = metadata
+        .keyboard
+        .display_name
+        .as_deref()
+        .unwrap_or("No keyboard");
+    format!(
+        "{} — {} — {}",
+        metadata.display_name(),
+        keyboard,
+        format_local_timestamp(metadata.updated_at_ms)
+    )
 }
 
 fn database_disk_usage(database_path: &Path) -> u64 {
@@ -1926,11 +1546,8 @@ fn format_byte_size(bytes: u64) -> String {
     }
 }
 
-fn format_duration_ns(duration_ns: i64) -> String {
-    let Ok(duration_ns) = u64::try_from(duration_ns) else {
-        return "Unavailable".to_owned();
-    };
-    let seconds = duration_ns / 1_000_000_000;
+fn format_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
     let hours = seconds / 3_600;
     let minutes = (seconds % 3_600) / 60;
     let seconds = seconds % 60;
@@ -1945,13 +1562,23 @@ fn format_local_timestamp(timestamp_ms: i64) -> String {
         .unwrap_or_else(|| format!("{timestamp_ms} ms since Unix epoch"))
 }
 
-fn retention_label(retention: RetentionPolicy) -> &'static str {
-    match retention {
-        RetentionPolicy::Days(30) => "30 days",
-        RetentionPolicy::Days(90) => "90 days",
-        RetentionPolicy::Days(365) => "365 days",
-        RetentionPolicy::Days(_) => "Unsupported",
-        RetentionPolicy::Forever => "Forever",
+fn boundary_policy(dirty: bool, autosave: bool) -> BoundaryPolicy {
+    match (dirty, autosave) {
+        (false, _) => BoundaryPolicy::Proceed,
+        (true, true) => BoundaryPolicy::Save,
+        (true, false) => BoundaryPolicy::Prompt,
+    }
+}
+
+fn storage_status_label(status: StorageStatus, has_id: bool) -> &'static str {
+    match status {
+        StorageStatus::Loading => "Loading saved sessions…",
+        StorageStatus::Unsaved => "Unsaved session",
+        StorageStatus::Saved if has_id => "Saved",
+        StorageStatus::Saved => "Unsaved session",
+        StorageStatus::Dirty => "Unsaved changes",
+        StorageStatus::Saving => "Saving…",
+        StorageStatus::Failed => "Storage operation failed",
     }
 }
 
@@ -1966,51 +1593,47 @@ impl eframe::App for App {
         self.drain_storage_events();
 
         let now = Instant::now();
-        if self.listener_state == ListenerState::Listening && self.checkpoint_schedule.is_due(now) {
-            self.request_checkpoint();
+        if self.settings.autosave_enabled()
+            && self.listener_state == ListenerState::Listening
+            && self.checkpoint_schedule.is_due(now)
+        {
+            self.request_save(None);
         }
         if let Some(delay) = self.checkpoint_schedule.time_until_due(now) {
             ui.ctx().request_repaint_after(delay);
         }
 
+        self.handle_close_request(ui.ctx());
         egui::CentralPanel::default().show(ui, |ui| {
             ScrollArea::vertical()
                 .id_salt("application-content")
                 .show(ui, |ui| {
-            ui.heading("evtap");
-            ui.label("Understand the mechanics of your everyday typing.");
-            if self.settings.persistence_enabled() {
-                ui.small("Opt-in aggregate history is stored locally; raw key events and ordered text are never stored.");
-            } else {
-                ui.small("Persistence is off. Session aggregates stay in memory and are discarded when evtap exits.");
-            }
-            ui.add_space(8.0);
+                    ui.heading("evtap");
+                    ui.label("Understand the mechanics of your everyday typing.");
+                    ui.small("Sessions always run in memory. Save manually or enable autosave to back aggregate state with local, unencrypted storage.");
+                    ui.add_space(8.0);
 
-            self.render_capture_setup(ui);
-            ui.add_space(8.0);
-            self.render_persistence_settings(ui);
-            ui.add_space(8.0);
-            if self.history_open {
-                self.render_history(ui);
-                ui.add_space(8.0);
-            }
+                    self.render_session_management(ui);
+                    ui.add_space(8.0);
+                    self.render_capture_setup(ui);
+                    ui.add_space(8.0);
 
-            for message in &self.recovery_messages {
-                ui.colored_label(egui::Color32::YELLOW, message);
-            }
-            ui.heading("Session analytics");
-            ui.small("Timing tables appear as samples arrive; no raw keystroke history is saved.");
-            ui.add_space(4.0);
-
-            for metric in &self.metrics {
-                ui.group(|ui| {
-                    ui.set_width(ui.available_width());
-                    render_metric(ui, metric.as_ref());
-                });
-                ui.add_space(6.0);
-            }
+                    for message in &self.recovery_messages {
+                        ui.colored_label(egui::Color32::YELLOW, message);
+                    }
+                    ui.heading("Session analytics");
+                    ui.small("Only aggregate snapshots are saved; input sequences and unfinished event context remain in memory.");
+                    ui.add_space(4.0);
+                    for metric in &self.metrics {
+                        ui.group(|ui| {
+                            ui.set_width(ui.available_width());
+                            render_metric(ui, metric.as_ref());
+                        });
+                        ui.add_space(6.0);
+                    }
                 });
         });
+        self.render_prompts(ui.ctx());
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -2022,27 +1645,31 @@ impl eframe::App for App {
                 thread::sleep(Duration::from_millis(10));
             }
         }
-        self.session.finish_capture_segment();
+        if self.session.finish_capture_segment() {
+            self.note_session_dirty();
+        }
+        self.clear_in_flight();
 
-        let final_checkpoint = if self.settings.persistence_enabled() && self.session.is_active() {
-            let generation = self.storage_tracker.mark_dirty().ok();
-            generation.and_then(|generation| {
-                self.session_snapshot()
-                    .ok()
-                    .map(|snapshot| CheckpointRequest {
+        let final_save = if self.settings.autosave_enabled() && self.working_dirty() {
+            self.storage_tracker
+                .begin_save()
+                .ok()
+                .flatten()
+                .and_then(|generation| {
+                    self.session_snapshot().ok().map(|snapshot| SaveRequest {
                         generation,
                         snapshot,
                     })
-            })
+                })
         } else {
             None
         };
         if let Some(storage) = self.storage.take() {
-            match storage.shutdown(final_checkpoint) {
-                Ok(result) if result.final_checkpoint_saved => {
+            match storage.shutdown(final_save) {
+                Ok(result) if result.final_save_succeeded => {
                     info!("storage worker shut down after saving aggregate state");
                 }
-                Ok(_) => warn!("storage worker shut down without a final aggregate checkpoint"),
+                Ok(_) => warn!("storage worker shut down without a final save"),
                 Err(error) => warn!(%error, "storage worker shutdown did not complete cleanly"),
             }
         }
@@ -2054,44 +1681,71 @@ mod tests {
     use std::fs;
 
     use super::{
-        database_disk_usage, font_definitions, format_byte_size, format_duration_ns,
-        format_local_timestamp, retention_label, unix_now_ms,
+        BoundaryPolicy, HACK_FONT_NAME, SessionMetadata, StorageStatus, boundary_policy,
+        database_disk_usage, font_definitions, session_selector_label, storage_status_label,
     };
-    use crate::settings::RetentionPolicy;
+    use crate::session::{KeyboardContext, SessionId};
     use eframe::egui;
 
     #[test]
     fn proportional_font_family_supports_bigram_arrow() {
-        let context = egui::Context::default();
-        context.set_fonts(font_definitions());
-        let mut has_arrow = false;
-
-        let _ = context.run_ui(egui::RawInput::default(), |ui| {
-            has_arrow =
-                ui.fonts_mut(|fonts| fonts.has_glyph(&egui::FontId::proportional(14.0), '→'));
-        });
-
-        assert!(has_arrow);
+        let fonts = font_definitions();
+        assert!(fonts.font_data.contains_key(HACK_FONT_NAME));
+        assert!(
+            fonts
+                .families
+                .get(&egui::FontFamily::Proportional)
+                .unwrap()
+                .iter()
+                .any(|font| font == HACK_FONT_NAME)
+        );
     }
 
     #[test]
-    fn persistence_helpers_use_bounded_values() {
-        assert!(unix_now_ms().unwrap() > 0);
-        assert_eq!(retention_label(RetentionPolicy::Days(90)), "90 days");
-        assert_eq!(retention_label(RetentionPolicy::Forever), "Forever");
-        assert_eq!(format_duration_ns(3_661_000_000_000), "01:01:01");
-        assert_eq!(format_duration_ns(-1), "Unavailable");
-        assert_eq!(format_byte_size(1_536), "1.5 KiB");
-        assert!(!format_local_timestamp(0).is_empty());
+    fn dirty_boundaries_follow_editor_style_save_policy() {
+        assert_eq!(boundary_policy(false, false), BoundaryPolicy::Proceed);
+        assert_eq!(boundary_policy(false, true), BoundaryPolicy::Proceed);
+        assert_eq!(boundary_policy(true, false), BoundaryPolicy::Prompt);
+        assert_eq!(boundary_policy(true, true), BoundaryPolicy::Save);
+    }
+
+    #[test]
+    fn storage_labels_cover_unsaved_and_saved_sessions() {
+        assert_eq!(
+            storage_status_label(StorageStatus::Unsaved, false),
+            "Unsaved session"
+        );
+        assert_eq!(storage_status_label(StorageStatus::Saved, true), "Saved");
+    }
+
+    #[test]
+    fn selector_distinguishes_untitled_sessions_with_metadata() {
+        let metadata = SessionMetadata {
+            id: SessionId::new(1).unwrap(),
+            name: None,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            last_opened_at_ms: 1,
+            captured_duration_ns: 0,
+            application_version: "test".to_owned(),
+            keyboard: KeyboardContext {
+                display_name: Some("Work keyboard".to_owned()),
+                ..Default::default()
+            },
+        };
+        let label = session_selector_label(&metadata);
+        assert!(label.contains("Untitled session"));
+        assert!(label.contains("Work keyboard"));
     }
 
     #[test]
     fn disk_usage_includes_sqlite_sidecars() {
         let temporary = tempfile::tempdir().unwrap();
         let database = temporary.path().join("evtap.sqlite3");
-        fs::write(&database, [0_u8; 5]).unwrap();
-        fs::write(temporary.path().join("evtap.sqlite3-wal"), [0_u8; 7]).unwrap();
+        fs::write(&database, [0_u8; 3]).unwrap();
+        fs::write(temporary.path().join("evtap.sqlite3-wal"), [0_u8; 5]).unwrap();
+        fs::write(temporary.path().join("evtap.sqlite3-shm"), [0_u8; 7]).unwrap();
 
-        assert_eq!(database_disk_usage(&database), 12);
+        assert_eq!(database_disk_usage(&database), 15);
     }
 }

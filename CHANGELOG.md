@@ -6,25 +6,29 @@ All notable changes to evtap are documented here. The format is based on [Keep a
 
 ### Added
 
-- Explicitly opt-in local aggregate persistence with a privacy disclosure and 90-day default retention.
+- Mutable saved sessions that can be selected and resumed indefinitely across application restarts.
+- Manual **Save now** and an editor-like autosave preference covering periodic, Stop, switch, and normal-close boundaries.
+- Untitled sessions, optional unique names, rename, reset, New session, individual deletion, complete saved-session deletion, and disk-usage display.
+- Familiar Save, Discard, and Cancel prompts before dirty session switches or close when autosave is off.
+- A one-time disclosure before the first analytics write; session management itself always works in memory.
 - Versioned, deterministic snapshots for every bundled metric, with strict size and value validation.
-- Private XDG settings, native window-state restoration, and a bundled SQLite analytics database.
-- Crash-recoverable active sessions, periodic transactional checkpoints, dirty-generation acknowledgements, and bounded graceful shutdown.
-- Finish/discard session lifecycle, configuration locking, storage status, retries, and enable/disable resolution flows.
-- Paginated completed-session history, isolated metric detail restoration, retention controls, individual deletion, complete analytics deletion, and disk-usage display.
-- Fault tests for malformed snapshots/settings, symlink paths, transaction rollback, migration failure, corrupt/newer databases, worker recovery, retention, and deletion.
+- Private XDG settings, native window-state restoration, a bundled SQLite analytics database, dirty-generation acknowledgements, retries, and bounded shutdown.
+- Generic non-destructive rejection of incompatible experimental, future, corrupt, unidentified, or foreign databases.
 
 ### Changed
 
-- **Stop listening** now pauses the active session instead of implying that the analytics session ended.
-- Session configuration becomes fixed at first capture and recovered sessions resume paused.
-- Privacy, metrics, troubleshooting, roadmap, and contributor documentation now describe the optional aggregate-storage boundary.
+- Replaced the unreleased active/completed history and retention design with one loaded working session and explicitly user-managed saved sessions.
+- **Stop listening** now pauses the working session and triggers autosave only when configured.
+- Keyboard and XKB values are remembered per session as suggestions rather than locked configuration.
+- Restored and selected sessions remain paused until the user starts listening.
+- The unreleased experimental database and settings schemas intentionally have no migration and must be removed manually.
 
 ### Security
 
-- Raw key events, ordered text, event timestamps, pressed-key state, and transient correction/timing context are excluded from persistent snapshots.
+- Raw key events, ordered text, event timestamps, pressed-key state, recent correction context, and unfinished correction/timing observations are excluded from saved snapshots.
+- Stop, switch, listener failure, exit, and restart clear metric in-flight context without clearing durable aggregates.
 - Settings and analytics use restrictive Unix permissions, atomic settings replacement, SQLite application identity, foreign keys, secure deletion, and WAL-backed transactions.
-- Unsupported settings or database versions and corrupt/unidentified databases are handled non-destructively rather than reset automatically.
+- The application no longer imposes a special symlink rejection policy; normal operating-system path resolution applies.
 
 ## [0.1.0] - 2026-07-28
 

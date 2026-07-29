@@ -1,6 +1,6 @@
 # Metric definitions
 
-All evtap metrics describe one active or completed session. Results are descriptive signals, not ergonomic or medical diagnoses. Persistence, when explicitly enabled, stores only the durable aggregate fields described below; metric computation still happens in memory.
+All evtap metrics describe the currently loaded mutable session. Results are descriptive signals, not ergonomic or medical diagnoses. Manual save and autosave store only the durable aggregate fields described below; metric computation still happens in memory.
 
 ## Event terminology
 
@@ -62,7 +62,7 @@ A pair appears only after at least three samples. The report shows the five fast
 
 ## Durable and transient state
 
-When persistence is enabled, metric snapshots contain aggregate counts and dimensions only:
+Saved metric snapshots contain aggregate counts and dimensions only:
 
 - total physical press count;
 - physical key code, display label, and count;
@@ -70,8 +70,8 @@ When persistence is enabled, metric snapshots contain aggregate counts and dimen
 - flight and dwell label, accumulated duration, and sample count;
 - bigram labels, accumulated duration, and sample count.
 
-Snapshots never contain event timestamps, pressed-key maps, the recent correction buffer, pending deletions, previous-press/release context, or ordered event history. Restoring always starts with fresh transient state, so no timing or correction sample bridges a restart.
+Snapshots never contain event timestamps, pressed-key maps, the recent correction buffer, pending deletions, previous-press/release context, or ordered event history. Stop, session switch, listener failure, and process restart clear this in-flight context. Restored cumulative aggregates continue growing, but no timing or correction sample bridges a boundary.
 
 ## Session lifecycle
 
-**Stop listening** pauses capture but preserves the active session. With persistence off, **Discard current session** clears every aggregate and transient metric buffer. With persistence enabled, **Finish session** archives the latest aggregate snapshot, while **Discard session** deletes the active database row and clears memory only after deletion is acknowledged. Closing evtap discards an in-memory-only session or performs a bounded final checkpoint for an opted-in persisted session.
+**Stop listening** pauses capture while preserving the working session. **Save now** writes its durable aggregate state; autosave can do the same periodically and at Stop, switch, and close boundaries. Switching or creating a session clears in-flight context. With autosave off, dirty switches and closes offer Save, Discard, or Cancel. Saved sessions remain mutable until explicitly reset or deleted; there is no finalization state.

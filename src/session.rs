@@ -15,13 +15,7 @@ impl SessionId {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SessionStatus {
-    Active,
-    Completed,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct KeyboardContext {
     pub display_name: Option<String>,
     pub model: String,
@@ -32,8 +26,10 @@ pub struct KeyboardContext {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionSnapshot {
     pub id: Option<SessionId>,
+    pub name: Option<String>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    pub last_opened_at_ms: i64,
     pub captured_duration_ns: i64,
     pub application_version: String,
     pub keyboard: KeyboardContext,
@@ -43,13 +39,19 @@ pub struct SessionSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionMetadata {
     pub id: SessionId,
-    pub status: SessionStatus,
+    pub name: Option<String>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
-    pub completed_at_ms: Option<i64>,
+    pub last_opened_at_ms: i64,
     pub captured_duration_ns: i64,
     pub application_version: String,
     pub keyboard: KeyboardContext,
+}
+
+impl SessionMetadata {
+    pub fn display_name(&self) -> &str {
+        self.name.as_deref().unwrap_or("Untitled session")
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -88,12 +90,6 @@ pub enum StoredMetricError {
 pub struct StoredSession {
     pub metadata: SessionMetadata,
     pub metrics: Vec<StoredMetricSnapshot>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SessionSummary {
-    pub metadata: SessionMetadata,
-    pub total_presses: Option<u64>,
 }
 
 pub struct RecoveredMetrics {
@@ -149,7 +145,8 @@ mod tests {
     use crate::metric::MetricSnapshot;
 
     use super::{
-        MetricRecoveryIssue, StoredMetricError, StoredMetricSnapshot, recover_default_metrics,
+        MetricRecoveryIssue, SessionId, SessionMetadata, StoredMetricError, StoredMetricSnapshot,
+        recover_default_metrics,
     };
 
     #[test]
@@ -213,5 +210,21 @@ mod tests {
             issue,
             MetricRecoveryIssue::Unknown { metric_id } if metric_id == "future-metric"
         )));
+    }
+
+    #[test]
+    fn unnamed_session_has_a_stable_display_fallback() {
+        let metadata = SessionMetadata {
+            id: SessionId::new(1).unwrap(),
+            name: None,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            last_opened_at_ms: 1,
+            captured_duration_ns: 0,
+            application_version: "test".to_owned(),
+            keyboard: Default::default(),
+        };
+
+        assert_eq!(metadata.display_name(), "Untitled session");
     }
 }

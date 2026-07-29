@@ -10,21 +10,21 @@ use thiserror::Error;
 
 use crate::{
     database::Repository,
-    session::{SessionId, SessionSnapshot, SessionStatus, SessionSummary, StoredSession},
-    settings::RetentionPolicy,
+    session::{SessionId, SessionMetadata, SessionSnapshot, StoredSession},
     wake::WakeSignal,
 };
 
 pub const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(30);
 pub const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+const SESSION_LIST_LIMIT: u32 = 10_000;
 
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub struct DirtyGeneration(u64);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StorageStatus {
-    Disabled,
     Loading,
+    Unsaved,
     Saved,
     Dirty,
     Saving,
@@ -42,7 +42,7 @@ pub struct DirtyTracker {
 impl Default for DirtyTracker {
     fn default() -> Self {
         Self {
-            status: StorageStatus::Disabled,
+            status: StorageStatus::Unsaved,
             current: DirtyGeneration::default(),
             saved: DirtyGeneration::default(),
             in_flight: None,
@@ -58,19 +58,15 @@ impl DirtyTracker {
         self.in_flight = None;
     }
 
-    pub fn loaded(&mut self) {
-        self.status = StorageStatus::Saved;
+    pub fn loaded(&mut self, saved: bool) {
+        self.status = if saved {
+            StorageStatus::Saved
+        } else {
+            StorageStatus::Unsaved
+        };
         self.current = DirtyGeneration::default();
         self.saved = DirtyGeneration::default();
         self.in_flight = None;
-    }
-
-    pub fn fail_loading(&mut self) -> Result<(), DirtyTrackingError> {
-        if self.status != StorageStatus::Loading {
-            return Err(DirtyTrackingError::NotLoading);
-        }
-        self.status = StorageStatus::Failed;
-        Ok(())
     }
 
     pub fn set_failed(&mut self) {
@@ -78,17 +74,12 @@ impl DirtyTracker {
         self.status = StorageStatus::Failed;
     }
 
-    pub fn disable(&mut self) {
-        self.status = StorageStatus::Disabled;
-        self.in_flight = None;
-    }
-
     pub fn status(&self) -> StorageStatus {
         self.status
     }
 
     #[cfg(test)]
-    pub fn saved(&self) -> DirtyGeneration {
+    pub fn saved_generation(&self) -> DirtyGeneration {
         self.saved
     }
 
@@ -96,38 +87,35 @@ impl DirtyTracker {
         self.in_flight
     }
 
+    pub fn is_dirty(&self) -> bool {
+        self.status == StorageStatus::Unsaved || self.current > self.saved
+    }
+
     pub fn mark_dirty(&mut self) -> Result<DirtyGeneration, DirtyTrackingError> {
-        if matches!(
-            self.status,
-            StorageStatus::Disabled | StorageStatus::Loading
-        ) {
+        if self.status == StorageStatus::Loading {
             return Err(DirtyTrackingError::NotReady);
         }
-        self.current = DirtyGeneration(
-            self.current
-                .0
-                .checked_add(1)
-                .ok_or(DirtyTrackingError::GenerationOverflow)?,
-        );
+        self.current = next_generation(self.current)?;
         if self.in_flight.is_none() {
             self.status = StorageStatus::Dirty;
         }
         Ok(self.current)
     }
 
-    pub fn begin_checkpoint(&mut self) -> Option<DirtyGeneration> {
-        if matches!(
-            self.status,
-            StorageStatus::Disabled | StorageStatus::Loading
-        ) || self.in_flight.is_some()
-            || self.current <= self.saved
-        {
-            return None;
+    pub fn begin_save(&mut self) -> Result<Option<DirtyGeneration>, DirtyTrackingError> {
+        if self.status == StorageStatus::Loading || self.in_flight.is_some() {
+            return Ok(None);
+        }
+        if self.status == StorageStatus::Unsaved && self.current == self.saved {
+            self.current = next_generation(self.current)?;
+        }
+        if self.current <= self.saved {
+            return Ok(None);
         }
         let generation = self.current;
         self.in_flight = Some(generation);
         self.status = StorageStatus::Saving;
-        Some(generation)
+        Ok(Some(generation))
     }
 
     pub fn acknowledge(&mut self, generation: DirtyGeneration) -> Result<(), DirtyTrackingError> {
@@ -161,6 +149,14 @@ impl DirtyTracker {
     }
 }
 
+fn next_generation(generation: DirtyGeneration) -> Result<DirtyGeneration, DirtyTrackingError> {
+    generation
+        .0
+        .checked_add(1)
+        .map(DirtyGeneration)
+        .ok_or(DirtyTrackingError::GenerationOverflow)
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CheckpointSchedule {
     deadline: Option<Instant>,
@@ -180,12 +176,8 @@ impl CheckpointSchedule {
             .map(|deadline| deadline.saturating_duration_since(now))
     }
 
-    pub fn checkpoint_started(&mut self) {
+    pub fn save_started(&mut self) {
         self.deadline = None;
-    }
-
-    pub fn retry_later(&mut self, now: Instant) {
-        self.deadline = Some(now + CHECKPOINT_INTERVAL);
     }
 
     pub fn clear(&mut self) {
@@ -197,8 +189,6 @@ impl CheckpointSchedule {
 pub enum DirtyTrackingError {
     #[error("storage is not ready for dirty tracking")]
     NotReady,
-    #[error("storage is not loading")]
-    NotLoading,
     #[error("dirty generation counter overflowed")]
     GenerationOverflow,
     #[error("storage acknowledgement did not match the in-flight generation")]
@@ -209,7 +199,7 @@ pub enum DirtyTrackingError {
 }
 
 #[derive(Clone, Debug)]
-pub struct CheckpointRequest {
+pub struct SaveRequest {
     pub generation: DirtyGeneration,
     pub snapshot: SessionSnapshot,
 }
@@ -217,57 +207,35 @@ pub struct CheckpointRequest {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StorageOperation {
     Open,
-    Checkpoint,
-    Finalize,
-    Discard,
-    Retention,
+    Save,
+    List,
+    Load,
+    Delete,
     DeleteAll,
-    HistoryList,
-    HistoryDetail,
-    DeleteCompleted,
     Maintenance,
-    ShutdownCheckpoint,
+    ShutdownSave,
 }
 
 #[derive(Debug)]
 pub enum StorageCommand {
     RetryOpen {
-        retention: RetentionPolicy,
-        now_ms: i64,
+        last_session_id: Option<SessionId>,
     },
-    Checkpoint(CheckpointRequest),
-    Finalize {
-        checkpoint: CheckpointRequest,
-        completed_at_ms: i64,
-        retention: RetentionPolicy,
-        retention_now_ms: i64,
-    },
-    DiscardActive {
-        session_id: SessionId,
-    },
-    ApplyRetention {
-        retention: RetentionPolicy,
-        now_ms: i64,
-    },
-    DeleteAll {
-        reopen: bool,
-        retention: RetentionPolicy,
-        now_ms: i64,
-    },
-    ListCompleted {
+    Save(SaveRequest),
+    ListSessions {
         request_id: u64,
-        limit: u32,
-        offset: u32,
     },
-    LoadCompleted {
+    LoadSession {
         request_id: u64,
         session_id: SessionId,
+        opened_at_ms: i64,
     },
-    DeleteCompleted {
+    DeleteSession {
         session_id: SessionId,
     },
+    DeleteAll,
     Shutdown {
-        final_checkpoint: Option<CheckpointRequest>,
+        final_save: Option<SaveRequest>,
     },
 }
 
@@ -282,44 +250,30 @@ pub struct StorageFailure {
 #[derive(Debug)]
 pub enum StorageEvent {
     Opened {
-        active: Option<StoredSession>,
-        retained_sessions: usize,
+        sessions: Vec<SessionMetadata>,
+        selected: Option<StoredSession>,
     },
-    Checkpointed {
+    Saved {
         generation: DirtyGeneration,
         session_id: SessionId,
     },
-    Finalized {
-        generation: DirtyGeneration,
-        session_id: SessionId,
-    },
-    Discarded {
-        session_id: SessionId,
-        deleted: bool,
-    },
-    RetentionApplied {
-        deleted_sessions: usize,
-    },
-    AllDeleted {
-        reopened: bool,
-    },
-    HistoryLoaded {
+    SessionsListed {
         request_id: u64,
-        offset: u32,
-        sessions: Vec<SessionSummary>,
+        sessions: Vec<SessionMetadata>,
     },
-    CompletedLoaded {
+    SessionLoaded {
         request_id: u64,
         session: Option<StoredSession>,
     },
-    CompletedDeleted {
+    SessionDeleted {
         session_id: SessionId,
         deleted: bool,
     },
+    AllDeleted,
     Failed(StorageFailure),
     ShutdownComplete {
         final_generation: Option<DirtyGeneration>,
-        final_checkpoint_saved: bool,
+        final_save_succeeded: bool,
     },
 }
 
@@ -332,8 +286,7 @@ pub struct StorageWorker {
 impl StorageWorker {
     pub fn spawn(
         database_path: PathBuf,
-        retention: RetentionPolicy,
-        now_ms: i64,
+        last_session_id: Option<SessionId>,
         wake: WakeSignal,
     ) -> Result<Self, StorageWorkerError> {
         let (command_sender, command_receiver) = mpsc::channel();
@@ -343,8 +296,7 @@ impl StorageWorker {
             .spawn(move || {
                 worker_main(
                     database_path,
-                    retention,
-                    now_ms,
+                    last_session_id,
                     command_receiver,
                     &event_sender,
                     &wake,
@@ -372,26 +324,19 @@ impl StorageWorker {
         }
     }
 
-    pub fn request_shutdown(
-        &self,
-        final_checkpoint: Option<CheckpointRequest>,
-    ) -> Result<(), StorageWorkerError> {
-        self.send(StorageCommand::Shutdown { final_checkpoint })
-    }
-
     pub fn shutdown(
         self,
-        final_checkpoint: Option<CheckpointRequest>,
+        final_save: Option<SaveRequest>,
     ) -> Result<ShutdownResult, StorageWorkerError> {
-        self.shutdown_with_timeout(final_checkpoint, GRACEFUL_SHUTDOWN_TIMEOUT)
+        self.shutdown_with_timeout(final_save, GRACEFUL_SHUTDOWN_TIMEOUT)
     }
 
     fn shutdown_with_timeout(
         mut self,
-        final_checkpoint: Option<CheckpointRequest>,
+        final_save: Option<SaveRequest>,
         timeout: Duration,
     ) -> Result<ShutdownResult, StorageWorkerError> {
-        self.send(StorageCommand::Shutdown { final_checkpoint })?;
+        self.send(StorageCommand::Shutdown { final_save })?;
         let deadline = Instant::now() + timeout;
         let result = loop {
             let remaining = deadline
@@ -400,11 +345,11 @@ impl StorageWorker {
             match self.events.recv_timeout(remaining) {
                 Ok(StorageEvent::ShutdownComplete {
                     final_generation,
-                    final_checkpoint_saved,
+                    final_save_succeeded,
                 }) => {
                     break ShutdownResult {
                         final_generation,
-                        final_checkpoint_saved,
+                        final_save_succeeded,
                     };
                 }
                 Ok(_) => {}
@@ -428,16 +373,16 @@ impl StorageWorker {
 
 impl Drop for StorageWorker {
     fn drop(&mut self) {
-        let _ = self.commands.send(StorageCommand::Shutdown {
-            final_checkpoint: None,
-        });
+        let _ = self
+            .commands
+            .send(StorageCommand::Shutdown { final_save: None });
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ShutdownResult {
     pub final_generation: Option<DirtyGeneration>,
-    pub final_checkpoint_saved: bool,
+    pub final_save_succeeded: bool,
 }
 
 #[derive(Debug, Error)]
@@ -456,8 +401,6 @@ pub enum StorageWorkerError {
 
 struct WorkerState {
     repository: Option<Repository>,
-    active_session_id: Option<SessionId>,
-    finalized_since_checkpoint: bool,
     database_path: PathBuf,
 }
 
@@ -465,115 +408,86 @@ impl WorkerState {
     fn new(database_path: PathBuf) -> Self {
         Self {
             repository: None,
-            active_session_id: None,
-            finalized_since_checkpoint: false,
             database_path,
         }
     }
 
     fn open(
         &mut self,
-        retention: RetentionPolicy,
-        now_ms: i64,
-    ) -> Result<(Option<StoredSession>, usize), String> {
-        self.repository = None;
-        self.active_session_id = None;
-        self.finalized_since_checkpoint = false;
-        let mut repository =
-            Repository::open(self.database_path.clone()).map_err(|error| error.to_string())?;
-        let retained_sessions = repository
-            .apply_retention(now_ms, retention)
+        last_session_id: Option<SessionId>,
+    ) -> Result<(Vec<SessionMetadata>, Option<StoredSession>), String> {
+        self.repository = Repository::open_existing(self.database_path.clone())
             .map_err(|error| error.to_string())?;
-        let active = repository
-            .load_active()
+        let Some(repository) = &self.repository else {
+            return Ok((Vec::new(), None));
+        };
+        let sessions = repository
+            .list_sessions(SESSION_LIST_LIMIT)
             .map_err(|error| error.to_string())?;
-        self.active_session_id = active.as_ref().map(|session| session.metadata.id);
-        self.repository = Some(repository);
-        Ok((active, retained_sessions))
+        let selected = last_session_id
+            .map(|session_id| repository.load_session(session_id))
+            .transpose()
+            .map_err(|error| error.to_string())?
+            .flatten();
+        Ok((sessions, selected))
     }
 
-    fn checkpoint(&mut self, mut request: CheckpointRequest) -> Result<SessionId, String> {
-        request.snapshot.id = request.snapshot.id.or(self.active_session_id);
-        let repository = self
-            .repository
-            .as_mut()
-            .ok_or_else(|| "storage is unavailable".to_owned())?;
-        let session_id = repository
-            .checkpoint(&request.snapshot)
-            .map_err(|error| error.to_string())?;
-        self.active_session_id = Some(session_id);
-        self.finalized_since_checkpoint = false;
-        Ok(session_id)
-    }
-
-    fn finalize(
-        &mut self,
-        mut request: CheckpointRequest,
-        completed_at_ms: i64,
-    ) -> Result<SessionId, String> {
-        request.snapshot.id = request.snapshot.id.or(self.active_session_id);
-        let repository = self
-            .repository
-            .as_mut()
-            .ok_or_else(|| "storage is unavailable".to_owned())?;
-        let session_id = repository
-            .finalize(&request.snapshot, completed_at_ms)
-            .map_err(|error| error.to_string())?;
-        self.active_session_id = None;
-        self.finalized_since_checkpoint = true;
-        Ok(session_id)
-    }
-
-    fn discard_active(&mut self, session_id: SessionId) -> Result<bool, String> {
-        let repository = self
-            .repository
-            .as_mut()
-            .ok_or_else(|| "storage is unavailable".to_owned())?;
-        let deleted = repository
-            .discard_active(session_id)
-            .map_err(|error| error.to_string())?;
-        if deleted && self.active_session_id == Some(session_id) {
-            self.active_session_id = None;
+    fn repository_mut(&mut self) -> Result<&mut Repository, String> {
+        if self.repository.is_none() {
+            self.repository = Some(
+                Repository::open(self.database_path.clone()).map_err(|error| error.to_string())?,
+            );
         }
-        Ok(deleted)
+        self.repository
+            .as_mut()
+            .ok_or_else(|| "storage is unavailable".to_owned())
     }
 
-    fn apply_retention(
+    fn save(&mut self, request: SaveRequest) -> Result<SessionId, String> {
+        self.repository_mut()?
+            .save(&request.snapshot)
+            .map_err(|error| error.to_string())
+    }
+
+    fn list_sessions(&self) -> Result<Vec<SessionMetadata>, String> {
+        self.repository.as_ref().map_or_else(
+            || Ok(Vec::new()),
+            |repository| {
+                repository
+                    .list_sessions(SESSION_LIST_LIMIT)
+                    .map_err(|error| error.to_string())
+            },
+        )
+    }
+
+    fn load_session(
         &mut self,
-        now_ms: i64,
-        retention: RetentionPolicy,
-    ) -> Result<usize, String> {
-        self.repository
-            .as_mut()
-            .ok_or_else(|| "storage is unavailable".to_owned())?
-            .apply_retention(now_ms, retention)
-            .map_err(|error| error.to_string())
-    }
-
-    fn list_completed(&self, limit: u32, offset: u32) -> Result<Vec<SessionSummary>, String> {
-        self.repository
-            .as_ref()
-            .ok_or_else(|| "storage is unavailable".to_owned())?
-            .list_completed(limit, offset)
-            .map_err(|error| error.to_string())
-    }
-
-    fn load_completed(&self, session_id: SessionId) -> Result<Option<StoredSession>, String> {
-        self.repository
-            .as_ref()
-            .ok_or_else(|| "storage is unavailable".to_owned())?
+        session_id: SessionId,
+        opened_at_ms: i64,
+    ) -> Result<Option<StoredSession>, String> {
+        let Some(repository) = self.repository.as_mut() else {
+            return Ok(None);
+        };
+        let session = repository
             .load_session(session_id)
-            .map(|session| {
-                session.filter(|stored| stored.metadata.status == SessionStatus::Completed)
-            })
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        if session.is_some() {
+            repository
+                .mark_opened(session_id, opened_at_ms)
+                .map_err(|error| error.to_string())?;
+            return repository
+                .load_session(session_id)
+                .map_err(|error| error.to_string());
+        }
+        Ok(None)
     }
 
-    fn delete_completed(&mut self, session_id: SessionId) -> Result<bool, String> {
-        self.repository
-            .as_mut()
-            .ok_or_else(|| "storage is unavailable".to_owned())?
-            .delete_completed(session_id)
+    fn delete_session(&mut self, session_id: SessionId) -> Result<bool, String> {
+        let Some(repository) = self.repository.as_mut() else {
+            return Ok(false);
+        };
+        repository
+            .delete_session(session_id)
             .map_err(|error| error.to_string())
     }
 
@@ -585,23 +499,9 @@ impl WorkerState {
             .map_err(|error| error.to_string())
     }
 
-    fn delete_all(
-        &mut self,
-        reopen: bool,
-        retention: RetentionPolicy,
-        now_ms: i64,
-    ) -> Result<(), String> {
+    fn delete_all(&mut self) -> Result<(), String> {
         self.repository = None;
-        self.active_session_id = None;
-        self.finalized_since_checkpoint = false;
-        remove_database_files(&self.database_path)?;
-        if reopen {
-            let (active, _) = self.open(retention, now_ms)?;
-            if active.is_some() {
-                return Err("fresh analytics database unexpectedly contained a session".to_owned());
-            }
-        }
-        Ok(())
+        remove_database_files(&self.database_path)
     }
 }
 
@@ -628,7 +528,9 @@ fn remove_database_files(database_path: &Path) -> Result<(), String> {
             }
         }
     }
-    if let Some(parent) = database_path.parent() {
+    if let Some(parent) = database_path.parent()
+        && parent.exists()
+    {
         fs::File::open(parent)
             .and_then(|directory| directory.sync_all())
             .map_err(|error| format!("failed to synchronize analytics directory: {error}"))?;
@@ -638,49 +540,28 @@ fn remove_database_files(database_path: &Path) -> Result<(), String> {
 
 fn worker_main(
     database_path: PathBuf,
-    retention: RetentionPolicy,
-    now_ms: i64,
+    last_session_id: Option<SessionId>,
     commands: Receiver<StorageCommand>,
     events: &Sender<StorageEvent>,
     wake: &WakeSignal,
 ) {
     let mut state = WorkerState::new(database_path);
-    match state.open(retention, now_ms) {
-        Ok((active, retained_sessions)) => emit(
-            events,
-            wake,
-            StorageEvent::Opened {
-                active,
-                retained_sessions,
-            },
-        ),
-        Err(details) => emit_failure(events, wake, &state, StorageOperation::Open, None, details),
-    }
+    let open_result = state.open(last_session_id);
+    emit_open_result(events, wake, &state, open_result);
 
     while let Ok(command) = commands.recv() {
         match command {
-            StorageCommand::RetryOpen { retention, now_ms } => {
-                match state.open(retention, now_ms) {
-                    Ok((active, retained_sessions)) => emit(
-                        events,
-                        wake,
-                        StorageEvent::Opened {
-                            active,
-                            retained_sessions,
-                        },
-                    ),
-                    Err(details) => {
-                        emit_failure(events, wake, &state, StorageOperation::Open, None, details)
-                    }
-                }
+            StorageCommand::RetryOpen { last_session_id } => {
+                let result = state.open(last_session_id);
+                emit_open_result(events, wake, &state, result);
             }
-            StorageCommand::Checkpoint(request) => {
+            StorageCommand::Save(request) => {
                 let generation = request.generation;
-                match state.checkpoint(request) {
+                match state.save(request) {
                     Ok(session_id) => emit(
                         events,
                         wake,
-                        StorageEvent::Checkpointed {
+                        StorageEvent::Saved {
                             generation,
                             session_id,
                         },
@@ -689,76 +570,49 @@ fn worker_main(
                         events,
                         wake,
                         &state,
-                        StorageOperation::Checkpoint,
+                        StorageOperation::Save,
                         Some(generation),
                         details,
                     ),
                 }
             }
-            StorageCommand::Finalize {
-                checkpoint,
-                completed_at_ms,
-                retention,
-                retention_now_ms,
-            } => {
-                let generation = checkpoint.generation;
-                match state.finalize(checkpoint, completed_at_ms) {
-                    Ok(session_id) => {
-                        emit(
-                            events,
-                            wake,
-                            StorageEvent::Finalized {
-                                generation,
-                                session_id,
-                            },
-                        );
-                        match state.apply_retention(retention_now_ms, retention) {
-                            Ok(deleted_sessions) => {
-                                emit(
-                                    events,
-                                    wake,
-                                    StorageEvent::RetentionApplied { deleted_sessions },
-                                );
-                                if deleted_sessions > 0
-                                    && let Err(details) = state.reclaim_after_deletion()
-                                {
-                                    emit_failure(
-                                        events,
-                                        wake,
-                                        &state,
-                                        StorageOperation::Maintenance,
-                                        None,
-                                        details,
-                                    );
-                                }
-                            }
-                            Err(details) => emit_failure(
-                                events,
-                                wake,
-                                &state,
-                                StorageOperation::Retention,
-                                None,
-                                details,
-                            ),
-                        }
-                    }
-                    Err(details) => emit_failure(
-                        events,
-                        wake,
-                        &state,
-                        StorageOperation::Finalize,
-                        Some(generation),
-                        details,
-                    ),
+            StorageCommand::ListSessions { request_id } => match state.list_sessions() {
+                Ok(sessions) => emit(
+                    events,
+                    wake,
+                    StorageEvent::SessionsListed {
+                        request_id,
+                        sessions,
+                    },
+                ),
+                Err(details) => {
+                    emit_failure(events, wake, &state, StorageOperation::List, None, details)
                 }
-            }
-            StorageCommand::DiscardActive { session_id } => {
-                match state.discard_active(session_id) {
+            },
+            StorageCommand::LoadSession {
+                request_id,
+                session_id,
+                opened_at_ms,
+            } => match state.load_session(session_id, opened_at_ms) {
+                Ok(session) => emit(
+                    events,
+                    wake,
+                    StorageEvent::SessionLoaded {
+                        request_id,
+                        session,
+                    },
+                ),
+                Err(details) => {
+                    emit_failure(events, wake, &state, StorageOperation::Load, None, details)
+                }
+            },
+            StorageCommand::DeleteSession { session_id } => {
+                match state.delete_session(session_id) {
                     Ok(deleted) => {
                         emit(
                             events,
                             wake,
-                            StorageEvent::Discarded {
+                            StorageEvent::SessionDeleted {
                                 session_id,
                                 deleted,
                             },
@@ -778,49 +632,14 @@ fn worker_main(
                         events,
                         wake,
                         &state,
-                        StorageOperation::Discard,
+                        StorageOperation::Delete,
                         None,
                         details,
                     ),
                 }
             }
-            StorageCommand::ApplyRetention { retention, now_ms } => {
-                match state.apply_retention(now_ms, retention) {
-                    Ok(deleted_sessions) => {
-                        emit(
-                            events,
-                            wake,
-                            StorageEvent::RetentionApplied { deleted_sessions },
-                        );
-                        if deleted_sessions > 0
-                            && let Err(details) = state.reclaim_after_deletion()
-                        {
-                            emit_failure(
-                                events,
-                                wake,
-                                &state,
-                                StorageOperation::Maintenance,
-                                None,
-                                details,
-                            );
-                        }
-                    }
-                    Err(details) => emit_failure(
-                        events,
-                        wake,
-                        &state,
-                        StorageOperation::Retention,
-                        None,
-                        details,
-                    ),
-                }
-            }
-            StorageCommand::DeleteAll {
-                reopen,
-                retention,
-                now_ms,
-            } => match state.delete_all(reopen, retention, now_ms) {
-                Ok(()) => emit(events, wake, StorageEvent::AllDeleted { reopened: reopen }),
+            StorageCommand::DeleteAll => match state.delete_all() {
+                Ok(()) => emit(events, wake, StorageEvent::AllDeleted),
                 Err(details) => emit_failure(
                     events,
                     wake,
@@ -830,97 +649,16 @@ fn worker_main(
                     details,
                 ),
             },
-            StorageCommand::ListCompleted {
-                request_id,
-                limit,
-                offset,
-            } => match state.list_completed(limit, offset) {
-                Ok(sessions) => emit(
-                    events,
-                    wake,
-                    StorageEvent::HistoryLoaded {
-                        request_id,
-                        offset,
-                        sessions,
-                    },
-                ),
-                Err(details) => emit_failure(
-                    events,
-                    wake,
-                    &state,
-                    StorageOperation::HistoryList,
-                    None,
-                    details,
-                ),
-            },
-            StorageCommand::LoadCompleted {
-                request_id,
-                session_id,
-            } => match state.load_completed(session_id) {
-                Ok(session) => emit(
-                    events,
-                    wake,
-                    StorageEvent::CompletedLoaded {
-                        request_id,
-                        session,
-                    },
-                ),
-                Err(details) => emit_failure(
-                    events,
-                    wake,
-                    &state,
-                    StorageOperation::HistoryDetail,
-                    None,
-                    details,
-                ),
-            },
-            StorageCommand::DeleteCompleted { session_id } => {
-                match state.delete_completed(session_id) {
-                    Ok(deleted) => {
-                        emit(
-                            events,
-                            wake,
-                            StorageEvent::CompletedDeleted {
-                                session_id,
-                                deleted,
-                            },
-                        );
-                        if deleted && let Err(details) = state.reclaim_after_deletion() {
-                            emit_failure(
-                                events,
-                                wake,
-                                &state,
-                                StorageOperation::Maintenance,
-                                None,
-                                details,
-                            );
-                        }
-                    }
-                    Err(details) => emit_failure(
-                        events,
-                        wake,
-                        &state,
-                        StorageOperation::DeleteCompleted,
-                        None,
-                        details,
-                    ),
-                }
-            }
-            StorageCommand::Shutdown { final_checkpoint } => {
-                let final_generation = final_checkpoint
-                    .as_ref()
-                    .map(|checkpoint| checkpoint.generation);
-                let final_checkpoint_saved = final_checkpoint.is_none_or(|checkpoint| {
-                    if state.finalized_since_checkpoint {
-                        return true;
-                    }
-                    let generation = checkpoint.generation;
-                    match state.checkpoint(checkpoint) {
+            StorageCommand::Shutdown { final_save } => {
+                let final_generation = final_save.as_ref().map(|save| save.generation);
+                let final_save_succeeded = final_save.is_none_or(|request| {
+                    let generation = request.generation;
+                    match state.save(request) {
                         Ok(session_id) => {
                             emit(
                                 events,
                                 wake,
-                                StorageEvent::Checkpointed {
+                                StorageEvent::Saved {
                                     generation,
                                     session_id,
                                 },
@@ -932,7 +670,7 @@ fn worker_main(
                                 events,
                                 wake,
                                 &state,
-                                StorageOperation::ShutdownCheckpoint,
+                                StorageOperation::ShutdownSave,
                                 Some(generation),
                                 details,
                             );
@@ -946,12 +684,24 @@ fn worker_main(
                     wake,
                     StorageEvent::ShutdownComplete {
                         final_generation,
-                        final_checkpoint_saved,
+                        final_save_succeeded,
                     },
                 );
                 break;
             }
         }
+    }
+}
+
+fn emit_open_result(
+    events: &Sender<StorageEvent>,
+    wake: &WakeSignal,
+    state: &WorkerState,
+    result: Result<(Vec<SessionMetadata>, Option<StoredSession>), String>,
+) {
+    match result {
+        Ok((sessions, selected)) => emit(events, wake, StorageEvent::Opened { sessions, selected }),
+        Err(details) => emit_failure(events, wake, state, StorageOperation::Open, None, details),
     }
 }
 
@@ -989,7 +739,7 @@ mod tests {
             Arc,
             atomic::{AtomicUsize, Ordering},
         },
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use tempfile::tempdir;
@@ -997,41 +747,35 @@ mod tests {
     use crate::{
         metric::MetricSnapshot,
         session::{KeyboardContext, SessionSnapshot},
-        settings::RetentionPolicy,
         wake::WakeSignal,
     };
 
     use super::{
-        CHECKPOINT_INTERVAL, CheckpointRequest, CheckpointSchedule, DirtyGeneration, DirtyTracker,
-        StorageCommand, StorageEvent, StorageOperation, StorageStatus, StorageWorker,
+        CheckpointSchedule, DirtyTracker, SaveRequest, StorageCommand, StorageEvent, StorageWorker,
     };
 
-    fn wake_signal() -> (WakeSignal, Arc<AtomicUsize>) {
+    fn wake_signal() -> WakeSignal {
         let wakes = Arc::new(AtomicUsize::new(0));
-        let callback_wakes = Arc::clone(&wakes);
-        (
-            WakeSignal::new(move || {
-                callback_wakes.fetch_add(1, Ordering::Relaxed);
-            }),
-            wakes,
-        )
+        WakeSignal::new({
+            let wakes = Arc::clone(&wakes);
+            move || {
+                wakes.fetch_add(1, Ordering::Relaxed);
+            }
+        })
     }
 
     fn snapshot(updated_at_ms: i64) -> SessionSnapshot {
         SessionSnapshot {
             id: None,
-            created_at_ms: 1_000,
+            name: None,
+            created_at_ms: 1,
             updated_at_ms,
-            captured_duration_ns: 100,
-            application_version: "0.2.0-dev".to_owned(),
-            keyboard: KeyboardContext {
-                display_name: None,
-                model: String::new(),
-                layout: "us".to_owned(),
-                variant: String::new(),
-            },
+            last_opened_at_ms: updated_at_ms,
+            captured_duration_ns: 0,
+            application_version: "test".to_owned(),
+            keyboard: KeyboardContext::default(),
             metrics: vec![
-                MetricSnapshot::from_json("total-presses", 1, r#"{"count":4}"#.to_owned()).unwrap(),
+                MetricSnapshot::from_json("total-presses", 1, r#"{"count":1}"#.to_owned()).unwrap(),
             ],
         }
     }
@@ -1041,334 +785,187 @@ mod tests {
             if let Some(event) = worker.try_recv().unwrap() {
                 return event;
             }
-            std::thread::sleep(Duration::from_millis(5));
+            std::thread::sleep(Duration::from_millis(10));
         }
-        panic!("storage worker did not produce an event");
+        panic!("storage event did not arrive");
     }
 
     #[test]
-    fn checkpoint_schedule_waits_thirty_seconds_without_postponing_on_each_event() {
-        let start = std::time::Instant::now();
+    fn autosave_schedule_waits_thirty_seconds_without_postponing() {
+        let start = Instant::now();
         let mut schedule = CheckpointSchedule::default();
         schedule.note_dirty(start);
         schedule.note_dirty(start + Duration::from_secs(20));
 
-        assert!(!schedule.is_due(start + CHECKPOINT_INTERVAL - Duration::from_millis(1)));
-        assert!(schedule.is_due(start + CHECKPOINT_INTERVAL));
-        schedule.checkpoint_started();
-        assert!(!schedule.is_due(start + Duration::from_secs(60)));
+        assert!(!schedule.is_due(start + Duration::from_secs(29)));
+        assert!(schedule.is_due(start + Duration::from_secs(30)));
     }
 
     #[test]
     fn dirty_acknowledgement_does_not_save_newer_changes() {
         let mut tracker = DirtyTracker::default();
-        tracker.begin_loading();
-        tracker.loaded();
+        tracker.loaded(true);
         let first = tracker.mark_dirty().unwrap();
-        assert_eq!(tracker.begin_checkpoint(), Some(first));
-        let second = tracker.mark_dirty().unwrap();
-        assert!(second > first);
-        assert_eq!(tracker.status(), StorageStatus::Saving);
-        assert_eq!(tracker.begin_checkpoint(), None);
-
+        assert_eq!(tracker.begin_save().unwrap(), Some(first));
+        tracker.mark_dirty().unwrap();
         tracker.acknowledge(first).unwrap();
 
-        assert_eq!(tracker.status(), StorageStatus::Dirty);
-        assert_eq!(tracker.saved(), first);
-        assert_eq!(tracker.begin_checkpoint(), Some(second));
+        assert!(tracker.is_dirty());
+        assert_eq!(tracker.saved_generation(), first);
     }
 
     #[test]
-    fn failed_checkpoint_remains_dirty_and_can_retry_latest_generation() {
+    fn pristine_untitled_session_can_be_saved() {
         let mut tracker = DirtyTracker::default();
-        tracker.begin_loading();
-        tracker.loaded();
-        let generation = tracker.mark_dirty().unwrap();
-        assert_eq!(tracker.begin_checkpoint(), Some(generation));
-        tracker.fail(generation).unwrap();
-        assert_eq!(tracker.status(), StorageStatus::Failed);
-        assert_eq!(tracker.saved(), DirtyGeneration::default());
-        assert_eq!(tracker.begin_checkpoint(), Some(generation));
+        let generation = tracker.begin_save().unwrap().unwrap();
+        tracker.acknowledge(generation).unwrap();
+        assert!(!tracker.is_dirty());
     }
 
     #[test]
-    fn worker_checkpoints_and_recovers_active_aggregates() {
+    fn worker_starts_without_creating_a_database_and_saves_on_request() {
         let temporary = tempdir().unwrap();
-        let path = temporary.path().join("evtap.sqlite3");
-        let (wake, wakes) = wake_signal();
-        let worker =
-            StorageWorker::spawn(path.clone(), RetentionPolicy::Days(90), 2_000, wake).unwrap();
-        assert!(matches!(
-            recv_event(&worker),
-            StorageEvent::Opened { active: None, .. }
-        ));
+        let path = temporary.path().join("data/evtap.sqlite3");
+        let worker = StorageWorker::spawn(path.clone(), None, wake_signal()).unwrap();
+        assert!(matches!(recv_event(&worker), StorageEvent::Opened { .. }));
+        assert!(!path.exists());
 
-        let generation = DirtyGeneration(1);
+        let mut tracker = DirtyTracker::default();
+        let generation = tracker.begin_save().unwrap().unwrap();
         worker
-            .send(StorageCommand::Checkpoint(CheckpointRequest {
+            .send(StorageCommand::Save(SaveRequest {
                 generation,
-                snapshot: snapshot(2_000),
+                snapshot: snapshot(10),
             }))
-            .unwrap();
-        assert!(matches!(
-            recv_event(&worker),
-            StorageEvent::Checkpointed {
-                generation: saved,
-                ..
-            } if saved == generation
-        ));
-        assert!(wakes.load(Ordering::Relaxed) >= 2);
-        worker.shutdown(None).unwrap();
-
-        let (wake, _) = wake_signal();
-        let worker = StorageWorker::spawn(path, RetentionPolicy::Days(90), 3_000, wake).unwrap();
-        let StorageEvent::Opened {
-            active: Some(active),
-            ..
-        } = recv_event(&worker)
-        else {
-            panic!("expected restored active session");
-        };
-        assert_eq!(active.metrics.len(), 1);
-        assert_eq!(active.metrics[0].metric_id, "total-presses");
-        worker.shutdown(None).unwrap();
-    }
-
-    #[test]
-    fn shutdown_flushes_a_fresh_snapshot_and_uses_the_worker_session_id() {
-        let temporary = tempdir().unwrap();
-        let path = temporary.path().join("evtap.sqlite3");
-        let (wake, _) = wake_signal();
-        let worker =
-            StorageWorker::spawn(path.clone(), RetentionPolicy::Days(90), 2_000, wake).unwrap();
-        assert!(matches!(recv_event(&worker), StorageEvent::Opened { .. }));
-        worker
-            .send(StorageCommand::Checkpoint(CheckpointRequest {
-                generation: DirtyGeneration(1),
-                snapshot: snapshot(2_000),
-            }))
-            .unwrap();
-
-        let result = worker
-            .shutdown(Some(CheckpointRequest {
-                generation: DirtyGeneration(2),
-                snapshot: snapshot(3_000),
-            }))
-            .unwrap();
-        assert_eq!(result.final_generation, Some(DirtyGeneration(2)));
-        assert!(result.final_checkpoint_saved);
-
-        let (wake, _) = wake_signal();
-        let worker = StorageWorker::spawn(path, RetentionPolicy::Days(90), 4_000, wake).unwrap();
-        let StorageEvent::Opened {
-            active: Some(active),
-            ..
-        } = recv_event(&worker)
-        else {
-            panic!("expected restored active session");
-        };
-        assert_eq!(active.metadata.updated_at_ms, 3_000);
-        worker.shutdown(None).unwrap();
-    }
-
-    #[test]
-    fn worker_lists_loads_and_deletes_completed_sessions() {
-        let temporary = tempdir().unwrap();
-        let path = temporary.path().join("evtap.sqlite3");
-        let (wake, _) = wake_signal();
-        let worker =
-            StorageWorker::spawn(path.clone(), RetentionPolicy::Days(90), 2_000, wake).unwrap();
-        assert!(matches!(recv_event(&worker), StorageEvent::Opened { .. }));
-        worker
-            .send(StorageCommand::Checkpoint(CheckpointRequest {
-                generation: DirtyGeneration(1),
-                snapshot: snapshot(2_000),
-            }))
-            .unwrap();
-        assert!(matches!(
-            recv_event(&worker),
-            StorageEvent::Checkpointed { .. }
-        ));
-        worker
-            .send(StorageCommand::Finalize {
-                checkpoint: CheckpointRequest {
-                    generation: DirtyGeneration(2),
-                    snapshot: snapshot(3_000),
-                },
-                completed_at_ms: 4_000,
-                retention: RetentionPolicy::Days(90),
-                retention_now_ms: 4_000,
-            })
             .unwrap();
         let session_id = match recv_event(&worker) {
-            StorageEvent::Finalized {
-                generation: DirtyGeneration(2),
-                session_id,
-            } => session_id,
+            StorageEvent::Saved { session_id, .. } => session_id,
             event => panic!("unexpected event: {event:?}"),
         };
-        assert!(matches!(
-            recv_event(&worker),
-            StorageEvent::RetentionApplied { .. }
-        ));
-
-        worker
-            .send(StorageCommand::ListCompleted {
-                request_id: 7,
-                limit: 50,
-                offset: 0,
-            })
-            .unwrap();
-        let StorageEvent::HistoryLoaded {
-            request_id: 7,
-            sessions,
-            ..
-        } = recv_event(&worker)
-        else {
-            panic!("expected history page");
-        };
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].metadata.id, session_id);
-        assert_eq!(sessions[0].total_presses, Some(4));
-
-        worker
-            .send(StorageCommand::LoadCompleted {
-                request_id: 8,
-                session_id,
-            })
-            .unwrap();
-        let StorageEvent::CompletedLoaded {
-            request_id: 8,
-            session: Some(stored),
-        } = recv_event(&worker)
-        else {
-            panic!("expected completed-session detail");
-        };
-        assert_eq!(stored.metadata.id, session_id);
-        assert_eq!(stored.metrics.len(), 1);
-
-        worker
-            .send(StorageCommand::DeleteCompleted { session_id })
-            .unwrap();
-        assert!(matches!(
-            recv_event(&worker),
-            StorageEvent::CompletedDeleted {
-                session_id: deleted_id,
-                deleted: true,
-            } if deleted_id == session_id
-        ));
-        let shutdown = worker
-            .shutdown(Some(CheckpointRequest {
-                generation: DirtyGeneration(3),
-                snapshot: snapshot(5_000),
-            }))
-            .unwrap();
-        assert!(shutdown.final_checkpoint_saved);
-
-        let (wake, _) = wake_signal();
-        let worker = StorageWorker::spawn(path, RetentionPolicy::Days(90), 5_000, wake).unwrap();
-        assert!(matches!(
-            recv_event(&worker),
-            StorageEvent::Opened { active: None, .. }
-        ));
-        worker.shutdown(None).unwrap();
-    }
-
-    #[test]
-    fn delete_all_closes_removes_and_optionally_reopens_storage() {
-        let temporary = tempdir().unwrap();
-        let path = temporary.path().join("evtap.sqlite3");
-        let (wake, _) = wake_signal();
-        let worker =
-            StorageWorker::spawn(path.clone(), RetentionPolicy::Days(90), 2_000, wake).unwrap();
-        assert!(matches!(recv_event(&worker), StorageEvent::Opened { .. }));
-        worker
-            .send(StorageCommand::Checkpoint(CheckpointRequest {
-                generation: DirtyGeneration(1),
-                snapshot: snapshot(2_000),
-            }))
-            .unwrap();
-        assert!(matches!(
-            recv_event(&worker),
-            StorageEvent::Checkpointed { .. }
-        ));
-
-        worker
-            .send(StorageCommand::DeleteAll {
-                reopen: true,
-                retention: RetentionPolicy::Days(90),
-                now_ms: 3_000,
-            })
-            .unwrap();
-        assert!(matches!(
-            recv_event(&worker),
-            StorageEvent::AllDeleted { reopened: true }
-        ));
         assert!(path.exists());
 
         worker
-            .send(StorageCommand::DeleteAll {
-                reopen: false,
-                retention: RetentionPolicy::Days(90),
-                now_ms: 4_000,
+            .send(StorageCommand::LoadSession {
+                request_id: 1,
+                session_id,
+                opened_at_ms: 20,
             })
             .unwrap();
         assert!(matches!(
             recv_event(&worker),
-            StorageEvent::AllDeleted { reopened: false }
+            StorageEvent::SessionLoaded {
+                session: Some(_),
+                ..
+            }
         ));
+        worker.shutdown(None).unwrap();
+    }
+
+    #[test]
+    fn startup_loads_only_the_requested_last_session() {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("evtap.sqlite3");
+        let worker = StorageWorker::spawn(path.clone(), None, wake_signal()).unwrap();
+        assert!(matches!(recv_event(&worker), StorageEvent::Opened { .. }));
+        let mut tracker = DirtyTracker::default();
+
+        let first_generation = tracker.begin_save().unwrap().unwrap();
+        worker
+            .send(StorageCommand::Save(SaveRequest {
+                generation: first_generation,
+                snapshot: snapshot(10),
+            }))
+            .unwrap();
+        let first = match recv_event(&worker) {
+            StorageEvent::Saved { session_id, .. } => session_id,
+            event => panic!("unexpected event: {event:?}"),
+        };
+        tracker.acknowledge(first_generation).unwrap();
+
+        let second_generation = tracker.mark_dirty().unwrap();
+        assert_eq!(tracker.begin_save().unwrap(), Some(second_generation));
+        worker
+            .send(StorageCommand::Save(SaveRequest {
+                generation: second_generation,
+                snapshot: snapshot(20),
+            }))
+            .unwrap();
+        let second = match recv_event(&worker) {
+            StorageEvent::Saved { session_id, .. } => session_id,
+            event => panic!("unexpected event: {event:?}"),
+        };
+        assert_ne!(first, second);
+        worker.shutdown(None).unwrap();
+
+        let worker = StorageWorker::spawn(path, Some(first), wake_signal()).unwrap();
+        match recv_event(&worker) {
+            StorageEvent::Opened { sessions, selected } => {
+                assert_eq!(sessions.len(), 2);
+                assert_eq!(selected.unwrap().metadata.id, first);
+            }
+            event => panic!("unexpected event: {event:?}"),
+        }
+        worker.shutdown(None).unwrap();
+    }
+
+    #[test]
+    fn shutdown_flushes_a_fresh_snapshot() {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("evtap.sqlite3");
+        let worker = StorageWorker::spawn(path.clone(), None, wake_signal()).unwrap();
+        assert!(matches!(recv_event(&worker), StorageEvent::Opened { .. }));
+        let mut tracker = DirtyTracker::default();
+        let generation = tracker.begin_save().unwrap().unwrap();
+
+        let result = worker
+            .shutdown(Some(SaveRequest {
+                generation,
+                snapshot: snapshot(10),
+            }))
+            .unwrap();
+
+        assert_eq!(result.final_generation, Some(generation));
+        assert!(result.final_save_succeeded);
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn incompatible_database_is_reported_without_replacement() {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("evtap.sqlite3");
+        std::fs::write(&path, b"not sqlite").unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let worker = StorageWorker::spawn(path.clone(), None, wake_signal()).unwrap();
+
+        assert!(matches!(recv_event(&worker), StorageEvent::Failed(_)));
+        assert_eq!(std::fs::read(path).unwrap(), original);
+        worker.shutdown(None).unwrap();
+    }
+
+    #[test]
+    fn delete_all_removes_database_and_sidecars() {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("evtap.sqlite3");
+        let worker = StorageWorker::spawn(path.clone(), None, wake_signal()).unwrap();
+        assert!(matches!(recv_event(&worker), StorageEvent::Opened { .. }));
+        let mut tracker = DirtyTracker::default();
+        let generation = tracker.begin_save().unwrap().unwrap();
+        worker
+            .send(StorageCommand::Save(SaveRequest {
+                generation,
+                snapshot: snapshot(10),
+            }))
+            .unwrap();
+        assert!(matches!(recv_event(&worker), StorageEvent::Saved { .. }));
+
+        worker.send(StorageCommand::DeleteAll).unwrap();
+        assert!(matches!(recv_event(&worker), StorageEvent::AllDeleted));
         assert!(!path.exists());
         worker.shutdown(None).unwrap();
     }
 
     #[test]
-    fn open_failure_is_reported_without_replacing_the_database() {
-        let temporary = tempdir().unwrap();
-        let path = temporary.path().join("evtap.sqlite3");
-        std::fs::write(&path, b"not a database").unwrap();
-        let original = std::fs::read(&path).unwrap();
-        let (wake, _) = wake_signal();
-        let worker =
-            StorageWorker::spawn(PathBuf::from(&path), RetentionPolicy::Days(90), 2_000, wake)
-                .unwrap();
-
-        assert!(matches!(recv_event(&worker), StorageEvent::Failed(_)));
-        assert_eq!(std::fs::read(&path).unwrap(), original);
-
-        worker
-            .send(StorageCommand::Checkpoint(CheckpointRequest {
-                generation: DirtyGeneration(1),
-                snapshot: snapshot(2_000),
-            }))
-            .unwrap();
-        assert!(matches!(
-            recv_event(&worker),
-            StorageEvent::Failed(failure)
-                if failure.operation == StorageOperation::Checkpoint
-                    && failure.generation == Some(DirtyGeneration(1))
-        ));
-
-        std::fs::remove_file(&path).unwrap();
-        worker
-            .send(StorageCommand::RetryOpen {
-                retention: RetentionPolicy::Days(90),
-                now_ms: 3_000,
-            })
-            .unwrap();
-        assert!(matches!(recv_event(&worker), StorageEvent::Opened { .. }));
-        worker
-            .send(StorageCommand::Checkpoint(CheckpointRequest {
-                generation: DirtyGeneration(2),
-                snapshot: snapshot(3_000),
-            }))
-            .unwrap();
-        assert!(matches!(
-            recv_event(&worker),
-            StorageEvent::Checkpointed {
-                generation: DirtyGeneration(2),
-                ..
-            }
-        ));
-        worker.shutdown(None).unwrap();
+    fn event_types_do_not_need_database_paths_from_callers() {
+        let _: Option<PathBuf> = None;
     }
 }

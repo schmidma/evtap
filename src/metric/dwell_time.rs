@@ -150,6 +150,10 @@ impl Metric for DwellTime {
         Ok(())
     }
 
+    fn clear_in_flight(&mut self) {
+        self.pressed_keys.clear();
+    }
+
     fn reset(&mut self) {
         *self = Self::default();
     }
@@ -185,6 +189,18 @@ mod tests {
 
         assert_eq!(metric.stats.get("A").map(|stats| stats.samples), Some(1));
         assert_eq!(metric.stats.get("a").map(|stats| stats.samples), None);
+    }
+
+    #[test]
+    fn clearing_in_flight_context_drops_unfinished_presses() {
+        let mut metric = DwellTime::default();
+        metric.process(&event(100, KeyEventKind::Press, Some("a")));
+
+        metric.clear_in_flight();
+        metric.process(&event(180, KeyEventKind::Release, Some("a")));
+
+        assert!(metric.pressed_keys.is_empty());
+        assert!(!metric.stats.contains_key("a"));
     }
 
     #[test]

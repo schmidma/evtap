@@ -37,11 +37,11 @@ The main internal boundaries are:
 - `input`: normalized, backend-independent keyboard events.
 - `metric`: the metric contract, generic report model, and metric registry.
 - `metric_view`: generic egui rendering for metric reports.
-- `session`: persisted-session metadata and isolated metric recovery.
+- `session`: mutable saved-session metadata and isolated metric recovery.
 - `settings` and `paths`: atomic privacy preferences and XDG locations.
-- `database`: SQLite schema, migrations, validation, and transactions.
+- `database`: SQLite identity/schema validation and transactional mutable-session storage.
 - `storage`: the background command/event protocol; it accepts aggregate `SessionSnapshot` values and must never import `KeyEvent`.
-- `app`: capture/session lifecycle, dirty tracking, and UI orchestration.
+- `app`: capture/session lifecycle, editor-style save boundaries, dirty tracking, and UI orchestration.
 
 A metric must not depend directly on evdev, Tokio, or egui. To add one:
 
@@ -60,12 +60,12 @@ The generic report renderer means a normal metric addition should not require ch
 evtap handles globally captured keyboard input. Changes must preserve these rules:
 
 - Never persist or transmit raw keyboard events, ordered text, event timestamps, pressed-key state, or transient analysis context.
-- Persistent code may receive only validated aggregate snapshots; do not add a `KeyEvent` dependency to `database`, `storage`, `settings`, or session-history code.
+- Storage code may receive only validated aggregate snapshots; do not add a `KeyEvent` dependency to `database`, `storage`, `settings`, or saved-session code.
 - Keep transient text buffers bounded and only as large as an analysis requires.
-- Keep persistence opt-in and preserve non-destructive behavior for corrupt or newer settings/databases.
+- Require the disclosure before the first analytics write and preserve non-destructive behavior for corrupt or incompatible settings/databases.
 - Do not log captured labels, snapshot JSON, or SQL parameter values.
 - Make any inference or uncertainty explicit in metric descriptions.
-- Treat capture, storage, permission, migration, retention, and deletion failures as user-visible errors.
+- Treat capture, storage, permission, schema, switch, close, and deletion failures as user-visible errors.
 
 Export, telemetry, network behavior, crash reporting, or encryption requires a separate design and privacy review.
 

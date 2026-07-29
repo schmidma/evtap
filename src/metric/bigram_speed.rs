@@ -167,6 +167,10 @@ impl Metric for BigramSpeed {
         Ok(())
     }
 
+    fn clear_in_flight(&mut self) {
+        self.last_press = None;
+    }
+
     fn reset(&mut self) {
         *self = Self::default();
     }
@@ -206,6 +210,20 @@ mod tests {
             metric.stats.get(&key).map(|stats| stats.total),
             Some(Duration::from_millis(80))
         );
+    }
+
+    #[test]
+    fn clearing_in_flight_context_preserves_aggregates_without_bridging() {
+        let mut metric = BigramSpeed::default();
+        metric.process(&press(100, "a"));
+        metric.process(&press(180, "b"));
+        let aggregates = metric.stats.clone();
+
+        metric.clear_in_flight();
+        metric.process(&press(250, "c"));
+
+        assert_eq!(metric.stats, aggregates);
+        assert!(!metric.stats.contains_key(&("b".to_owned(), "c".to_owned())));
     }
 
     #[test]

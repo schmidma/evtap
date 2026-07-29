@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
-    fs::{self, DirBuilder, OpenOptions},
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+    fs::{self, DirBuilder},
+    os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -12,31 +12,28 @@ use rusqlite::{
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::{
-    session::{
-        KeyboardContext, SessionId, SessionMetadata, SessionSnapshot, SessionStatus,
-        SessionSummary, StoredMetricSnapshot, StoredSession,
-    },
-    settings::RetentionPolicy,
+use crate::session::{
+    KeyboardContext, SessionId, SessionMetadata, SessionSnapshot, StoredMetricSnapshot,
+    StoredSession,
 };
 
 const APPLICATION_ID: i64 = 0x4556_5450; // "EVTP"
-const DATABASE_SCHEMA_VERSION: i64 = 1;
+const DATABASE_SCHEMA_VERSION: i64 = 2;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_SESSION_METRICS: usize = 1_000;
 const MAX_APPLICATION_VERSION_BYTES: usize = 128;
+const MAX_SESSION_NAME_BYTES: usize = 80;
 const MAX_KEYBOARD_NAME_BYTES: usize = 1_024;
 const MAX_KEYBOARD_VALUE_BYTES: usize = 256;
-const MAX_HISTORY_PAGE_SIZE: u32 = 100;
-const MILLISECONDS_PER_DAY: i64 = 86_400_000;
+const MAX_SESSION_LIST_SIZE: u32 = 10_000;
 
-const SCHEMA_V1: &str = r#"
+const SCHEMA_V2: &str = r#"
 CREATE TABLE sessions (
     id                    INTEGER PRIMARY KEY,
-    status                TEXT NOT NULL CHECK (status IN ('active', 'completed')),
+    name                  TEXT,
     created_at_ms         INTEGER NOT NULL,
     updated_at_ms         INTEGER NOT NULL,
-    completed_at_ms       INTEGER,
+    last_opened_at_ms     INTEGER NOT NULL,
     captured_duration_ns  INTEGER NOT NULL DEFAULT 0
                              CHECK (captured_duration_ns >= 0),
     application_version   TEXT NOT NULL,
@@ -44,19 +41,15 @@ CREATE TABLE sessions (
     xkb_model             TEXT NOT NULL,
     xkb_layout            TEXT NOT NULL,
     xkb_variant           TEXT NOT NULL,
-    CHECK (
-        (status = 'active' AND completed_at_ms IS NULL) OR
-        (status = 'completed' AND completed_at_ms IS NOT NULL)
-    )
+    CHECK (name IS NULL OR length(name) > 0)
 );
 
-CREATE UNIQUE INDEX sessions_one_active
-    ON sessions(status)
-    WHERE status = 'active';
+CREATE UNIQUE INDEX sessions_unique_name
+    ON sessions(name)
+    WHERE name IS NOT NULL;
 
-CREATE INDEX sessions_completed_at
-    ON sessions(completed_at_ms DESC)
-    WHERE status = 'completed';
+CREATE INDEX sessions_recently_opened
+    ON sessions(last_opened_at_ms DESC, id DESC);
 
 CREATE TABLE metric_snapshots (
     session_id             INTEGER NOT NULL
@@ -68,170 +61,133 @@ CREATE TABLE metric_snapshots (
     updated_at_ms          INTEGER NOT NULL,
     PRIMARY KEY (session_id, metric_id)
 ) WITHOUT ROWID;
-
-PRAGMA user_version = 1;
 "#;
 
 pub struct Repository {
     connection: Connection,
+    path: Option<PathBuf>,
 }
 
 impl Repository {
     pub fn open(path: PathBuf) -> Result<Self, RepositoryError> {
         prepare_database_path(&path)?;
-        let connection = Connection::open_with_flags(
-            &path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_CREATE
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        set_private_permissions(&path, 0o600)?;
-
-        let mut repository = Self { connection };
+        let connection = open_connection(&path, true)?;
+        let mut repository = Self {
+            connection,
+            path: Some(path.clone()),
+        };
         repository.configure(true)?;
+        set_private_permissions(&path, 0o600)?;
         Ok(repository)
+    }
+
+    pub fn open_existing(path: PathBuf) -> Result<Option<Self>, RepositoryError> {
+        match fs::metadata(&path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => return Err(RepositoryError::NotRegularFile(path)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(RepositoryError::ReadMetadata { path, source }),
+        }
+        let connection = open_connection(&path, false)?;
+        let mut repository = Self {
+            connection,
+            path: Some(path.clone()),
+        };
+        repository.configure(true)?;
+        set_private_permissions(&path, 0o600)?;
+        Ok(Some(repository))
     }
 
     #[cfg(test)]
     pub fn open_in_memory() -> Result<Self, RepositoryError> {
         let connection = Connection::open_in_memory()?;
-        let mut repository = Self { connection };
+        let mut repository = Self {
+            connection,
+            path: None,
+        };
         repository.configure(false)?;
         Ok(repository)
     }
 
-    pub fn checkpoint(&mut self, snapshot: &SessionSnapshot) -> Result<SessionId, RepositoryError> {
+    pub fn save(&mut self, snapshot: &SessionSnapshot) -> Result<SessionId, RepositoryError> {
         validate_snapshot(snapshot)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let session_id = match snapshot.id {
-            Some(session_id) => {
-                let changed = transaction.execute(
-                    "UPDATE sessions SET
-                        created_at_ms = ?2,
-                        updated_at_ms = ?3,
-                        captured_duration_ns = ?4,
-                        application_version = ?5,
-                        keyboard_name = ?6,
-                        xkb_model = ?7,
-                        xkb_layout = ?8,
-                        xkb_variant = ?9
-                     WHERE id = ?1 AND status = 'active'",
-                    params![
-                        session_id.get(),
-                        snapshot.created_at_ms,
-                        snapshot.updated_at_ms,
-                        snapshot.captured_duration_ns,
-                        snapshot.application_version,
-                        snapshot.keyboard.display_name,
-                        snapshot.keyboard.model,
-                        snapshot.keyboard.layout,
-                        snapshot.keyboard.variant,
-                    ],
-                )?;
-                if changed != 1 {
-                    return Err(RepositoryError::SessionNotActive(session_id));
-                }
-                session_id
+
+        if let Some(name) = &snapshot.name {
+            let duplicate: bool = transaction.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sessions
+                    WHERE name = ?1 AND (?2 IS NULL OR id != ?2)
+                )",
+                params![name, snapshot.id.map(SessionId::get)],
+                |row| row.get(0),
+            )?;
+            if duplicate {
+                return Err(RepositoryError::DuplicateSessionName);
             }
-            None => {
-                transaction.execute(
-                    "INSERT INTO sessions (
-                        status, created_at_ms, updated_at_ms, completed_at_ms,
-                        captured_duration_ns, application_version, keyboard_name,
-                        xkb_model, xkb_layout, xkb_variant
-                     ) VALUES ('active', ?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    params![
-                        snapshot.created_at_ms,
-                        snapshot.updated_at_ms,
-                        snapshot.captured_duration_ns,
-                        snapshot.application_version,
-                        snapshot.keyboard.display_name,
-                        snapshot.keyboard.model,
-                        snapshot.keyboard.layout,
-                        snapshot.keyboard.variant,
-                    ],
-                )?;
-                SessionId::new(transaction.last_insert_rowid()).ok_or(
-                    RepositoryError::InvalidStoredSession("invalid inserted session ID"),
-                )?
+        }
+
+        let session_id = if let Some(session_id) = snapshot.id {
+            let changed = transaction.execute(
+                "UPDATE sessions SET
+                    name = ?1,
+                    created_at_ms = ?2,
+                    updated_at_ms = ?3,
+                    last_opened_at_ms = ?4,
+                    captured_duration_ns = ?5,
+                    application_version = ?6,
+                    keyboard_name = ?7,
+                    xkb_model = ?8,
+                    xkb_layout = ?9,
+                    xkb_variant = ?10
+                 WHERE id = ?11",
+                params![
+                    snapshot.name,
+                    snapshot.created_at_ms,
+                    snapshot.updated_at_ms,
+                    snapshot.last_opened_at_ms,
+                    snapshot.captured_duration_ns,
+                    snapshot.application_version,
+                    snapshot.keyboard.display_name,
+                    snapshot.keyboard.model,
+                    snapshot.keyboard.layout,
+                    snapshot.keyboard.variant,
+                    session_id.get(),
+                ],
+            )?;
+            if changed != 1 {
+                return Err(RepositoryError::SessionNotFound(session_id.get()));
             }
+            session_id
+        } else {
+            transaction.execute(
+                "INSERT INTO sessions (
+                    name, created_at_ms, updated_at_ms, last_opened_at_ms,
+                    captured_duration_ns, application_version, keyboard_name,
+                    xkb_model, xkb_layout, xkb_variant
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    snapshot.name,
+                    snapshot.created_at_ms,
+                    snapshot.updated_at_ms,
+                    snapshot.last_opened_at_ms,
+                    snapshot.captured_duration_ns,
+                    snapshot.application_version,
+                    snapshot.keyboard.display_name,
+                    snapshot.keyboard.model,
+                    snapshot.keyboard.layout,
+                    snapshot.keyboard.variant,
+                ],
+            )?;
+            SessionId::new(transaction.last_insert_rowid())
+                .ok_or(RepositoryError::InvalidGeneratedSessionId)?
         };
+
         write_metrics(&transaction, session_id, snapshot)?;
         transaction.commit()?;
         Ok(session_id)
-    }
-
-    pub fn finalize(
-        &mut self,
-        snapshot: &SessionSnapshot,
-        completed_at_ms: i64,
-    ) -> Result<SessionId, RepositoryError> {
-        validate_snapshot(snapshot)?;
-        if completed_at_ms < snapshot.updated_at_ms {
-            return Err(RepositoryError::InvalidSession(
-                "completion time precedes the latest update",
-            ));
-        }
-        let session_id = snapshot.id.ok_or(RepositoryError::InvalidSession(
-            "cannot finalize a session that has not been checkpointed",
-        ))?;
-
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed = transaction.execute(
-            "UPDATE sessions SET
-                status = 'completed',
-                created_at_ms = ?2,
-                updated_at_ms = ?3,
-                completed_at_ms = ?4,
-                captured_duration_ns = ?5,
-                application_version = ?6,
-                keyboard_name = ?7,
-                xkb_model = ?8,
-                xkb_layout = ?9,
-                xkb_variant = ?10
-             WHERE id = ?1 AND status = 'active'",
-            params![
-                session_id.get(),
-                snapshot.created_at_ms,
-                snapshot.updated_at_ms,
-                completed_at_ms,
-                snapshot.captured_duration_ns,
-                snapshot.application_version,
-                snapshot.keyboard.display_name,
-                snapshot.keyboard.model,
-                snapshot.keyboard.layout,
-                snapshot.keyboard.variant,
-            ],
-        )?;
-        if changed != 1 {
-            return Err(RepositoryError::SessionNotActive(session_id));
-        }
-        write_metrics(&transaction, session_id, snapshot)?;
-        transaction.commit()?;
-        Ok(session_id)
-    }
-
-    pub fn load_active(&self) -> Result<Option<StoredSession>, RepositoryError> {
-        let metadata = self
-            .connection
-            .query_row(
-                &format!(
-                    "{} WHERE status = 'active' LIMIT 1",
-                    session_metadata_query()
-                ),
-                [],
-                raw_metadata_from_row,
-            )
-            .optional()?
-            .map(SessionMetadata::try_from)
-            .transpose()?;
-        metadata
-            .map(|metadata| self.load_stored_session(metadata))
-            .transpose()
     }
 
     pub fn load_session(
@@ -253,100 +209,59 @@ impl Repository {
             .transpose()
     }
 
-    pub fn list_completed(
-        &self,
-        limit: u32,
-        offset: u32,
-    ) -> Result<Vec<SessionSummary>, RepositoryError> {
-        if limit == 0 || limit > MAX_HISTORY_PAGE_SIZE {
-            return Err(RepositoryError::InvalidPageSize(limit));
-        }
+    pub fn list_sessions(&self, limit: u32) -> Result<Vec<SessionMetadata>, RepositoryError> {
+        let limit = limit.clamp(1, MAX_SESSION_LIST_SIZE);
         let mut statement = self.connection.prepare(&format!(
-            "{} WHERE status = 'completed'
-             ORDER BY completed_at_ms DESC, id DESC LIMIT ?1 OFFSET ?2",
+            "{} ORDER BY last_opened_at_ms DESC, id DESC LIMIT ?1",
             session_metadata_query()
         ))?;
-        let rows = statement.query_map(params![limit, offset], raw_metadata_from_row)?;
-        let raw_metadata: Vec<_> = rows.collect::<Result<_, _>>()?;
-        drop(statement);
-
-        raw_metadata
-            .into_iter()
-            .map(|raw| {
-                let metadata = SessionMetadata::try_from(raw)?;
-                let total_presses = self.total_presses(metadata.id)?;
-                Ok(SessionSummary {
-                    metadata,
-                    total_presses,
-                })
-            })
-            .collect()
+        let rows = statement.query_map([limit], raw_metadata_from_row)?;
+        rows.map(|row| SessionMetadata::try_from(row?)).collect()
     }
 
-    pub fn delete_completed(&mut self, session_id: SessionId) -> Result<bool, RepositoryError> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed = transaction.execute(
-            "DELETE FROM sessions WHERE id = ?1 AND status = 'completed'",
-            [session_id.get()],
-        )?;
-        transaction.commit()?;
-        Ok(changed == 1)
-    }
-
-    pub fn discard_active(&mut self, session_id: SessionId) -> Result<bool, RepositoryError> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed = transaction.execute(
-            "DELETE FROM sessions WHERE id = ?1 AND status = 'active'",
-            [session_id.get()],
-        )?;
-        transaction.commit()?;
-        Ok(changed == 1)
-    }
-
-    pub fn apply_retention(
+    pub fn mark_opened(
         &mut self,
-        now_ms: i64,
-        retention: RetentionPolicy,
-    ) -> Result<usize, RepositoryError> {
-        let RetentionPolicy::Days(days @ (30 | 90 | 365)) = retention else {
-            return match retention {
-                RetentionPolicy::Forever => Ok(0),
-                RetentionPolicy::Days(_) => Err(RepositoryError::InvalidRetention),
-            };
-        };
-        let retention_ms = i64::from(days)
-            .checked_mul(MILLISECONDS_PER_DAY)
-            .ok_or(RepositoryError::InvalidRetention)?;
-        let cutoff = now_ms
-            .checked_sub(retention_ms)
-            .ok_or(RepositoryError::InvalidRetention)?;
+        session_id: SessionId,
+        opened_at_ms: i64,
+    ) -> Result<(), RepositoryError> {
+        validate_timestamp(opened_at_ms)?;
+        let changed = self.connection.execute(
+            "UPDATE sessions SET last_opened_at_ms = ?1 WHERE id = ?2",
+            params![opened_at_ms, session_id.get()],
+        )?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(RepositoryError::SessionNotFound(session_id.get()))
+        }
+    }
+
+    pub fn delete_session(&mut self, session_id: SessionId) -> Result<bool, RepositoryError> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed = transaction.execute(
-            "DELETE FROM sessions
-             WHERE status = 'completed' AND completed_at_ms < ?1",
-            [cutoff],
-        )?;
+        let deleted =
+            transaction.execute("DELETE FROM sessions WHERE id = ?1", [session_id.get()])?;
         transaction.commit()?;
-        Ok(changed)
+        Ok(deleted == 1)
+    }
+
+    #[cfg(test)]
+    pub fn delete_all_sessions(&mut self) -> Result<usize, RepositoryError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let deleted = transaction.execute("DELETE FROM sessions", [])?;
+        transaction.commit()?;
+        Ok(deleted)
     }
 
     pub fn reclaim_after_deletion(&self) -> Result<(), RepositoryError> {
-        let (busy, _, _): (i64, i64, i64) =
-            self.connection
-                .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                })?;
-        if busy != 0 {
-            return Err(RepositoryError::WalCheckpointBusy);
-        }
-        self.connection
-            .execute_batch("PRAGMA incremental_vacuum(64)")?;
+        self.connection.execute_batch(
+            "PRAGMA wal_checkpoint(TRUNCATE);
+             VACUUM;
+             PRAGMA optimize;",
+        )?;
         Ok(())
     }
 
@@ -356,54 +271,59 @@ impl Repository {
         let application_id: i64 =
             self.connection
                 .pragma_query_value(None, "application_id", |row| row.get(0))?;
-        if application_id != 0 && application_id != APPLICATION_ID {
-            return Err(RepositoryError::WrongApplicationId { application_id });
-        }
         let schema_version: i64 =
             self.connection
                 .pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if schema_version > DATABASE_SCHEMA_VERSION {
-            return Err(RepositoryError::NewerSchemaVersion {
-                supported: DATABASE_SCHEMA_VERSION,
-                actual: schema_version,
-            });
-        }
-        if application_id == 0 {
-            let schema_objects: i64 = self.connection.query_row(
-                "SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
-                [],
-                |row| row.get(0),
-            )?;
-            if schema_objects != 0 {
-                return Err(RepositoryError::UnidentifiedNonemptyDatabase);
-            }
-            self.connection
-                .pragma_update(None, "application_id", APPLICATION_ID)?;
-        }
+        let object_count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE name NOT LIKE 'sqlite_%'",
+            [],
+            |row| row.get(0),
+        )?;
 
-        self.connection.pragma_update(None, "foreign_keys", "ON")?;
-        self.connection.pragma_update(None, "secure_delete", "ON")?;
-        self.connection
-            .pragma_update(None, "synchronous", "NORMAL")?;
-        if persistent {
-            let journal_mode: String =
-                self.connection
-                    .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
-            if !journal_mode.eq_ignore_ascii_case("wal") {
-                return Err(RepositoryError::UnexpectedJournalMode(journal_mode));
-            }
-        }
-
-        if schema_version == 0 {
-            self.connection
-                .pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+        if application_id == 0 && schema_version == 0 && object_count == 0 {
             let transaction = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            transaction.execute_batch(SCHEMA_V1)?;
+            transaction.execute_batch(SCHEMA_V2)?;
+            transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
+            transaction.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)?;
             transaction.commit()?;
+        } else {
+            if application_id != APPLICATION_ID {
+                return Err(if application_id == 0 {
+                    RepositoryError::UnidentifiedDatabase(self.display_path())
+                } else {
+                    RepositoryError::WrongApplication {
+                        path: self.display_path(),
+                        actual: application_id,
+                    }
+                });
+            }
+            if schema_version != DATABASE_SCHEMA_VERSION {
+                return Err(RepositoryError::IncompatibleSchema {
+                    path: self.display_path(),
+                    actual: schema_version,
+                    expected: DATABASE_SCHEMA_VERSION,
+                });
+            }
+        }
+
+        self.connection.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             PRAGMA secure_delete = ON;
+             PRAGMA synchronous = NORMAL;",
+        )?;
+        if persistent {
+            self.connection.pragma_update(None, "journal_mode", "WAL")?;
         }
         Ok(())
+    }
+
+    fn display_path(&self) -> PathBuf {
+        self.path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("<in-memory database>"))
     }
 
     fn load_stored_session(
@@ -420,7 +340,9 @@ impl Repository {
     ) -> Result<Vec<StoredMetricSnapshot>, RepositoryError> {
         let mut statement = self.connection.prepare(
             "SELECT metric_id, metric_schema_version, payload_json
-             FROM metric_snapshots WHERE session_id = ?1 ORDER BY metric_id",
+             FROM metric_snapshots
+             WHERE session_id = ?1
+             ORDER BY metric_id",
         )?;
         let rows = statement.query_map([session_id.get()], |row| {
             Ok(StoredMetricSnapshot {
@@ -429,24 +351,16 @@ impl Repository {
                 payload_json: row.get(2)?,
             })
         })?;
-        rows.collect::<Result<_, _>>().map_err(Into::into)
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
+}
 
-    fn total_presses(&self, session_id: SessionId) -> Result<Option<u64>, RepositoryError> {
-        let stored: Option<(i64, String)> = self
-            .connection
-            .query_row(
-                "SELECT metric_schema_version, payload_json FROM metric_snapshots
-                 WHERE session_id = ?1 AND metric_id = 'total-presses'",
-                [session_id.get()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        Ok(stored
-            .filter(|(schema_version, _)| *schema_version == 1)
-            .and_then(|(_, payload)| serde_json::from_str::<TotalPressesPayload>(&payload).ok())
-            .map(|payload| payload.count))
+fn open_connection(path: &Path, create: bool) -> Result<Connection, RepositoryError> {
+    let mut flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    if create {
+        flags |= OpenFlags::SQLITE_OPEN_CREATE;
     }
+    Connection::open_with_flags(path, flags).map_err(Into::into)
 }
 
 fn write_metrics(
@@ -476,27 +390,21 @@ fn write_metrics(
 }
 
 fn validate_snapshot(snapshot: &SessionSnapshot) -> Result<(), RepositoryError> {
-    if snapshot.created_at_ms < 0 {
-        return Err(RepositoryError::InvalidSession(
-            "creation time must not precede the Unix epoch",
-        ));
-    }
-    if snapshot.updated_at_ms < snapshot.created_at_ms {
-        return Err(RepositoryError::InvalidSession(
-            "update time precedes creation time",
-        ));
-    }
+    validate_timestamp(snapshot.created_at_ms)?;
+    validate_timestamp(snapshot.updated_at_ms)?;
+    validate_timestamp(snapshot.last_opened_at_ms)?;
     if snapshot.captured_duration_ns < 0 {
-        return Err(RepositoryError::InvalidSession(
-            "capture duration must not be negative",
-        ));
+        return Err(RepositoryError::InvalidDuration);
     }
     if snapshot.application_version.is_empty()
         || snapshot.application_version.len() > MAX_APPLICATION_VERSION_BYTES
     {
-        return Err(RepositoryError::InvalidSession(
-            "application version is empty or too long",
-        ));
+        return Err(RepositoryError::InvalidApplicationVersion);
+    }
+    if let Some(name) = &snapshot.name
+        && (name.trim() != name || name.is_empty() || name.len() > MAX_SESSION_NAME_BYTES)
+    {
+        return Err(RepositoryError::InvalidSessionName);
     }
     if snapshot
         .keyboard
@@ -508,46 +416,54 @@ fn validate_snapshot(snapshot: &SessionSnapshot) -> Result<(), RepositoryError> 
             &snapshot.keyboard.layout,
             &snapshot.keyboard.variant,
         ]
-        .into_iter()
+        .iter()
         .any(|value| value.len() > MAX_KEYBOARD_VALUE_BYTES)
     {
-        return Err(RepositoryError::InvalidSession(
-            "keyboard metadata is too long",
-        ));
+        return Err(RepositoryError::InvalidKeyboardContext);
     }
     if snapshot.metrics.len() > MAX_SESSION_METRICS {
-        return Err(RepositoryError::InvalidSession(
-            "session contains too many metrics",
-        ));
+        return Err(RepositoryError::TooManyMetrics);
     }
     let mut metric_ids = HashSet::with_capacity(snapshot.metrics.len());
-    if snapshot
-        .metrics
-        .iter()
-        .any(|metric| !metric_ids.insert(metric.metric_id()))
-    {
-        return Err(RepositoryError::InvalidSession(
-            "session contains duplicate metric IDs",
-        ));
+    for metric in &snapshot.metrics {
+        if !metric_ids.insert(metric.metric_id()) {
+            return Err(RepositoryError::DuplicateMetric(
+                metric.metric_id().to_owned(),
+            ));
+        }
+        serde_json::from_str::<serde::de::IgnoredAny>(metric.payload_json()).map_err(|source| {
+            RepositoryError::InvalidMetricJson {
+                metric_id: metric.metric_id().to_owned(),
+                source,
+            }
+        })?;
     }
     Ok(())
 }
 
+fn validate_timestamp(value: i64) -> Result<(), RepositoryError> {
+    if value < 0 {
+        Err(RepositoryError::InvalidTimestamp)
+    } else {
+        Ok(())
+    }
+}
+
 fn session_metadata_query() -> &'static str {
     "SELECT
-        id, status, created_at_ms, updated_at_ms, completed_at_ms,
+        id, name, created_at_ms, updated_at_ms, last_opened_at_ms,
         captured_duration_ns, application_version, keyboard_name,
         xkb_model, xkb_layout, xkb_variant
      FROM sessions"
 }
 
-#[derive(Debug)]
+#[derive(Deserialize)]
 struct RawSessionMetadata {
     id: i64,
-    status: String,
+    name: Option<String>,
     created_at_ms: i64,
     updated_at_ms: i64,
-    completed_at_ms: Option<i64>,
+    last_opened_at_ms: i64,
     captured_duration_ns: i64,
     application_version: String,
     keyboard_name: Option<String>,
@@ -559,10 +475,10 @@ struct RawSessionMetadata {
 fn raw_metadata_from_row(row: &Row<'_>) -> rusqlite::Result<RawSessionMetadata> {
     Ok(RawSessionMetadata {
         id: row.get(0)?,
-        status: row.get(1)?,
+        name: row.get(1)?,
         created_at_ms: row.get(2)?,
         updated_at_ms: row.get(3)?,
-        completed_at_ms: row.get(4)?,
+        last_opened_at_ms: row.get(4)?,
         captured_duration_ns: row.get(5)?,
         application_version: row.get(6)?,
         keyboard_name: row.get(7)?,
@@ -576,49 +492,13 @@ impl TryFrom<RawSessionMetadata> for SessionMetadata {
     type Error = RepositoryError;
 
     fn try_from(raw: RawSessionMetadata) -> Result<Self, Self::Error> {
-        let id = SessionId::new(raw.id)
-            .ok_or(RepositoryError::InvalidStoredSession("invalid session ID"))?;
-        let status = match raw.status.as_str() {
-            "active" => SessionStatus::Active,
-            "completed" => SessionStatus::Completed,
-            _ => {
-                return Err(RepositoryError::InvalidStoredSession(
-                    "invalid session status",
-                ));
-            }
-        };
-        let completion_is_invalid = match (status, raw.completed_at_ms) {
-            (SessionStatus::Active, Some(_)) | (SessionStatus::Completed, None) => true,
-            (SessionStatus::Completed, Some(completed_at_ms)) => {
-                completed_at_ms < raw.updated_at_ms
-            }
-            (SessionStatus::Active, None) => false,
-        };
-        let keyboard_is_invalid = raw
-            .keyboard_name
-            .as_ref()
-            .is_some_and(|name| name.len() > MAX_KEYBOARD_NAME_BYTES)
-            || [&raw.xkb_model, &raw.xkb_layout, &raw.xkb_variant]
-                .into_iter()
-                .any(|value| value.len() > MAX_KEYBOARD_VALUE_BYTES);
-        if raw.created_at_ms < 0
-            || raw.updated_at_ms < raw.created_at_ms
-            || raw.captured_duration_ns < 0
-            || raw.application_version.is_empty()
-            || raw.application_version.len() > MAX_APPLICATION_VERSION_BYTES
-            || completion_is_invalid
-            || keyboard_is_invalid
-        {
-            return Err(RepositoryError::InvalidStoredSession(
-                "invalid session metadata",
-            ));
-        }
-        Ok(Self {
+        let id = SessionId::new(raw.id).ok_or(RepositoryError::InvalidStoredSession)?;
+        let metadata = Self {
             id,
-            status,
+            name: raw.name,
             created_at_ms: raw.created_at_ms,
             updated_at_ms: raw.updated_at_ms,
-            completed_at_ms: raw.completed_at_ms,
+            last_opened_at_ms: raw.last_opened_at_ms,
             captured_duration_ns: raw.captured_duration_ns,
             application_version: raw.application_version,
             keyboard: KeyboardContext {
@@ -627,45 +507,33 @@ impl TryFrom<RawSessionMetadata> for SessionMetadata {
                 layout: raw.xkb_layout,
                 variant: raw.xkb_variant,
             },
-        })
+        };
+        let validation_snapshot = SessionSnapshot {
+            id: Some(metadata.id),
+            name: metadata.name.clone(),
+            created_at_ms: metadata.created_at_ms,
+            updated_at_ms: metadata.updated_at_ms,
+            last_opened_at_ms: metadata.last_opened_at_ms,
+            captured_duration_ns: metadata.captured_duration_ns,
+            application_version: metadata.application_version.clone(),
+            keyboard: metadata.keyboard.clone(),
+            metrics: Vec::new(),
+        };
+        validate_snapshot(&validation_snapshot)
+            .map_err(|_| RepositoryError::InvalidStoredSession)?;
+        Ok(metadata)
     }
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TotalPressesPayload {
-    count: u64,
 }
 
 fn prepare_database_path(path: &Path) -> Result<(), RepositoryError> {
     let parent = path.parent().ok_or(RepositoryError::MissingParent)?;
-    ensure_private_directory(parent)?;
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() || !metadata.is_file() {
-                return Err(RepositoryError::UnsafeDatabasePath);
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(path)
-                .map_err(|source| RepositoryError::CreateDatabase { source })?;
-        }
-        Err(source) => return Err(RepositoryError::ReadMetadata { source }),
-    }
-    set_private_permissions(path, 0o600)
+    ensure_private_directory(parent)
 }
 
 fn ensure_private_directory(path: &Path) -> Result<(), RepositoryError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                return Err(RepositoryError::UnsafeDatabaseDirectory);
-            }
-        }
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Err(RepositoryError::NotDirectory(path.to_path_buf())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let mut builder = DirBuilder::new();
             builder.recursive(true).mode(0o700);
@@ -673,7 +541,12 @@ fn ensure_private_directory(path: &Path) -> Result<(), RepositoryError> {
                 .create(path)
                 .map_err(|source| RepositoryError::CreateDirectory { source })?;
         }
-        Err(source) => return Err(RepositoryError::ReadMetadata { source }),
+        Err(source) => {
+            return Err(RepositoryError::ReadMetadata {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
     }
     set_private_permissions(path, 0o700)
 }
@@ -685,24 +558,22 @@ fn set_private_permissions(path: &Path, mode: u32) -> Result<(), RepositoryError
 
 #[derive(Debug, Error)]
 pub enum RepositoryError {
+    #[error(transparent)]
+    Sqlite(#[from] rusqlite::Error),
     #[error("database path has no parent directory")]
     MissingParent,
-    #[error("database path is a symbolic link or not a regular file")]
-    UnsafeDatabasePath,
-    #[error("database directory is a symbolic link or not a directory")]
-    UnsafeDatabaseDirectory,
+    #[error("database path is not a regular file: {0}")]
+    NotRegularFile(PathBuf),
+    #[error("database directory path is not a directory: {0}")]
+    NotDirectory(PathBuf),
+    #[error("failed to read database path metadata: {path}")]
+    ReadMetadata {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("failed to create private database directory")]
     CreateDirectory {
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to create private database file")]
-    CreateDatabase {
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to read database path metadata")]
-    ReadMetadata {
         #[source]
         source: std::io::Error,
     },
@@ -711,28 +582,46 @@ pub enum RepositoryError {
         #[source]
         source: std::io::Error,
     },
-    #[error("SQLite operation failed")]
-    Sqlite(#[from] rusqlite::Error),
-    #[error("database belongs to another application (application_id={application_id})")]
-    WrongApplicationId { application_id: i64 },
-    #[error("nonempty database has no evtap application identity")]
-    UnidentifiedNonemptyDatabase,
-    #[error("database schema version {actual} is newer than supported version {supported}")]
-    NewerSchemaVersion { supported: i64, actual: i64 },
-    #[error("SQLite selected unexpected journal mode {0}")]
-    UnexpectedJournalMode(String),
-    #[error("invalid session snapshot: {0}")]
-    InvalidSession(&'static str),
-    #[error("stored session is invalid: {0}")]
-    InvalidStoredSession(&'static str),
-    #[error("session {0:?} is not active")]
-    SessionNotActive(SessionId),
-    #[error("history page size {0} is invalid")]
-    InvalidPageSize(u32),
-    #[error("retention interval is invalid")]
-    InvalidRetention,
-    #[error("SQLite WAL checkpoint remained busy")]
-    WalCheckpointBusy,
+    #[error("nonempty database has no evtap application identity: {0}")]
+    UnidentifiedDatabase(PathBuf),
+    #[error("database belongs to another application ({actual:#x}): {path}")]
+    WrongApplication { path: PathBuf, actual: i64 },
+    #[error(
+        "the evtap database at {path} uses incompatible schema {actual}; expected {expected}. Move or delete it to start fresh"
+    )]
+    IncompatibleSchema {
+        path: PathBuf,
+        actual: i64,
+        expected: i64,
+    },
+    #[error("session name is invalid")]
+    InvalidSessionName,
+    #[error("another saved session already uses that name")]
+    DuplicateSessionName,
+    #[error("session timestamp is invalid")]
+    InvalidTimestamp,
+    #[error("captured duration is invalid")]
+    InvalidDuration,
+    #[error("application version is invalid")]
+    InvalidApplicationVersion,
+    #[error("keyboard context is invalid")]
+    InvalidKeyboardContext,
+    #[error("session has too many metrics")]
+    TooManyMetrics,
+    #[error("session contains duplicate metric {0}")]
+    DuplicateMetric(String),
+    #[error("metric {metric_id} contains invalid JSON")]
+    InvalidMetricJson {
+        metric_id: String,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("stored session metadata is invalid")]
+    InvalidStoredSession,
+    #[error("database generated an invalid session ID")]
+    InvalidGeneratedSessionId,
+    #[error("saved session {0} does not exist")]
+    SessionNotFound(i64),
 }
 
 #[cfg(test)]
@@ -747,39 +636,39 @@ mod tests {
 
     use crate::{
         metric::MetricSnapshot,
-        session::{KeyboardContext, SessionSnapshot, SessionStatus},
-        settings::RetentionPolicy,
+        session::{KeyboardContext, SessionId, SessionSnapshot},
     };
 
     use super::{APPLICATION_ID, DATABASE_SCHEMA_VERSION, Repository, RepositoryError};
 
-    fn snapshot(id: Option<crate::session::SessionId>, updated_at_ms: i64) -> SessionSnapshot {
+    fn snapshot(id: Option<SessionId>, name: Option<&str>, now: i64) -> SessionSnapshot {
         SessionSnapshot {
             id,
-            created_at_ms: 1_000,
-            updated_at_ms,
-            captured_duration_ns: 500_000_000,
+            name: name.map(str::to_owned),
+            created_at_ms: 1,
+            updated_at_ms: now,
+            last_opened_at_ms: now,
+            captured_duration_ns: 42,
             application_version: "0.2.0-dev".to_owned(),
             keyboard: KeyboardContext {
-                display_name: Some("Test Keyboard".to_owned()),
+                display_name: Some("Keyboard".to_owned()),
                 model: "pc105".to_owned(),
-                layout: "de".to_owned(),
+                layout: "us".to_owned(),
                 variant: String::new(),
             },
             metrics: vec![
-                MetricSnapshot::from_json("total-presses", 1, r#"{"count":12}"#.to_owned())
-                    .unwrap(),
-                MetricSnapshot::from_json("unknown-future", 3, "{}".to_owned()).unwrap(),
+                MetricSnapshot::from_json("total-presses", 1, r#"{"count":3}"#.to_owned()).unwrap(),
             ],
         }
     }
 
     #[test]
-    fn creates_private_database_with_expected_schema() {
+    fn creates_private_database_with_redesigned_schema() {
         let temporary = tempdir().unwrap();
-        let path = temporary.path().join("data/evtap.sqlite3");
+        let path = temporary.path().join("data/evtap/evtap.sqlite3");
         let repository = Repository::open(path.clone()).unwrap();
 
+        assert!(repository.list_sessions(10).unwrap().is_empty());
         assert_eq!(
             fs::metadata(path.parent().unwrap())
                 .unwrap()
@@ -792,256 +681,205 @@ mod tests {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        let application_id: i64 = repository
-            .connection
-            .pragma_query_value(None, "application_id", |row| row.get(0))
-            .unwrap();
-        let schema_version: i64 = repository
-            .connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(application_id, APPLICATION_ID);
-        assert_eq!(schema_version, DATABASE_SCHEMA_VERSION);
-    }
-
-    #[test]
-    fn rejects_symlinked_database_without_modifying_its_target() {
-        let temporary = tempdir().unwrap();
-        let target = temporary.path().join("target.sqlite3");
-        let path = temporary.path().join("evtap.sqlite3");
-        fs::write(&target, b"sensitive target").unwrap();
-        symlink(&target, &path).unwrap();
-
-        assert!(matches!(
-            Repository::open(path),
-            Err(RepositoryError::UnsafeDatabasePath)
-        ));
-        assert_eq!(fs::read(target).unwrap(), b"sensitive target");
-    }
-
-    #[test]
-    fn checkpoints_and_restores_active_session_without_dropping_unknown_metrics() {
-        let mut repository = Repository::open_in_memory().unwrap();
-        let first = snapshot(None, 2_000);
-        let session_id = repository.checkpoint(&first).unwrap();
-
-        let stored = repository.load_active().unwrap().unwrap();
-        assert_eq!(stored.metadata.id, session_id);
-        assert_eq!(stored.metadata.status, SessionStatus::Active);
-        assert_eq!(stored.metrics.len(), 2);
-
-        let mut second = snapshot(Some(session_id), 3_000);
-        second.metrics.truncate(1);
-        repository.checkpoint(&second).unwrap();
-        let stored = repository.load_active().unwrap().unwrap();
-        assert_eq!(stored.metrics.len(), 2);
-        assert!(
-            stored
-                .metrics
-                .iter()
-                .any(|metric| metric.metric_id == "unknown-future")
-        );
-    }
-
-    #[test]
-    fn database_enforces_a_single_active_session() {
-        let mut repository = Repository::open_in_memory().unwrap();
-        let first_id = repository.checkpoint(&snapshot(None, 2_000)).unwrap();
-
-        assert!(matches!(
-            repository.checkpoint(&snapshot(None, 3_000)),
-            Err(RepositoryError::Sqlite(_))
-        ));
+        let connection = Connection::open(path).unwrap();
         assert_eq!(
-            repository.load_active().unwrap().unwrap().metadata.id,
-            first_id
+            connection
+                .pragma_query_value(None, "application_id", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            APPLICATION_ID
+        );
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            DATABASE_SCHEMA_VERSION
         );
     }
 
     #[test]
-    fn checkpoint_validation_is_atomic() {
+    fn saves_lists_and_restores_multiple_mutable_sessions() {
         let mut repository = Repository::open_in_memory().unwrap();
-        let mut invalid = snapshot(None, 2_000);
-        invalid.metrics.push(invalid.metrics[0].clone());
+        let home = repository.save(&snapshot(None, Some("Home"), 10)).unwrap();
+        let work = repository.save(&snapshot(None, Some("Work"), 20)).unwrap();
 
-        assert!(matches!(
-            repository.checkpoint(&invalid),
-            Err(RepositoryError::InvalidSession(_))
-        ));
-        assert!(repository.load_active().unwrap().is_none());
+        let mut changed = snapshot(Some(home), Some("Home"), 30);
+        changed.metrics[0] =
+            MetricSnapshot::from_json("total-presses", 1, r#"{"count":9}"#.to_owned()).unwrap();
+        repository.save(&changed).unwrap();
+
+        let sessions = repository.list_sessions(10).unwrap();
+        assert_eq!(
+            sessions.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![home, work]
+        );
+        let restored = repository.load_session(home).unwrap().unwrap();
+        assert_eq!(restored.metadata.name.as_deref(), Some("Home"));
+        assert_eq!(restored.metrics[0].payload_json, r#"{"count":9}"#);
     }
 
     #[test]
-    fn sqlite_failure_rolls_back_the_whole_checkpoint() {
+    fn permits_untitled_sessions_but_rejects_duplicate_nonempty_names() {
         let mut repository = Repository::open_in_memory().unwrap();
+        repository.save(&snapshot(None, None, 10)).unwrap();
+        repository.save(&snapshot(None, None, 11)).unwrap();
+        repository.save(&snapshot(None, Some("Home"), 12)).unwrap();
+
+        assert!(matches!(
+            repository.save(&snapshot(None, Some("Home"), 13)),
+            Err(RepositoryError::DuplicateSessionName)
+        ));
+        assert_eq!(repository.list_sessions(10).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn preserves_unknown_metrics_during_later_saves() {
+        let mut repository = Repository::open_in_memory().unwrap();
+        let id = repository.save(&snapshot(None, None, 10)).unwrap();
         repository
             .connection
-            .execute_batch(
-                "CREATE TRIGGER fail_metric_insert
-                 BEFORE INSERT ON metric_snapshots
-                 BEGIN SELECT RAISE(ABORT, 'injected checkpoint failure'); END;",
+            .execute(
+                "INSERT INTO metric_snapshots VALUES (?1, 'future', 1, '{}', 10)",
+                [id.get()],
             )
             .unwrap();
 
-        assert!(matches!(
-            repository.checkpoint(&snapshot(None, 2_000)),
-            Err(RepositoryError::Sqlite(_))
-        ));
-        let session_count: i64 = repository
-            .connection
-            .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
-            .unwrap();
-        let metric_count: i64 = repository
-            .connection
-            .query_row("SELECT count(*) FROM metric_snapshots", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!((session_count, metric_count), (0, 0));
-    }
+        repository.save(&snapshot(Some(id), None, 20)).unwrap();
 
-    #[test]
-    fn finalizes_lists_retains_and_deletes_sessions() {
-        let mut repository = Repository::open_in_memory().unwrap();
-        let session_id = repository.checkpoint(&snapshot(None, 2_000)).unwrap();
-        repository
-            .finalize(&snapshot(Some(session_id), 3_000), 4_000)
-            .unwrap();
-
-        assert!(repository.load_active().unwrap().is_none());
-        let history = repository.list_completed(50, 0).unwrap();
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].metadata.status, SessionStatus::Completed);
-        assert_eq!(history[0].total_presses, Some(12));
-        let active_id = repository.checkpoint(&snapshot(None, 5_000)).unwrap();
-        assert_eq!(
-            repository
-                .apply_retention(4_000, RetentionPolicy::Forever)
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            repository
-                .apply_retention(90 * 86_400_000 + 4_001, RetentionPolicy::Days(90))
-                .unwrap(),
-            1
-        );
-        assert!(repository.load_session(session_id).unwrap().is_none());
-        assert_eq!(
-            repository.load_active().unwrap().unwrap().metadata.id,
-            active_id
-        );
-    }
-
-    #[test]
-    fn completed_history_is_paginated_newest_first() {
-        let mut repository = Repository::open_in_memory().unwrap();
-        let mut completed = Vec::new();
-        for (updated_at_ms, completed_at_ms) in [(2_000, 3_000), (4_000, 5_000), (6_000, 7_000)] {
-            let session_id = repository
-                .checkpoint(&snapshot(None, updated_at_ms))
-                .unwrap();
-            repository
-                .finalize(&snapshot(Some(session_id), updated_at_ms), completed_at_ms)
-                .unwrap();
-            completed.push(session_id);
-        }
-
-        let first_page = repository.list_completed(2, 0).unwrap();
-        let second_page = repository.list_completed(2, 2).unwrap();
-
-        assert_eq!(
-            first_page
+        let restored = repository.load_session(id).unwrap().unwrap();
+        assert!(
+            restored
+                .metrics
                 .iter()
-                .map(|summary| summary.metadata.id)
-                .collect::<Vec<_>>(),
-            vec![completed[2], completed[1]]
+                .any(|metric| metric.metric_id == "future")
         );
-        assert_eq!(second_page.len(), 1);
-        assert_eq!(second_page[0].metadata.id, completed[0]);
     }
 
     #[test]
-    fn failed_migration_rolls_back_schema_and_version() {
+    fn validation_failure_does_not_partially_update() {
+        let mut repository = Repository::open_in_memory().unwrap();
+        let id = repository
+            .save(&snapshot(None, Some("Before"), 10))
+            .unwrap();
+        let mut invalid = snapshot(Some(id), Some("After"), 20);
+        invalid.metrics.push(invalid.metrics[0].clone());
+
+        assert!(matches!(
+            repository.save(&invalid),
+            Err(RepositoryError::DuplicateMetric(_))
+        ));
+        assert_eq!(
+            repository
+                .load_session(id)
+                .unwrap()
+                .unwrap()
+                .metadata
+                .name
+                .as_deref(),
+            Some("Before")
+        );
+    }
+
+    #[test]
+    fn sqlite_failure_rolls_back_metadata_and_all_metric_changes() {
+        let mut repository = Repository::open_in_memory().unwrap();
+        let id = repository
+            .save(&snapshot(None, Some("Before"), 10))
+            .unwrap();
+        repository
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_metric_update
+                 BEFORE UPDATE ON metric_snapshots
+                 BEGIN
+                     SELECT RAISE(FAIL, 'injected metric failure');
+                 END;",
+            )
+            .unwrap();
+        let mut changed = snapshot(Some(id), Some("After"), 20);
+        changed.metrics[0] =
+            MetricSnapshot::from_json("total-presses", 1, r#"{"count":99}"#.to_owned()).unwrap();
+
+        assert!(repository.save(&changed).is_err());
+
+        let restored = repository.load_session(id).unwrap().unwrap();
+        assert_eq!(restored.metadata.name.as_deref(), Some("Before"));
+        assert_eq!(restored.metadata.updated_at_ms, 10);
+        assert_eq!(restored.metrics[0].payload_json, r#"{"count":3}"#);
+    }
+
+    #[test]
+    fn deletes_sessions_transactionally() {
+        let mut repository = Repository::open_in_memory().unwrap();
+        let first = repository.save(&snapshot(None, Some("One"), 10)).unwrap();
+        repository.save(&snapshot(None, Some("Two"), 20)).unwrap();
+
+        assert!(repository.delete_session(first).unwrap());
+        assert_eq!(repository.list_sessions(10).unwrap().len(), 1);
+        assert_eq!(repository.delete_all_sessions().unwrap(), 1);
+        assert!(repository.list_sessions(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rejects_any_incompatible_schema_generically_without_modifying_it() {
         let temporary = tempdir().unwrap();
-        let path = temporary.path().join("migration.sqlite3");
+        let path = temporary.path().join("evtap.sqlite3");
         let connection = Connection::open(&path).unwrap();
         connection
             .pragma_update(None, "application_id", APPLICATION_ID)
             .unwrap();
+        connection.pragma_update(None, "user_version", 1).unwrap();
         connection
-            .execute("CREATE TABLE sessions (sentinel TEXT NOT NULL)", [])
-            .unwrap();
-        connection
-            .execute("INSERT INTO sessions VALUES ('preserved')", [])
+            .execute("CREATE TABLE old_experiment (value)", [])
             .unwrap();
         drop(connection);
+        let original = fs::read(&path).unwrap();
 
         assert!(matches!(
-            Repository::open(path.clone()),
-            Err(RepositoryError::Sqlite(_))
+            Repository::open_existing(path.clone()),
+            Err(RepositoryError::IncompatibleSchema { actual: 1, .. })
         ));
-
-        let connection = Connection::open(path).unwrap();
-        let schema_version: i64 = connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        let sentinel: String = connection
-            .query_row("SELECT sentinel FROM sessions", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(schema_version, 0);
-        assert_eq!(sentinel, "preserved");
+        assert_eq!(fs::read(path).unwrap(), original);
     }
 
     #[test]
-    fn rejects_wrong_application_and_newer_schema_without_modifying_them() {
+    fn rejects_foreign_future_and_unidentified_databases_non_destructively() {
         let temporary = tempdir().unwrap();
-        let wrong_path = temporary.path().join("wrong.sqlite3");
-        let wrong = Connection::open(&wrong_path).unwrap();
-        wrong.pragma_update(None, "application_id", 1234).unwrap();
-        drop(wrong);
-        assert!(matches!(
-            Repository::open(wrong_path.clone()),
-            Err(RepositoryError::WrongApplicationId {
-                application_id: 1234
-            })
-        ));
-        let wrong = Connection::open(wrong_path).unwrap();
-        assert_eq!(
-            wrong
-                .pragma_query_value::<i64, _>(None, "application_id", |row| row.get(0))
-                .unwrap(),
-            1234
-        );
+        for (name, application_id, version) in [
+            ("foreign.sqlite3", 7, DATABASE_SCHEMA_VERSION),
+            (
+                "future.sqlite3",
+                APPLICATION_ID,
+                DATABASE_SCHEMA_VERSION + 1,
+            ),
+            ("unidentified.sqlite3", 0, 0),
+        ] {
+            let path = temporary.path().join(name);
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute("CREATE TABLE existing_data (value)", [])
+                .unwrap();
+            connection
+                .pragma_update(None, "application_id", application_id)
+                .unwrap();
+            connection
+                .pragma_update(None, "user_version", version)
+                .unwrap();
+            drop(connection);
+            let original = fs::read(&path).unwrap();
 
-        let unidentified_path = temporary.path().join("unidentified.sqlite3");
-        let unidentified = Connection::open(&unidentified_path).unwrap();
-        unidentified
-            .execute("CREATE TABLE foreign_data (value INTEGER)", [])
-            .unwrap();
-        drop(unidentified);
-        assert!(matches!(
-            Repository::open(unidentified_path),
-            Err(RepositoryError::UnidentifiedNonemptyDatabase)
-        ));
+            assert!(Repository::open_existing(path.clone()).is_err());
+            assert_eq!(fs::read(path).unwrap(), original);
+        }
+    }
 
-        let newer_path = temporary.path().join("newer.sqlite3");
-        let newer = Connection::open(&newer_path).unwrap();
-        newer
-            .pragma_update(None, "application_id", APPLICATION_ID)
-            .unwrap();
-        newer.pragma_update(None, "user_version", 99).unwrap();
-        drop(newer);
-        assert!(matches!(
-            Repository::open(newer_path.clone()),
-            Err(RepositoryError::NewerSchemaVersion { actual: 99, .. })
-        ));
-        let newer = Connection::open(newer_path).unwrap();
-        assert_eq!(
-            newer
-                .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
-                .unwrap(),
-            99
-        );
+    #[test]
+    fn allows_a_symlinked_database_path() {
+        let temporary = tempdir().unwrap();
+        let target = temporary.path().join("target.sqlite3");
+        let link = temporary.path().join("evtap.sqlite3");
+        drop(Repository::open(target.clone()).unwrap());
+        symlink(&target, &link).unwrap();
+
+        assert!(Repository::open_existing(link).unwrap().is_some());
     }
 }

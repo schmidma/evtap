@@ -6,40 +6,40 @@ evtap opens a Linux evdev keyboard device and can observe global input from that
 
 Only run binaries you trust. Prefer releases produced by this repository's GitHub Actions workflow, verify the published SHA-256 checksum, or build and inspect the source yourself.
 
-## Privacy modes
+## In-memory sessions and disk saves
 
-Aggregate persistence is **off by default**. In this mode, session state exists only in process memory and is discarded when the process exits.
+evtap always processes one mutable working session in memory. Session creation, capture, pause, rename, reset, and switching are ordinary application behavior rather than a separate persistence mode.
 
-Persistence can be enabled only through an explicit in-app disclosure. It is local and unencrypted. Opting in changes the privacy boundary because labels such as characters, character pairs, correction pairs, and physical-key usage may reveal information about what was typed even though they are unordered aggregates.
+A session is written to disk only by **Save now** or autosave. Before the first analytics write, evtap explains that aggregate labels remain sensitive and the database is local and unencrypted. The acknowledgement is remembered so the warning is not shown repeatedly.
 
-Disabling persistence requires resolving any active persisted session: either finish it and keep its completed history, or delete all stored analytics. A persisted active row is not silently abandoned.
+Autosave is off by default. When off, dirty session switches and normal close offer Save, Discard, or Cancel. When on, evtap saves periodically and at Stop, switch, and close boundaries. Existing saved sessions can be loaded regardless of the autosave setting.
 
 ## Capture and processing flow
 
 1. The scanner inspects readable `/dev/input/event*` devices and lists interfaces that expose a basic keyboard key set.
-2. Capture begins only after the user selects a keyboard and chooses **Start listening**. Recovery never starts capture automatically.
+2. Capture begins only after the user selects a keyboard and chooses **Start listening**. Loading a session never starts capture automatically.
 3. Linux key events are converted into an internal event containing physical identity, event kind, timestamp, and optional XKB-produced text.
-4. Metrics consume the event synchronously and retain aggregates or bounded transient state.
+4. Metrics consume the event synchronously and retain aggregates or bounded in-flight context.
 5. The normalized event is dropped after processing. The storage module cannot receive it.
-6. If persistence is enabled and the session is dirty, the UI serializes complete aggregate snapshots and sends those snapshots to a dedicated SQLite worker.
+6. A manual or automatic save serializes complete durable aggregate snapshots and sends them to a dedicated SQLite worker.
 
 ## Retained in memory
 
 Most metrics retain counts and accumulated durations. Text-oriented aggregates retain labels such as characters or character pairs because those labels are the analyzed dimension.
 
-Correction inference additionally retains up to ten recent text fragments so that Backspace can be associated with recently produced text. Timing metrics retain short-lived press or release context. These buffers exist only in process memory and are cleared on discard, finish, or restart.
+Correction inference additionally retains up to ten recent text fragments so Backspace can be associated with recently produced text. Timing metrics retain short-lived press or release context. This in-flight context is cleared on Stop, session switch, listener failure, and process exit or restart.
 
 Therefore, "no raw history" does not mean process memory contains no text. Anyone able to inspect evtap's memory may be able to recover aggregate labels and transient analysis state.
 
-## Persisted aggregate analytics
+## Saved aggregate analytics
 
-When persistence is enabled, `evtap.sqlite3` may contain:
+`evtap.sqlite3` may contain:
 
-- local session IDs and active/completed state;
-- UTC creation, update, and completion times for sessions;
+- local session IDs and optional names;
+- UTC creation, update, and most-recently-opened times;
 - accumulated capture duration;
 - evtap version;
-- keyboard display name and selected XKB model, layout, and variant;
+- the most recently used keyboard display name and XKB model, layout, and variant;
 - total physical press count;
 - physical key code, display label, and count;
 - deletion labels/counts and inferred deleted-to-typed pair/count aggregates;
@@ -47,27 +47,29 @@ When persistence is enabled, `evtap.sqlite3` may contain:
 - bigram labels with accumulated durations and sample counts;
 - unknown versioned metric rows retained for forward compatibility.
 
-These aggregates are sensitive. Character and pair dimensions may reveal frequently typed fragments, correction habits, or keyboard use patterns. Session timestamps and durations reveal when and for how long capture occurred.
+These aggregates are sensitive. Character and pair dimensions may reveal frequently typed fragments, correction habits, or keyboard-use patterns. Session timestamps and durations reveal when and for how long capture occurred.
 
-## Never persisted
+Saved sessions remain mutable and resumable until explicitly deleted. There is no completed-session history or automatic retention.
 
-evtap's persistence boundary never accepts or stores:
+## Never saved
+
+evtap's storage boundary never accepts or stores:
 
 - raw evdev or normalized key events;
 - an ordered keystroke or text stream;
 - per-event timestamps;
 - device paths;
-- pressed-key state or press timestamps;
+- pressed-key state or unfinished press timestamps;
 - recent correction history or a pending deletion;
 - previous press/release timing context;
-- window-widget memory containing analytics;
+- arbitrary window-widget memory containing analytics;
 - captured labels or payloads in logs.
 
-No timing or correction sample is allowed to bridge a restart.
+No timing, adjacency, dwell, or correction observation can bridge Stop, a session switch, listener failure, or process restart. Restored metrics continue cumulative aggregate totals but begin fresh in-flight context.
 
 ## Files and permissions
 
-On Linux, the expected files are:
+Expected Linux files are:
 
 ```text
 $XDG_CONFIG_HOME/evtap/settings.json
@@ -77,27 +79,25 @@ $XDG_DATA_HOME/evtap/evtap.sqlite3
 
 with `~/.config/evtap` and `~/.local/share/evtap` fallbacks.
 
-- `settings.json` stores the settings schema version, persistence consent, retention choice, and XKB preferences. It is written atomically.
-- `app.ron` is owned by eframe and contains native window state only. Arbitrary egui widget memory is disabled.
-- `evtap.sqlite3` and its temporary WAL/shared-memory sidecars store aggregate analytics.
+- `settings.json` stores the settings schema version, disclosure acknowledgement, autosave preference, last-selected session ID, and fallback XKB preferences. It is written atomically and contains no analytics.
+- `app.ron` is owned by eframe and contains native window state only. Arbitrary egui widget-memory persistence is disabled.
+- `evtap.sqlite3` and its WAL/shared-memory sidecars store saved session metadata and aggregate snapshots.
 
-evtap creates or tightens its settings/data directories to mode `0700` and settings/database files to mode `0600`. It rejects symbolic links at critical settings and database paths. These controls reduce accidental access but do not protect against the same user, root, compromised processes, filesystem snapshots, backups, or copied files.
+evtap creates or tightens its settings/data directories to mode `0700` and settings/database files to mode `0600`. It uses normal operating-system path and symbolic-link resolution; it does not promise a special no-symlink policy. Permissions reduce access by other unprivileged local users but do not protect against the same user, root, compromised processes, filesystem snapshots, backups, or copied files.
 
 The analytics database is not encrypted. Encryption without a defensible key-management design would provide misleading protection.
 
-## Retention, checkpoints, and deletion
+## Saves, crashes, and deletion
 
-Completed sessions default to 90-day retention. The available choices are 30, 90, or 365 days, or forever. Retention uses completion time and never deletes an active session.
+**Save now** creates an explicit durability boundary. With autosave enabled, dirty state is also saved approximately every 30 seconds during continuous capture and after Stop, before switching sessions, and during graceful close. A crash or power loss can discard changes after the latest acknowledged transaction.
 
-Dirty active sessions are checkpointed approximately every 30 seconds during continuous capture, immediately after Stop, as part of Finish, and during graceful shutdown. A crash or power loss can discard changes after the latest committed transaction.
+Deleting a saved session transactionally removes its metric snapshots through SQLite foreign-key cascading. **Delete all saved sessions** closes SQLite and removes the database, WAL, shared-memory, and rollback-journal files. SQLite secure deletion and best-effort page reclamation are enabled, but deletion cannot erase copies in backups, snapshots, SSD remapping, or forensic storage layers.
 
-Deleting a session transactionally removes its metric snapshots through SQLite foreign-key cascading. **Delete all stored analytics** closes SQLite and removes the database, WAL, shared-memory, and rollback-journal files before optionally creating a new empty database. SQLite secure deletion and best-effort page reclamation are enabled, but deletion cannot erase copies in backups, snapshots, SSD remapping, or forensic storage layers.
-
-Corrupt, unidentified, or newer-schema databases are not automatically replaced, downgraded, renamed, or truncated. Settings with an unsupported schema use persistence-off defaults in memory and are not overwritten automatically.
+Corrupt, unidentified, or incompatible-schema databases are not automatically replaced, downgraded, renamed, or truncated. The current unreleased experimental schema has no migration: move or delete it manually to start fresh. Unsupported settings files likewise remain untouched.
 
 ## Network and logging
 
-evtap initiates no telemetry, synchronization, cloud, crash-reporting, or metric-export requests. It has no account system. The GUI and dependencies may interact with local windowing, accessibility, timezone, and desktop services required to display the application.
+evtap initiates no telemetry, synchronization, cloud, crash-reporting, or metric-export requests. It has no account system. The GUI and dependencies may interact with local windowing, timezone, and desktop services required to display the application.
 
 Logs may contain operation names, safe filesystem/device paths, and payload-free errors. They must not contain captured key codes, produced text, aggregate labels, or serialized metric payloads.
 

@@ -66,7 +66,7 @@ A disconnect, suspend/resume transition, permission change, or kernel read failu
 
 ## A saved session does not load
 
-Persistence is opt-in. Confirm that **Local aggregate history** says Enabled and inspect the error shown beside the storage status.
+Inspect the session storage status and error shown in the Session panel. evtap loads only the ID recorded as the last-selected saved session. If that session was deleted, evtap deliberately starts a new **Untitled session** rather than choosing an unexpected older session.
 
 Expected paths are:
 
@@ -82,13 +82,13 @@ ls -ld ~/.config/evtap ~/.local/share/evtap
 ls -l ~/.config/evtap/settings.json ~/.local/share/evtap/evtap.sqlite3*
 ```
 
-Do not replace a storage error by deleting files until deciding whether the existing aggregate history matters. evtap deliberately refuses to overwrite corrupt databases, databases belonging to another application, and newer schema versions. Keep a private copy before investigating. Never attach a real analytics database to a public issue; aggregate labels are sensitive.
+Do not replace a storage error by deleting files until deciding whether the existing saved sessions matter. evtap deliberately refuses to overwrite corrupt databases, databases belonging to another application, and incompatible schema versions. The unreleased experimental persistence schema is not migrated; move or delete that development database manually. Keep a private copy before investigating. Never attach a real analytics database to a public issue because aggregate labels are sensitive.
 
-A recovered active session is always paused. Because device paths are never stored, select the matching keyboard again before restarting capture.
+A restored session is always paused. The remembered keyboard name may preselect one unique match, but device paths are never stored. Select any intended readable keyboard before restarting capture.
 
 ## Settings cannot be loaded or changed
 
-Malformed or newer-version `settings.json` files cause evtap to use persistence-off defaults without overwriting the existing file. The UI then refuses preference changes until the file is fixed or deliberately moved aside.
+Malformed or unsupported-version `settings.json` files cause evtap to use safe defaults without overwriting the existing file. The UI then refuses preference changes until the file is fixed or deliberately moved aside.
 
 If preserving it matters, copy it privately before editing. Otherwise, with evtap stopped:
 
@@ -96,17 +96,17 @@ If preserving it matters, copy it privately before editing. Otherwise, with evta
 mv ~/.config/evtap/settings.json ~/.config/evtap/settings.json.backup
 ```
 
-Restarting uses defaults. Treat the backup as private because it records persistence consent and keyboard preferences.
+Restarting uses defaults. Treat the backup as private because it records the storage-disclosure acknowledgement, autosave, last-selected session ID, and keyboard preferences.
 
 ## Saves fail or remain dirty
 
 A storage failure never stops capture or clears in-memory metrics. Check free space, ownership, permissions, read-only filesystem state, and whether another process has replaced the database path. Use **Retry storage operation** after correcting the cause; retry serializes a fresh snapshot of the latest aggregates.
 
-On graceful exit evtap waits only for a bounded final save. A timeout or forced process termination can lose changes after the most recent committed checkpoint. Do not assume the **Saved** label until the worker has acknowledged the current generation.
+With autosave enabled, normal close waits only for a bounded final save. With autosave disabled, a dirty close offers Save, Exit without saving, or Cancel. A timeout or forced process termination can lose changes after the most recent acknowledged save. Do not assume the **Saved** label until the worker has acknowledged the current generation.
 
-## Retention or deletion appears incomplete
+## Deletion appears incomplete
 
-Retention applies to completed-session completion time and never removes the active session. Individual deletion and retention are transactional, then request SQLite WAL checkpoint/page reclamation. **Delete all stored analytics** closes SQLite and removes the database plus `-wal`, `-shm`, and rollback-journal sidecars.
+Individual session deletion is transactional and immediate even when autosave is off. **Delete all saved sessions** closes SQLite and removes the database plus `-wal`, `-shm`, and rollback-journal sidecars. There is no automatic retention policy.
 
 The UI reports filesystem failures, but evtap cannot erase copies held by backups, filesystem snapshots, SSD remapping, or other storage layers. Stop evtap before manually inspecting or moving SQLite files, and keep the database and sidecars together.
 

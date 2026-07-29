@@ -34,10 +34,10 @@ impl AppPaths {
     }
 
     pub fn prepare_data_dir(&self) -> Result<(), AppPathsError> {
-        match fs::symlink_metadata(&self.data_dir) {
+        match fs::metadata(&self.data_dir) {
             Ok(metadata) => {
-                if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                    return Err(AppPathsError::UnsafeDataDirectory);
+                if !metadata.is_dir() {
+                    return Err(AppPathsError::NotDataDirectory);
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -70,8 +70,8 @@ impl AppPaths {
 pub enum AppPathsError {
     #[error("could not determine configuration and data directories")]
     DirectoriesUnavailable,
-    #[error("application data path is a symbolic link or not a directory")]
-    UnsafeDataDirectory,
+    #[error("application data path is not a directory")]
+    NotDataDirectory,
     #[error("failed to read application data directory metadata")]
     ReadDataDirectory {
         #[source]

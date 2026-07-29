@@ -226,6 +226,11 @@ impl Metric for ErrorRate {
         Ok(())
     }
 
+    fn clear_in_flight(&mut self) {
+        self.history.clear();
+        self.pending_deleted = None;
+    }
+
     fn reset(&mut self) {
         *self = Self::default();
     }
@@ -275,6 +280,21 @@ mod tests {
             metric.confusions.get(&("o".to_owned(), "p".to_owned())),
             Some(&1)
         );
+    }
+
+    #[test]
+    fn clearing_in_flight_context_drops_recent_text_and_pending_correction() {
+        let mut metric = ErrorRate::default();
+        metric.process(&text("o"));
+        metric.process(&backspace());
+        let mistakes = metric.mistakes.clone();
+
+        metric.clear_in_flight();
+        metric.process(&text("p"));
+
+        assert_eq!(metric.mistakes, mistakes);
+        assert!(metric.confusions.is_empty());
+        assert_eq!(metric.history.back().map(String::as_str), Some("p"));
     }
 
     #[test]

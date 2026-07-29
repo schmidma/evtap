@@ -32,30 +32,31 @@ The `0.1.x` goal is a trustworthy Linux-only beta for personal use.
 - [x] Validate at least one permission-denied and reconnect workflow interactively
 - [x] Publish and test a GitHub prerelease before the final `v0.1.0` tag
 
-## 0.2 — opt-in aggregate persistence
+## 0.2 — resumable aggregate sessions
 
-The [accepted persistence specification](docs/persistence-spec.md) defines local, versioned aggregate storage without raw event history. The implementation is now on `main` for prerelease hardening.
+The [accepted persistence specification](docs/persistence-spec.md) defines editor-like sessions with optional local, versioned aggregate saves and no raw event history.
 
 ### Product scope
 
-- Persistence remains off until the user accepts an explicit sensitivity disclosure.
+- Exactly one mutable working session is loaded in memory.
+- Manual save and autosave use the same session model; the first analytics write requires a sensitivity disclosure.
+- Saved sessions remain resumable until explicit deletion. There is no finalization, history, or retention lifecycle.
+- Dirty switches and closes use familiar Save, Discard, or Cancel boundaries when autosave is off.
 - Versioned aggregate snapshots never cross the storage boundary as raw events.
-- Active sessions recover paused with transient metric state cleared.
-- Completed history is paginated and rendered through separate metric instances.
-- Retention and per-session/complete deletion are user controlled.
-- Privacy settings, window state, and analytics use separate files.
+- Restored sessions recover paused with all in-flight metric context cleared.
+- Preferences, window state, and analytics use separate files.
 
 ### Quality gate
 
 - [x] Versioned, deterministic, size-limited snapshots for every bundled metric
-- [x] Durable/transient state separation and restart-safe restoration tests
+- [x] Durable/in-flight state separation and restart-safe restoration tests
 - [x] Atomic private settings with unsupported-version protection
-- [x] SQLite identity, schema migration, transactions, retention, and cascading deletion
-- [x] Dedicated worker, dirty generations, 30-second schedule, retries, and bounded shutdown
-- [x] Capture/session separation, configuration locking, finish/discard, and enable/disable flows
-- [x] Paginated history, isolated detail restoration, retention, and deletion UI
-- [x] Rust 1.92, strict Clippy, unit/integration, RustSec, and privacy fault checks
-- [ ] Interactive permission, restart, crash-recovery, disk-failure, retention, and deletion validation
+- [x] SQLite identity, exact schema validation, mutable sessions, transactions, and cascading deletion
+- [x] Dedicated worker, dirty generations, 30-second autosave schedule, retries, and bounded shutdown
+- [x] Manual save, saved-session selection, untitled sessions, rename, reset, and deletion UI
+- [x] Editor-style switch/close boundaries and remembered last-session recovery
+- [x] Rust 1.92, strict Clippy, unit/integration, RustSec, and privacy fault checks for the revised model
+- [ ] Interactive permission, manual/autosave, restart, crash-recovery, disk-failure, switching, and deletion validation
 - [ ] Publish and test a `0.2.0` prerelease before the final tag
 
 ## After 0.2

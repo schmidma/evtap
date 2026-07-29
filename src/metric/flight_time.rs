@@ -143,6 +143,10 @@ impl Metric for FlightTime {
         Ok(())
     }
 
+    fn clear_in_flight(&mut self) {
+        self.last_release = None;
+    }
+
     fn reset(&mut self) {
         *self = Self::default();
     }
@@ -181,6 +185,17 @@ mod tests {
             metric.stats.get("b").map(|stats| stats.total),
             Some(Duration::from_millis(75))
         );
+    }
+
+    #[test]
+    fn clearing_in_flight_context_preserves_aggregates_without_bridging() {
+        let mut metric = FlightTime::default();
+        metric.process(&event(100, KeyEventKind::Release, Some("a")));
+
+        metric.clear_in_flight();
+        metric.process(&event(175, KeyEventKind::Press, Some("b")));
+
+        assert!(metric.stats.is_empty());
     }
 
     #[test]
