@@ -1678,14 +1678,559 @@ impl eframe::App for App {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{
+        fs, thread,
+        time::{Duration, SystemTime},
+    };
 
     use super::{
-        BoundaryPolicy, HACK_FONT_NAME, SessionMetadata, StorageStatus, boundary_policy,
-        database_disk_usage, font_definitions, session_selector_label, storage_status_label,
+        App, BoundaryPolicy, HACK_FONT_NAME, ListenerState, SessionMetadata, StorageOperation,
+        StorageStatus, boundary_policy, database_disk_usage, font_definitions,
+        session_selector_label, storage_status_label,
     };
-    use crate::session::{KeyboardContext, SessionId};
+    use crate::{
+        input::KeyEventKind,
+        paths::AppPaths,
+        session::{KeyboardContext, SessionId},
+    };
     use eframe::egui;
+    use egui_kittest::{Harness, kittest::Queryable};
+    use evdev::KeyCode;
+
+    fn headless_harness(paths: AppPaths) -> Harness<'static, App> {
+        Harness::builder()
+            .with_size(egui::vec2(900.0, 1_200.0))
+            .build_eframe(move |creation_context| App::new(creation_context, paths).unwrap())
+    }
+
+    fn wait_for_app(harness: &mut Harness<'_, App>, predicate: impl Fn(&App) -> bool) {
+        wait_for_app_attempts(harness, 200, predicate);
+    }
+
+    fn wait_for_app_attempts(
+        harness: &mut Harness<'_, App>,
+        attempts: usize,
+        predicate: impl Fn(&App) -> bool,
+    ) {
+        for _ in 0..attempts {
+            harness.step();
+            if predicate(harness.state()) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("headless app did not reach the expected state");
+    }
+
+    fn request_headless_close(harness: &mut Harness<'_, App>) {
+        harness
+            .input_mut()
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .events
+            .push(egui::ViewportEvent::Close);
+        harness.step();
+        harness
+            .input_mut()
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .events
+            .clear();
+    }
+
+    fn shutdown_harness(harness: &mut Harness<'_, App>) {
+        eframe::App::on_exit(harness.state_mut(), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn headless_manual_save_disclosure_and_restart() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::with_roots(
+            temporary.path().join("config"),
+            temporary.path().join("data"),
+        );
+        paths.prepare_data_dir().unwrap();
+        let database = paths.database_file();
+
+        let saved_session_id = {
+            let mut harness = headless_harness(paths.clone());
+            wait_for_app(&mut harness, |app| app.storage_initialized);
+
+            assert_eq!(harness.state().session.display_name(), "Untitled session");
+            assert_eq!(harness.state().listener_state, ListenerState::Idle);
+            assert!(!database.exists());
+
+            harness.state_mut().process_input(
+                SystemTime::now(),
+                KeyCode::KEY_A,
+                KeyEventKind::Press,
+            );
+            harness.step();
+            assert!(harness.state().working_dirty());
+            assert!(harness.query_by_label("Presses: 1").is_some());
+
+            harness.get_by_label("Save now").click();
+            harness.run();
+            assert!(
+                harness
+                    .query_by_label("Save sensitive aggregate statistics?")
+                    .is_some()
+            );
+            assert!(!database.exists());
+
+            harness.get_by_label("Cancel").click();
+            harness.run();
+            assert!(!database.exists());
+
+            harness.get_by_label("Save now").click();
+            harness.run();
+            harness.get_by_label("Allow local saves").click();
+            harness.run();
+            wait_for_app(&mut harness, |app| {
+                app.session.id.is_some() && app.storage_tracker.status() == StorageStatus::Saved
+            });
+
+            let saved_session_id = harness.state().session.id.unwrap();
+            assert!(database.exists());
+            assert!(harness.state().settings.storage_disclosure_acknowledged());
+            shutdown_harness(&mut harness);
+            saved_session_id
+        };
+
+        let mut restarted = headless_harness(paths);
+        wait_for_app(&mut restarted, |app| {
+            app.storage_initialized && !app.loading_session && app.session.restored
+        });
+
+        assert_eq!(restarted.state().session.id, Some(saved_session_id));
+        assert_eq!(restarted.state().listener_state, ListenerState::Idle);
+        assert_eq!(
+            restarted.state().storage_tracker.status(),
+            StorageStatus::Saved
+        );
+        assert!(restarted.query_by_label("Presses: 1").is_some());
+        assert!(
+            restarted
+                .query_by_label_contains("Restored from disk; capture is paused")
+                .is_some()
+        );
+        shutdown_harness(&mut restarted);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn headless_dirty_close_can_cancel_or_save() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::with_roots(
+            temporary.path().join("config"),
+            temporary.path().join("data"),
+        );
+        paths.prepare_data_dir().unwrap();
+        let mut harness = headless_harness(paths);
+        wait_for_app(&mut harness, |app| app.storage_initialized);
+
+        harness.get_by_label("Save now").click();
+        harness.run();
+        harness.get_by_label("Allow local saves").click();
+        harness.run();
+        wait_for_app(&mut harness, |app| {
+            app.session.id.is_some() && app.storage_tracker.status() == StorageStatus::Saved
+        });
+
+        harness.get_by_label("Rename").click();
+        harness.run();
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .focus();
+        harness.run();
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .type_text("Closing test");
+        harness.run();
+        harness.get_by_label("Apply").click();
+        harness.run();
+        assert!(harness.state().working_dirty());
+
+        request_headless_close(&mut harness);
+        assert!(
+            harness
+                .query_by_label("Save changes before exiting?")
+                .is_some()
+        );
+        harness.get_by_label("Cancel").click();
+        harness.run();
+        assert!(!harness.state().allow_close);
+        assert!(harness.state().working_dirty());
+
+        request_headless_close(&mut harness);
+        harness.get_by_label("Save and exit").click();
+        harness.step();
+        wait_for_app(&mut harness, |app| {
+            app.allow_close && app.storage_tracker.status() == StorageStatus::Saved
+        });
+        assert_eq!(
+            harness.state().session.name.as_deref(),
+            Some("Closing test")
+        );
+        shutdown_harness(&mut harness);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn headless_failed_save_stays_dirty_and_retries_latest_state() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::with_roots(
+            temporary.path().join("config"),
+            temporary.path().join("data"),
+        );
+        paths.prepare_data_dir().unwrap();
+        let mut harness = headless_harness(paths.clone());
+        wait_for_app(&mut harness, |app| app.storage_initialized);
+
+        harness.get_by_label("Save now").click();
+        harness.run();
+        harness.get_by_label("Allow local saves").click();
+        harness.step();
+        wait_for_app(&mut harness, |app| {
+            app.session.id.is_some() && app.storage_tracker.status() == StorageStatus::Saved
+        });
+
+        let lock = rusqlite::Connection::open(paths.database_file()).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE; UPDATE sessions SET updated_at_ms = updated_at_ms;")
+            .unwrap();
+
+        harness.get_by_label("Rename").click();
+        harness.run();
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .focus();
+        harness.run();
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .type_text("Retry test");
+        harness.run();
+        harness.get_by_label("Apply").click();
+        harness.run();
+        harness.get_by_label("Save now").click();
+        harness.step();
+        wait_for_app_attempts(&mut harness, 1_200, |app| {
+            app.last_failed_operation == Some(StorageOperation::Save)
+        });
+        assert!(harness.state().working_dirty());
+        assert_eq!(
+            harness.state().storage_tracker.status(),
+            StorageStatus::Failed
+        );
+        assert!(harness.query_by_label("Retry storage operation").is_some());
+
+        harness.get_by_label("Rename").click();
+        harness.run();
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .focus();
+        harness.run();
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .type_text(" latest");
+        harness.run();
+        harness.get_by_label("Apply").click();
+        harness.run();
+        drop(lock);
+        harness.get_by_label("Retry storage operation").click();
+        harness.step();
+        wait_for_app(&mut harness, |app| {
+            app.storage_tracker.status() == StorageStatus::Saved && app.session.id.is_some()
+        });
+        assert_eq!(
+            harness.state().session.name.as_deref(),
+            Some("Retry test latest")
+        );
+        shutdown_harness(&mut harness);
+
+        let mut restarted = headless_harness(paths);
+        wait_for_app(&mut restarted, |app| {
+            app.storage_initialized && app.session.restored
+        });
+        assert_eq!(
+            restarted.state().session.name.as_deref(),
+            Some("Retry test latest")
+        );
+        shutdown_harness(&mut restarted);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn headless_autosave_switch_and_close_need_no_prompt() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::with_roots(
+            temporary.path().join("config"),
+            temporary.path().join("data"),
+        );
+        paths.prepare_data_dir().unwrap();
+        let mut harness = headless_harness(paths);
+        wait_for_app(&mut harness, |app| app.storage_initialized);
+
+        harness.get_by_label("Autosave sessions").click();
+        harness.run();
+        assert!(
+            harness
+                .query_by_label("Save sensitive aggregate statistics?")
+                .is_some()
+        );
+        harness.get_by_label("Cancel").click();
+        harness.run();
+        assert!(!harness.state().settings.autosave_enabled());
+
+        harness.get_by_label("Autosave sessions").click();
+        harness.run();
+        harness.get_by_label("Allow local saves").click();
+        harness.run();
+        assert!(harness.state().settings.autosave_enabled());
+
+        harness.get_by_label("Rename").click();
+        harness.run();
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .focus();
+        harness.run();
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .type_text("Autosaved Home");
+        harness.run();
+        harness.get_by_label("Apply").click();
+        harness.run();
+        harness.get_by_label("New session").click();
+        harness.run();
+        wait_for_app(&mut harness, |app| {
+            app.session.id.is_none()
+                && app
+                    .sessions
+                    .iter()
+                    .any(|saved| saved.name.as_deref() == Some("Autosaved Home"))
+        });
+        assert!(
+            harness
+                .query_by_label("Save changes before switching sessions?")
+                .is_none()
+        );
+
+        harness.get_by_label("Rename").click();
+        harness.run();
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .focus();
+        harness.run();
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .type_text("Autosaved Work");
+        harness.run();
+        harness.get_by_label("Apply").click();
+        harness.run();
+        request_headless_close(&mut harness);
+        assert!(
+            harness
+                .query_by_label("Save changes before exiting?")
+                .is_none()
+        );
+        wait_for_app(&mut harness, |app| {
+            app.allow_close
+                && app.session.id.is_some()
+                && app.storage_tracker.status() == StorageStatus::Saved
+        });
+        assert_eq!(
+            harness.state().session.name.as_deref(),
+            Some("Autosaved Work")
+        );
+        shutdown_harness(&mut harness);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn headless_session_switch_prompts_and_deletion() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::with_roots(
+            temporary.path().join("config"),
+            temporary.path().join("data"),
+        );
+        paths.prepare_data_dir().unwrap();
+        let database = paths.database_file();
+        let mut harness = headless_harness(paths.clone());
+        wait_for_app(&mut harness, |app| app.storage_initialized);
+
+        harness.get_by_label("Rename").click();
+        harness.run();
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .focus();
+        harness.run();
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .type_text("Home");
+        harness.run();
+        harness.get_by_label("Apply").click();
+        harness.run();
+        assert_eq!(harness.state().session.name.as_deref(), Some("Home"));
+
+        harness.get_by_label("Save now").click();
+        harness.run();
+        harness.get_by_label("Allow local saves").click();
+        harness.run();
+        wait_for_app(&mut harness, |app| {
+            app.session.id.is_some() && app.storage_tracker.status() == StorageStatus::Saved
+        });
+        let home_id = harness.state().session.id.unwrap();
+
+        harness.get_by_label("New session").click();
+        harness.run();
+        assert_eq!(harness.state().session.id, None);
+        harness.get_by_label("Save now").click();
+        harness.run();
+        wait_for_app(&mut harness, |app| {
+            app.session.id.is_some() && app.storage_tracker.status() == StorageStatus::Saved
+        });
+        let work_id = harness.state().session.id.unwrap();
+
+        harness.get_by_label("Rename").click();
+        harness.run();
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .focus();
+        harness.run();
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .type_text("Work");
+        harness.run();
+        harness.get_by_label("Apply").click();
+        harness.run();
+        assert!(harness.state().working_dirty());
+
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::ComboBox, "Current")
+            .click();
+        harness.run();
+        harness.get_by_label_contains("Home —").click();
+        harness.run();
+        assert!(
+            harness
+                .query_by_label("Save changes before switching sessions?")
+                .is_some()
+        );
+        harness.get_by_label("Cancel").click();
+        harness.run();
+        assert_eq!(harness.state().session.id, Some(work_id));
+        assert_eq!(harness.state().session.name.as_deref(), Some("Work"));
+
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::ComboBox, "Current")
+            .click();
+        harness.run();
+        harness.get_by_label_contains("Home —").click();
+        harness.run();
+        harness.get_by_label("Discard changes").click();
+        harness.run();
+        wait_for_app(&mut harness, |app| {
+            app.session.id == Some(home_id) && !app.loading_session
+        });
+        assert_eq!(harness.state().session.name.as_deref(), Some("Home"));
+
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::ComboBox, "Current")
+            .click();
+        harness.run();
+        harness.get_by_label_contains("Untitled session —").click();
+        harness.run();
+        wait_for_app(&mut harness, |app| {
+            app.session.id == Some(work_id) && !app.loading_session
+        });
+
+        harness.get_by_label("Rename").click();
+        harness.run();
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .focus();
+        harness.run();
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .type_text("Home");
+        harness.run();
+        harness.get_by_label("Apply").click();
+        harness.run();
+        assert!(harness.state().rename_error.is_some());
+        assert_eq!(harness.state().session.name, None);
+        harness.get_by_label("Cancel").click();
+        harness.run();
+
+        harness.get_by_label("Rename").click();
+        harness.run();
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .focus();
+        harness.run();
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .type_text("Work");
+        harness.run();
+        harness.get_by_label("Apply").click();
+        harness.run();
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::ComboBox, "Current")
+            .click();
+        harness.run();
+        harness.get_by_label_contains("Home —").click();
+        harness.run();
+        harness.get_by_label("Save and switch").click();
+        harness.step();
+        wait_for_app(&mut harness, |app| {
+            app.session.id == Some(home_id)
+                && !app.loading_session
+                && app
+                    .sessions
+                    .iter()
+                    .any(|saved| saved.id == work_id && saved.name.as_deref() == Some("Work"))
+        });
+
+        harness.get_by_label("Reset statistics").click();
+        harness.run();
+        harness
+            .get_all_by_role_and_label(egui::accesskit::Role::Button, "Reset statistics")
+            .last()
+            .unwrap()
+            .click();
+        harness.run();
+        assert!(harness.state().working_dirty());
+        assert_eq!(harness.state().session.name.as_deref(), Some("Home"));
+
+        harness.get_by_label("Delete session").click();
+        harness.run();
+        assert!(harness.query_by_label("Delete session?").is_some());
+        harness.get_by_label("Delete permanently").click();
+        harness.run();
+        wait_for_app(&mut harness, |app| {
+            !app.deleting_session && app.session.id.is_none()
+        });
+        assert_eq!(harness.state().session.display_name(), "Untitled session");
+        shutdown_harness(&mut harness);
+
+        let mut restarted = headless_harness(paths);
+        wait_for_app(&mut restarted, |app| app.storage_initialized);
+        assert_eq!(restarted.state().session.id, None);
+        assert!(!restarted.state().session.restored);
+        assert!(
+            restarted
+                .state()
+                .sessions
+                .iter()
+                .any(|saved| saved.id == work_id)
+        );
+
+        restarted.get_by_label("Delete all saved sessions").click();
+        restarted.run();
+        restarted.get_by_label("Delete all permanently").click();
+        restarted.run();
+        wait_for_app(&mut restarted, |app| {
+            !app.deleting_all && app.sessions.is_empty()
+        });
+        assert!(!database.exists());
+        shutdown_harness(&mut restarted);
+    }
 
     #[test]
     fn proportional_font_family_supports_bigram_arrow() {

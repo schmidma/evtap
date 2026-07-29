@@ -23,6 +23,14 @@ cargo audit
 
 Install `cargo-nextest` using its documented installer or package for your platform. If it is unavailable, use `cargo test --all-targets --locked` instead.
 
+The session lifecycle UI tests use `egui_kittest` and run entirely in process: they do not create a native window or require an X11 or Wayland display. To verify that boundary explicitly, run:
+
+```sh
+env -u DISPLAY -u WAYLAND_DISPLAY cargo nextest run headless_
+```
+
+Use an isolated virtual display for native-window investigation so test windows never appear in the active desktop session. On Arch Linux, install `xorg-server-xvfb` and `xdotool`; then launch the app and its automation from the same `xvfb-run` command. Xvfb is not required for the normal Rust test suite.
+
 `cargo audit` can be installed with:
 
 ```sh

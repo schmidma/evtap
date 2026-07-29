@@ -13,6 +13,16 @@ RUST_LOG=evtap=debug cargo run --release --locked
 
 Keep terminal logs private and remove the temporary directory afterward.
 
+## Automated headless coverage
+
+The regular Rust suite includes `egui_kittest` lifecycle tests for disclosure cancellation and acceptance, manual save and restart, dirty close cancellation and save, autosaved switches and closes, untitled-session saves, unique-name enforcement, switch Save/Discard/Cancel choices, reset, deletion, exact last-session behavior, delete-all cleanup, and busy-database save failure followed by a latest-state retry. They create no native window and can be run with both display protocols explicitly unavailable:
+
+```sh
+env -u DISPLAY -u WAYLAND_DISPLAY cargo nextest run headless_
+```
+
+These tests do not replace readable-evdev capture checks, native backend smoke tests, crash timing, or constrained-filesystem fault injection below. For native UI automation without showing windows in the current desktop session, run evtap and the automation process together under `xvfb-run`.
+
 ## Fresh in-memory behavior and disclosure
 
 1. Start evtap with empty XDG directories.
