@@ -620,7 +620,7 @@ mod tests {
             updated_at_ms: now,
             last_opened_at_ms: now,
             captured_duration_ns: 42,
-            application_version: "0.2.0-dev".to_owned(),
+            application_version: env!("CARGO_PKG_VERSION").to_owned(),
             keyboard: KeyboardContext {
                 display_name: Some("Keyboard".to_owned()),
                 model: "pc105".to_owned(),
