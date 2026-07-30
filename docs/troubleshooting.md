@@ -82,7 +82,7 @@ ls -ld ~/.config/evtap ~/.local/share/evtap
 ls -l ~/.config/evtap/settings.json ~/.local/share/evtap/evtap.sqlite3*
 ```
 
-Do not replace a storage error by deleting files until deciding whether the existing saved sessions matter. evtap deliberately refuses to overwrite corrupt databases, databases belonging to another application, and incompatible schema versions. The unreleased experimental persistence schema is not migrated; move or delete that development database manually. Keep a private copy before investigating. Never attach a real analytics database to a public issue because aggregate labels are sensitive.
+Do not replace a storage error by deleting files until deciding whether the existing saved sessions matter. evtap deliberately refuses to overwrite corrupt databases, databases belonging to another application, and incompatible schema versions. Unsupported schemas are not migrated automatically; move or delete the incompatible database manually only after keeping any private copy you need. Never attach a real analytics database to a public issue because aggregate labels are sensitive.
 
 A restored session is always paused. The remembered keyboard name may preselect one unique match, but device paths are never stored. Select any intended readable keyboard before restarting capture.
 

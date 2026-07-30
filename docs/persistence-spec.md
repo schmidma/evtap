@@ -1,10 +1,8 @@
-# Resumable session persistence specification
+# Resumable session persistence reference
 
-**Status:** Accepted, revised
-**Target:** evtap 0.2.0
-**Last updated:** 2026-07-28
+**Applies to:** evtap 0.2.x
 
-This document specifies optional local disk backing for evtap sessions. It is a design artifact, not behavior available in the stable 0.1.x release.
+This document defines the session lifecycle, durable data, privacy boundaries, and recovery behavior of evtap's optional local persistence.
 
 ## 1. Summary
 
@@ -68,7 +66,7 @@ Autosave is an editor-like preference, not an application or session state. When
 - before switching sessions;
 - during normal application close.
 
-The initial interval is fixed at 30 seconds and may become configurable later. Autosave never writes per key event.
+The autosave interval is fixed at 30 seconds. Autosave never writes per key event.
 
 Enabling autosave requires the same disclosure as a first manual save. The `autosave_enabled` preference is stored in `settings.json`.
 
@@ -169,7 +167,7 @@ Saved sessions are ordered by most recently selected/opened. Rows show enough me
 
 ### 7.1 Rename
 
-Names are optional Unicode strings of at most 80 UTF-8 characters after trimming. An empty name becomes unnamed. Nonempty names must not duplicate another saved session name. Rename changes the in-memory working session and marks it dirty; it does not bypass normal save behavior.
+Names are optional Unicode strings of at most 80 UTF-8 bytes after trimming. An empty name becomes unnamed. Nonempty names must not duplicate another saved session name. Rename changes the in-memory working session and marks it dirty; it does not bypass normal save behavior.
 
 ### 7.2 Reset
 
@@ -248,7 +246,7 @@ The application does not impose special symlink rejection. Normal operating-syst
 | Preferences | evtap | `$XDG_CONFIG_HOME/evtap/settings.json` | Disclosure acknowledgement, autosave, last session ID, fallback XKB preferences |
 | Session analytics | evtap | `$XDG_DATA_HOME/evtap/evtap.sqlite3` | Saved session metadata and aggregate metric snapshots |
 
-Use the usual `~/.config` and `~/.local/share` fallbacks. `App::persist_egui_memory` remains false; arbitrary widget memory and analytics must not enter `app.ron`.
+Use the usual `~/.config` and `~/.local/share` fallbacks. `app.ron` must not contain widget memory, evtap preferences, or analytics.
 
 Settings writes remain schema-versioned, validated, size-limited, synchronized, private, and atomic through a same-directory temporary file, flush, rename, and directory synchronization where supported.
 
@@ -274,7 +272,7 @@ Unknown fields are tolerated. Unsupported schema versions produce a non-destruct
 
 ## 10. SQLite design
 
-Use bundled SQLite through `rusqlite`, owned by one storage-worker thread. Configure:
+evtap uses bundled SQLite through `rusqlite` and configures:
 
 - read-write/create flags only when a write is requested;
 - evtap `application_id`;
@@ -287,7 +285,7 @@ Use bundled SQLite through `rusqlite`, owned by one storage-worker thread. Confi
 
 ### 10.1 Schema
 
-The redesigned prerelease schema uses `user_version = 2`:
+evtap 0.2 uses `user_version = 2`:
 
 ```sql
 CREATE TABLE sessions (
@@ -341,7 +339,7 @@ One immediate transaction:
 6. commits;
 7. acknowledges the exact dirty generation and assigned ID.
 
-No partial multi-metric state may become visible. Serialization finishes before opening the transaction.
+No partial multi-metric state may become visible. Serialization finishes before opening the transaction. At most one save is in flight. A save acknowledgement applies only to the matching dirty generation, and retrying after failure serializes the latest in-memory state.
 
 ### 10.3 Loading and listing
 
@@ -351,41 +349,19 @@ Selecting a session updates its `last_opened_at_ms` as an explicit metadata oper
 
 ### 10.4 Incompatible databases
 
-No compatibility or migration code is provided for unreleased experimental schemas. Empty databases initialize directly to schema version 2. A nonempty database with the wrong application identity or any unsupported schema version is left unchanged and produces a generic error containing the database path, for example:
+Empty databases initialize directly to schema version 2. A nonempty database with the wrong application identity or any unsupported schema version is left unchanged and produces a generic error containing the database path, for example:
 
 ```text
 The evtap database at … uses an incompatible schema. Move or delete it to start fresh.
 ```
 
-The implementation must not detect or name a particular experimental version. This exact-version check is the same defensive mechanism used for arbitrary incompatible or future schemas, not a compatibility layer. Reuse the `evtap.sqlite3` filename after manual deletion.
+Unsupported schema versions have no automatic migration path. Future schema changes require an explicit migration design and compatibility tests.
 
-Once a schema ships in a stable release, future migrations require an explicit new specification and tests.
+## 11. Metric snapshot contract
 
-## 11. Worker protocol
+Each metric uses a stable metric ID and an independently versioned snapshot format. Payloads are deterministic and fully validated before they can mutate metric state.
 
-The worker owns SQLite and communicates with the UI through bounded commands/events and `WakeSignal`. Commands operate on session snapshots and IDs only.
-
-Required operations:
-
-- inspect/open an existing database;
-- list saved sessions;
-- load one session;
-- save the working session;
-- mark a session opened;
-- delete one session;
-- delete all sessions;
-- reclaim after deletion;
-- shutdown with an optional final save.
-
-At most one save is in flight. Dirty generations advance independently; acknowledgement of an older generation cannot mark newer state saved. A retry serializes a fresh latest snapshot.
-
-Storage failures never stop capture or clear metrics. Errors contain operation and safe path context but no metric payloads, labels, SQL values, or input data.
-
-## 12. Metric snapshot contract
-
-Each metric provides object-safe snapshot and restore operations keyed by a stable metric ID and independent metric schema version. Payloads remain deterministic and validated before mutation.
-
-Initial limits remain:
+Snapshot limits are:
 
 - at most 16 MiB per metric payload;
 - at most 100,000 dimensions per metric;
@@ -397,105 +373,12 @@ Initial limits remain:
 
 Arrays are canonically ordered. Rounded averages are never stored. Unknown existing metric rows survive a save so temporarily removed metrics are not silently erased.
 
-## 13. Error behavior
+## 12. Error behavior
 
 - Settings and database errors preserve existing files.
 - Corrupt, unidentified, and incompatible databases are not replaced, truncated, renamed, or silently reset.
-- Failed saves leave working state dirty and retryable.
+- Failed saves leave working state dirty and retryable without stopping capture or clearing metrics.
 - Failed delete operations leave the session visible.
 - Failed automatic save blocks the requested switch or close.
 - A process kill may lose unsaved state but a committed SQLite transaction is all-or-nothing.
 - Logs never contain captured labels, metric payloads, or raw input.
-
-## 14. Testing requirements
-
-### Metric tests
-
-- deterministic aggregate snapshots;
-- round-trip restoration;
-- malformed, duplicate, unsupported, and overflowing payload rejection;
-- isolated restoration failures;
-- resumed processing adds to aggregates;
-- in-flight context is absent and cannot bridge restore.
-
-### Repository tests
-
-- initialize schema version 2;
-- generic rejection of schema version 1, future versions, wrong identity, and unidentified nonempty files without modification;
-- insert and update multiple mutable sessions;
-- save and restore untitled sessions;
-- enforce unique nonempty names by ID-independent validation;
-- atomic multi-metric saves and rollback;
-- preserve unknown snapshots;
-- list by recent-open order;
-- individual and complete deletion;
-- WAL recovery;
-- private Linux permissions.
-
-### Worker tests
-
-- save acknowledgement and assigned ID;
-- generation changes during an in-flight save;
-- explicit load/list/open/delete operations;
-- retry after failure;
-- autosave scheduling boundaries;
-- bounded shutdown;
-- repaint wake events;
-- no dependency on raw input types.
-
-### UI and lifecycle tests
-
-- fresh untitled session without a database;
-- disclosure on first manual save or autosave enable;
-- startup loads only the last-selected saved ID;
-- missing last ID creates an untitled session rather than loading an older one;
-- clean switch;
-- dirty Save/Discard/Cancel switch;
-- autosaved switch and blocked failed switch;
-- dirty Save/Discard/Cancel close;
-- rename, reset, and immediate deletion;
-- remembered setup remains flexible;
-- no Finish, History, or Retention controls.
-
-### Privacy tests
-
-- no event or ordering table;
-- no raw-input storage command;
-- no event timestamps, device paths, pressed keys, or recent correction context in snapshots;
-- settings contain no analytics;
-- `app.ron` contains no settings or analytics;
-- payload-free logs;
-- no telemetry or network behavior.
-
-## 15. Acceptance criteria
-
-The redesign is complete when:
-
-1. evtap always has one loaded session and behaves the same before and after its first save.
-2. A fresh run creates no analytics database until manual save or autosave performs a write.
-3. First disk write requires the aggregate-storage disclosure.
-4. Manual save and autosave restore identical aggregate reports after restart.
-5. Startup loads only the last-selected saved session and remains paused.
-6. Switching and close never silently lose dirty state.
-7. Untitled sessions can be saved without artificial naming barriers.
-8. Session setup values are remembered but never enforced against another device.
-9. No aggregate or timing context bleeds between sessions or process boundaries.
-10. Finalization, history, retention, and migration code are absent.
-11. Generic incompatible-schema handling leaves old development data untouched.
-12. Session deletion is explicit, immediate, and acknowledged.
-13. Storage remains transactional, private, responsive, and payload-free on errors.
-14. Format, strict Clippy, tests, Rust 1.92, RustSec, diagnostics, release build, and manual lifecycle validation pass.
-
-## 16. Deferred work
-
-Separate designs are required for:
-
-- configurable autosave interval;
-- multiple simultaneously loaded dirty sessions;
-- import, export, synchronization, or accounts;
-- trends and comparisons;
-- encryption and key management;
-- session merge or duplication;
-- database backup and restore;
-- concurrent access by multiple evtap processes;
-- public persistence APIs.

@@ -93,7 +93,7 @@ The analytics database is not encrypted. Encryption without a defensible key-man
 
 Deleting a saved session transactionally removes its metric snapshots through SQLite foreign-key cascading. **Delete all saved sessions** closes SQLite and removes the database, WAL, shared-memory, and rollback-journal files. SQLite secure deletion and best-effort page reclamation are enabled, but deletion cannot erase copies in backups, snapshots, SSD remapping, or forensic storage layers.
 
-Corrupt, unidentified, or incompatible-schema databases are not automatically replaced, downgraded, renamed, or truncated. The current unreleased experimental schema has no migration: move or delete it manually to start fresh. Unsupported settings files likewise remain untouched.
+Corrupt, unidentified, or incompatible-schema databases are not automatically replaced, downgraded, renamed, or truncated. Unsupported database and settings schemas have no automatic migration path; move or delete the incompatible file manually to start fresh.
 
 ## Network and logging
 

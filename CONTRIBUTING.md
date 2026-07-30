@@ -85,4 +85,6 @@ Export, telemetry, network behavior, crash reporting, or encryption requires a s
 
 Keep commits focused and include tests for behavior changes. Update user documentation whenever setup, permissions, privacy behavior, metric semantics, or supported environments change.
 
+Treat documentation as product content for human readers. Keep durable user and contributor guidance in the repository; keep implementation progress, temporary investigation notes, raw validation output, and duplicated test plans in issues, pull requests, tests, or git history instead.
+
 Unless stated otherwise, contributions are accepted under either the MIT License or the Apache License 2.0, at your option.

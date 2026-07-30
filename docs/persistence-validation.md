@@ -1,4 +1,4 @@
-# Resumable-session prerelease validation
+# Resumable-session persistence validation
 
 Use only nonsensitive synthetic typing. Do not paste passwords, tokens, private messages, or production source code into any application while evtap is listening.
 
@@ -113,7 +113,7 @@ Validate:
 
 For save failures, confirm capture continues, in-memory aggregates remain, the generation stays dirty, and the UI shows a payload-free error. **Retry storage operation** must serialize a fresh latest snapshot. A failed automatic save must block the requested switch or close.
 
-Confirm incompatible files are not replaced, truncated, renamed, or silently reset. The application should emit one generic incompatible-schema error with the database path; it must not contain special migration logic for an old unreleased experiment.
+Confirm incompatible files are not replaced, truncated, renamed, or silently reset. The application should emit one generic incompatible-schema error with the database path and must not guess at an unsupported schema's identity or history.
 
 ## Privacy inspection
 
@@ -127,31 +127,4 @@ After synthetic use, inspect `settings.json`, the SQLite schema/rows, `app.ron`,
 - logs contain no captured labels or serialized payloads;
 - the application initiates no telemetry or synchronization traffic.
 
-Record the evtap commit, Rust version, Linux distribution, desktop environment, display protocol, filesystem type, SQLite fault setup, and result for each prerelease candidate.
-
-## Validation record: 2026-07-30
-
-Code under test: `ddfe165f3e8c0301efddbc13838ec2fa580ee618` (`0.2.0-dev`).
-
-Environment:
-
-- Arch Linux, Linux `7.1.5-zen1-1-zen`, x86-64.
-- Rust `1.97.1`; the same code also passed the Rust `1.92` MSRV job.
-- niri on Wayland. Native interaction ran on an isolated Xvfb X11 display.
-- Disposable XDG roots were on `/tmp` (`tmpfs`).
-- A synthetic uinput keyboard was marked `LIBINPUT_IGNORE_DEVICE=1`, so niri never opened it; evtap read it directly through evdev.
-- SQLite `ENOSPC` and settings `EROFS` failures were injected at the system-call boundary in disposable processes. The regular suite separately covers bounded busy-database failure, incompatible identities and schemas, rollback, malformed settings, and symlink handling.
-
-Results:
-
-- **Passed:** disclosure cancellation and acceptance, private file modes, manual save, exact restart restoration, advisory keyboard restoration, and paused restart.
-- **Passed:** real evdev Start/Stop capture with key usage, counts, dwell, flight, bigram, and correction aggregates.
-- **Passed:** in-flight state did not bridge restart, Stop, session switch, or listener `ENODEV` failure. A held key at Stop produced no dwell sample after its later release.
-- **Passed:** the 30-second autosave checkpoint, Stop autosave, switch autosave while listening, listener-failure autosave, and normal-close autosave.
-- **Passed:** `kill -KILL` before autosave restored the previous complete snapshot. A kill immediately after requesting Stop/autosave recovered one complete new generation; SQLite integrity remained `ok`, and all metric rows had one generation timestamp.
-- **Passed:** injected `ENOSPC` kept the previous committed generation, left the latest state dirty, showed a payload-free failure, blocked automatic switch and close, and successfully retried the latest snapshot after recovery.
-- **Passed:** injected settings `EROFS` left `settings.json` byte-for-byte unchanged, reverted the attempted preference change, displayed a payload-free error, and saved successfully after recovery.
-- **Passed:** final inspection found only `sessions` and `metric_snapshots` in SQLite, documented preferences in `settings.json`, and window geometry in `app.ron`. No device path, raw-event structure, pressed-key state, correction buffer, or in-flight context appeared in those durable stores. Diagnostic logs named the selected device path and listener error but contained no captured key label or aggregate payload. No evtap TCP connection was present.
-- **Passed:** the complete automated suite, strict Clippy, formatting, Rust `1.92`, RustSec audit, release build, repeated display-free headless tests, native Xvfb smoke test, and GitHub CI run `30525439959`.
-
-Only nonsensitive generated input was used. Disposable databases, screenshots, logs, fault helpers, and the synthetic device were removed after validation.
+When sharing a validation report, include the evtap commit, Rust version, Linux distribution, desktop environment, display protocol, filesystem type, fault setup, and result.
