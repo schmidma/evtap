@@ -34,7 +34,7 @@ The `0.1.x` goal is a trustworthy Linux-only beta for personal use.
 
 ## 0.2 — resumable aggregate sessions
 
-The [accepted persistence specification](docs/persistence-spec.md) defines editor-like sessions with optional local, versioned aggregate saves and no raw event history.
+The [persistence reference](docs/persistence-spec.md) defines editor-like sessions with optional local, versioned aggregate saves and no raw event history.
 
 ### Product scope
 
@@ -56,8 +56,8 @@ The [accepted persistence specification](docs/persistence-spec.md) defines edito
 - [x] Manual save, saved-session selection, untitled sessions, rename, reset, and deletion UI
 - [x] Editor-style switch/close boundaries and remembered last-session recovery
 - [x] Rust 1.92, strict Clippy, unit/integration, RustSec, and privacy fault checks for the revised model
-- [ ] Interactive permission, manual/autosave, restart, crash-recovery, disk-failure, switching, and deletion validation
-- [ ] Publish and test a `0.2.0` prerelease before the final tag
+- [x] Interactive permission, manual/autosave, restart, crash-recovery, disk-failure, switching, and deletion validation
+- [x] Publish and test a `0.2.0` prerelease before the final tag
 
 ## After 0.2
 

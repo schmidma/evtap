@@ -7,7 +7,7 @@
 > [!WARNING]
 > evtap observes global keyboard input from the selected device while listening. Treat it like a keylogger even though it processes data locally and does not save raw input. Read the [privacy model](docs/privacy.md) before use.
 
-evtap is pre-1.0 software. `0.1.x` is the process-only baseline; the current `0.2` development line adds resumable sessions with optional local aggregate saves. Interfaces and behavior may still change between minor versions.
+evtap is pre-1.0 software. `0.1.x` is the process-only baseline; `0.2.x` adds resumable sessions with optional local aggregate saves. Interfaces and behavior may still change between minor versions.
 
 ## Current scope
 
@@ -38,13 +38,13 @@ Metric definitions, sampling thresholds, and limitations are documented in [docs
 Download the Linux archive and checksum from the [GitHub Releases page](https://github.com/schmidma/evtap/releases), verify it, and extract it:
 
 ```sh
-sha256sum --check evtap-0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
-tar -xzf evtap-0.1.0-x86_64-unknown-linux-gnu.tar.gz
-cd evtap-0.1.0-x86_64-unknown-linux-gnu
+sha256sum --check evtap-0.2.0-x86_64-unknown-linux-gnu.tar.gz.sha256
+tar -xzf evtap-0.2.0-x86_64-unknown-linux-gnu.tar.gz
+cd evtap-0.2.0-x86_64-unknown-linux-gnu
 ./evtap
 ```
 
-Replace `0.1.0` with the release you downloaded. GitHub releases are currently the only binary distribution channel; evtap is not published on crates.io or in distribution repositories.
+Replace `0.2.0` with the release you downloaded. GitHub releases are currently the only binary distribution channel; evtap is not published on crates.io or in distribution repositories.
 
 ### From source
 
@@ -123,7 +123,7 @@ $XDG_DATA_HOME/evtap/evtap.sqlite3
 
 with the usual `~/.config` and `~/.local/share` fallbacks. `settings.json` records the one-time storage disclosure acknowledgement, autosave, last-selected session ID, and fallback XKB preferences. `app.ron` contains native window state only. `evtap.sqlite3` contains saved session metadata and aggregate metric snapshots. evtap creates private application directories and files with restrictive Unix permissions, but the database is not encrypted and filesystem backups or privileged processes can still read it.
 
-With autosave enabled, dirty sessions are saved approximately every 30 seconds during capture and at Stop, switch, and normal-close boundaries. With autosave disabled, only explicit saves write analytics; dirty switches and closes prompt before dropping state. A crash can lose changes after the latest acknowledged save. See the [persistence specification](docs/persistence-spec.md) and [privacy model](docs/privacy.md) for exact fields and lifecycle behavior.
+With autosave enabled, dirty sessions are saved approximately every 30 seconds during capture and at Stop, switch, and normal-close boundaries. With autosave disabled, only explicit saves write analytics; dirty switches and closes prompt before dropping state. A crash can lose changes after the latest acknowledged save. See the [persistence reference](docs/persistence-spec.md) and [privacy model](docs/privacy.md) for exact fields and lifecycle behavior.
 
 ## Keyboard layout behavior
 
@@ -147,7 +147,7 @@ More detail is available in [docs/privacy.md](docs/privacy.md).
 
 ## Development
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, quality checks, architecture boundaries, metric-extension guidance, and privacy requirements. Persistence prereleases use the [manual validation guide](docs/persistence-validation.md). The current release plan is in [ROADMAP.md](ROADMAP.md), and notable changes are tracked in [CHANGELOG.md](CHANGELOG.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, quality checks, architecture boundaries, metric-extension guidance, and privacy requirements. Persistence changes use the [manual validation guide](docs/persistence-validation.md). The current release plan is in [ROADMAP.md](ROADMAP.md), and notable changes are tracked in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

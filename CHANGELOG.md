@@ -4,6 +4,8 @@ All notable changes to evtap are documented here. The format is based on [Keep a
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-30
+
 ### Added
 
 - Mutable saved sessions that can be selected and resumed indefinitely across application restarts.
@@ -12,23 +14,21 @@ All notable changes to evtap are documented here. The format is based on [Keep a
 - Familiar Save, Discard, and Cancel prompts before dirty session switches or close when autosave is off.
 - A one-time disclosure before the first analytics write; session management itself always works in memory.
 - Versioned, deterministic snapshots for every bundled metric, with strict size and value validation.
-- Private XDG settings, native window-state restoration, a bundled SQLite analytics database, dirty-generation acknowledgements, retries, and bounded shutdown.
-- Generic non-destructive rejection of incompatible experimental, future, corrupt, unidentified, or foreign databases.
+- Private XDG settings, native window-state restoration, a bundled SQLite analytics database, retryable saves, and bounded shutdown.
+- Generic non-destructive rejection of incompatible, future, corrupt, unidentified, or foreign databases.
 
 ### Changed
 
-- Replaced the unreleased active/completed history and retention design with one loaded working session and explicitly user-managed saved sessions.
 - **Stop listening** now pauses the working session and triggers autosave only when configured.
 - Keyboard and XKB values are remembered per session as suggestions rather than locked configuration.
 - Restored and selected sessions remain paused until the user starts listening.
-- The unreleased experimental database and settings schemas intentionally have no migration and must be removed manually.
 
 ### Security
 
 - Raw key events, ordered text, event timestamps, pressed-key state, recent correction context, and unfinished correction/timing observations are excluded from saved snapshots.
 - Stop, switch, listener failure, exit, and restart clear metric in-flight context without clearing durable aggregates.
 - Settings and analytics use restrictive Unix permissions, atomic settings replacement, SQLite application identity, foreign keys, secure deletion, and WAL-backed transactions.
-- The application no longer imposes a special symlink rejection policy; normal operating-system path resolution applies.
+- Storage follows normal operating-system symlink resolution while enforcing private directory and file modes.
 
 ## [0.1.0] - 2026-07-28
 
@@ -59,5 +59,6 @@ All notable changes to evtap are documented here. The format is based on [Keep a
 - Listener read failures terminate cleanly instead of repeatedly emitting stop events.
 - Normal startup and scan paths no longer rely on panic-prone unwraps or expects.
 
-[Unreleased]: https://github.com/schmidma/evtap/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/schmidma/evtap/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/schmidma/evtap/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/schmidma/evtap/releases/tag/v0.1.0
