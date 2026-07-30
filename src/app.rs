@@ -1,11 +1,8 @@
 use std::{
-    collections::HashMap,
-    path::Path,
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use chrono::{Local, TimeZone};
 use color_eyre::{Result, eyre::ContextCompat};
 use eframe::egui::{self, ScrollArea};
 use evdev::KeyCode;
@@ -13,15 +10,14 @@ use tracing::{error, info, warn};
 use xkbcommon::xkb::{self, Context, Keymap};
 
 use crate::{
-    input::{KeyEvent, KeyEventKind, KeyRole, PhysicalKey},
+    input::{KeyEvent, KeyEventKind, KeyRole},
     listener::{self, ListenerHandle},
-    metric::{Metric, default_metrics},
     metric_view::render_metric,
     paths::AppPaths,
     scanner::{self, DeviceMetadata, ScannerHandle},
     session::{
         KeyboardContext, MetricRecoveryIssue, SessionId, SessionMetadata, SessionSnapshot,
-        StoredSession, recover_default_metrics,
+        StoredSession,
     },
     settings::{Settings, SettingsStore},
     storage::{
@@ -31,6 +27,11 @@ use crate::{
     wake::WakeSignal,
     xkb_helper,
 };
+
+mod view;
+mod working_session;
+
+use working_session::WorkingSession;
 
 const HACK_FONT_NAME: &str = "Hack";
 const LISTENER_EXIT_WAIT: Duration = Duration::from_millis(500);
@@ -46,8 +47,6 @@ pub struct App {
     listener_state: ListenerState,
     capture_error: Option<String>,
     wake_signal: WakeSignal,
-    metrics: Vec<Box<dyn Metric>>,
-    physical_keys: HashMap<u16, PhysicalKey>,
 
     model: String,
     layout: String,
@@ -65,7 +64,7 @@ pub struct App {
     settings_load_failed: bool,
 
     storage: Option<StorageWorker>,
-    storage_initialized: bool,
+    initial_storage_open_handled: bool,
     storage_tracker: DirtyTracker,
     checkpoint_schedule: CheckpointSchedule,
     storage_error: Option<String>,
@@ -75,10 +74,10 @@ pub struct App {
     load_request_id: u64,
     loading_session: bool,
 
-    session: CurrentSession,
+    working_session: WorkingSession,
     recovery_messages: Vec<String>,
-    after_save: Option<BoundaryTarget>,
-    deferred_boundary: Option<BoundaryTarget>,
+    pending_boundary_after_save: Option<BoundaryTarget>,
+    pending_boundary_after_stop: Option<BoundaryTarget>,
     boundary_prompt: Option<BoundaryTarget>,
     disclosure_prompt: Option<DisclosureIntent>,
     allow_close: bool,
@@ -100,57 +99,6 @@ enum ListenerState {
     Listening,
     Stopping,
     Failed,
-}
-
-#[derive(Debug)]
-struct CurrentSession {
-    id: Option<SessionId>,
-    name: Option<String>,
-    created_at_ms: i64,
-    last_opened_at_ms: i64,
-    captured_duration: Duration,
-    capture_started_at: Option<Instant>,
-    keyboard: KeyboardContext,
-    restored: bool,
-}
-
-impl CurrentSession {
-    fn untitled(now_ms: i64, model: String, layout: String, variant: String) -> Self {
-        Self {
-            id: None,
-            name: None,
-            created_at_ms: now_ms,
-            last_opened_at_ms: now_ms,
-            captured_duration: Duration::ZERO,
-            capture_started_at: None,
-            keyboard: KeyboardContext {
-                display_name: None,
-                model,
-                layout,
-                variant,
-            },
-            restored: false,
-        }
-    }
-
-    fn display_name(&self) -> &str {
-        self.name.as_deref().unwrap_or("Untitled session")
-    }
-
-    fn duration(&self) -> Duration {
-        self.capture_started_at
-            .map_or(self.captured_duration, |started| {
-                self.captured_duration.saturating_add(started.elapsed())
-            })
-    }
-
-    fn finish_capture_segment(&mut self) -> bool {
-        let Some(started) = self.capture_started_at.take() else {
-            return false;
-        };
-        self.captured_duration = self.captured_duration.saturating_add(started.elapsed());
-        true
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -201,6 +149,15 @@ impl App {
         let available_variants = xkb_helper::get_variants(&layout);
         let xkb_state = init_keyboard_state(&model, &layout, &variant)?;
         let now_ms = unix_now_ms().unwrap_or_default();
+        let working_session = WorkingSession::untitled(
+            now_ms,
+            KeyboardContext {
+                display_name: None,
+                model: model.clone(),
+                layout: layout.clone(),
+                variant: variant.clone(),
+            },
+        );
         let mut storage_tracker = DirtyTracker::default();
         storage_tracker.begin_loading();
         let storage = StorageWorker::spawn(
@@ -219,11 +176,9 @@ impl App {
             listener_state: ListenerState::Idle,
             capture_error: None,
             wake_signal,
-            metrics: default_metrics(),
-            physical_keys: HashMap::new(),
-            model: model.clone(),
-            layout: layout.clone(),
-            variant: variant.clone(),
+            model,
+            layout,
+            variant,
             keyboard_error: None,
             available_models,
             available_layouts,
@@ -235,7 +190,7 @@ impl App {
             settings_error,
             settings_load_failed,
             storage: Some(storage),
-            storage_initialized: false,
+            initial_storage_open_handled: false,
             storage_tracker,
             checkpoint_schedule: CheckpointSchedule::default(),
             storage_error: None,
@@ -244,10 +199,10 @@ impl App {
             list_request_id: 0,
             load_request_id: 0,
             loading_session: false,
-            session: CurrentSession::untitled(now_ms, model, layout, variant),
+            working_session,
             recovery_messages: Vec::new(),
-            after_save: None,
-            deferred_boundary: None,
+            pending_boundary_after_save: None,
+            pending_boundary_after_stop: None,
             boundary_prompt: None,
             disclosure_prompt: None,
             allow_close: false,
@@ -306,7 +261,7 @@ impl App {
     }
 
     fn select_remembered_device(&mut self) {
-        let Some(name) = self.session.keyboard.display_name.as_deref() else {
+        let Some(name) = self.working_session.keyboard.display_name.as_deref() else {
             return;
         };
         let Some(devices) = &self.devices else {
@@ -335,14 +290,14 @@ impl App {
                 listener::Event::Connected => {
                     self.listener_state = ListenerState::Listening;
                     self.capture_error = None;
-                    self.session.capture_started_at = Some(Instant::now());
+                    self.working_session.start_capture();
                     info!("listener connected to keyboard");
                 }
                 listener::Event::Stopped { reason } => {
                     let is_error = reason.is_error();
                     let message = reason.to_string();
                     self.listener = None;
-                    if self.session.finish_capture_segment() {
+                    if self.working_session.finish_capture_segment() {
                         self.note_session_dirty();
                     }
                     self.clear_in_flight();
@@ -353,7 +308,7 @@ impl App {
                         self.capture_error = None;
                         ListenerState::Idle
                     };
-                    if let Some(target) = self.deferred_boundary.take() {
+                    if let Some(target) = self.pending_boundary_after_stop.take() {
                         self.continue_boundary(target);
                     } else if self.settings.autosave_enabled() && self.working_dirty() {
                         self.request_save(None);
@@ -385,35 +340,25 @@ impl App {
             KeyEventKind::Repeat => {}
         }
 
-        let key = self
-            .physical_keys
-            .entry(code)
-            .or_insert_with(|| {
-                let debug_name = format!("{key_code:?}");
-                let label = debug_name
-                    .strip_prefix("KEY_")
-                    .unwrap_or(&debug_name)
-                    .to_owned();
-                PhysicalKey::new(code, label)
-            })
-            .clone();
+        let key = self.working_session.physical_key(code, || {
+            let debug_name = format!("{key_code:?}");
+            debug_name
+                .strip_prefix("KEY_")
+                .unwrap_or(&debug_name)
+                .to_owned()
+        });
         let role = if key_code == KeyCode::KEY_BACKSPACE {
             KeyRole::Backspace
         } else {
             KeyRole::Other
         };
         let event = KeyEvent::new(key, text, timestamp, kind, role);
-        for metric in &mut self.metrics {
-            metric.process(&event);
-        }
+        self.working_session.process(&event);
         self.note_session_dirty();
     }
 
     fn clear_in_flight(&mut self) {
-        for metric in &mut self.metrics {
-            metric.clear_in_flight();
-        }
-        self.physical_keys.clear();
+        self.working_session.clear_in_flight();
         self.reinit_xkb();
     }
 
@@ -435,25 +380,29 @@ impl App {
     fn handle_storage_event(&mut self, event: StorageEvent) {
         match event {
             StorageEvent::Opened { sessions, selected } => {
-                let first_open = !self.storage_initialized;
-                self.storage_initialized = true;
+                let first_open = !self.initial_storage_open_handled;
+                self.initial_storage_open_handled = true;
                 self.sessions = sessions;
                 self.storage_error = None;
                 self.last_failed_operation = None;
                 if first_open {
                     if let Some(selected) = selected {
                         self.restore_session(selected);
-                        self.storage_tracker.loaded(true);
+                        self.storage_tracker.reset_saved();
                     } else {
-                        self.storage_tracker.loaded(false);
+                        self.storage_tracker.reset_unsaved();
                         if self.settings.last_session_id().is_some() {
                             self.settings.set_last_session_id(None);
                             self.save_settings();
                         }
                     }
                 } else {
-                    self.storage_tracker.loaded(self.session.id.is_some());
-                    if self.session.id.is_none() && self.session_has_content() {
+                    if self.working_session.id.is_some() {
+                        self.storage_tracker.reset_saved();
+                    } else {
+                        self.storage_tracker.reset_unsaved();
+                    }
+                    if self.working_session.id.is_none() && self.session_has_content() {
                         self.note_session_dirty();
                     }
                 }
@@ -462,11 +411,11 @@ impl App {
                 generation,
                 session_id,
             } => {
-                self.session.id = Some(session_id);
+                self.working_session.id = Some(session_id);
                 if let Err(error) = self.storage_tracker.acknowledge(generation) {
                     self.storage_error = Some(format!("Unexpected save acknowledgement: {error}"));
                     self.storage_tracker.set_failed();
-                    self.after_save = None;
+                    self.pending_boundary_after_save = None;
                     return;
                 }
                 self.settings.set_last_session_id(Some(session_id));
@@ -475,10 +424,10 @@ impl App {
                 self.last_failed_operation = None;
                 self.request_session_list();
                 if self.storage_tracker.is_dirty() {
-                    if let Some(target) = self.after_save {
+                    if let Some(target) = self.pending_boundary_after_save {
                         self.begin_save(Some(target));
                     }
-                } else if let Some(target) = self.after_save.take() {
+                } else if let Some(target) = self.pending_boundary_after_save.take() {
                     self.execute_boundary(target);
                 }
             }
@@ -502,7 +451,7 @@ impl App {
                     Some(session) => {
                         let id = session.metadata.id;
                         self.restore_session(session);
-                        self.storage_tracker.loaded(true);
+                        self.storage_tracker.reset_saved();
                         self.settings.set_last_session_id(Some(id));
                         self.save_settings();
                         self.request_session_list();
@@ -521,7 +470,7 @@ impl App {
                 deleted,
             } => {
                 self.deleting_session = false;
-                if deleted && self.session.id == Some(session_id) {
+                if deleted && self.working_session.id == Some(session_id) {
                     self.new_working_session();
                 }
                 self.request_session_list();
@@ -541,9 +490,9 @@ impl App {
                 self.last_failed_operation = Some(failure.operation);
                 if let Some(generation) = failure.generation {
                     let _ = self.storage_tracker.fail(generation);
-                    self.after_save = None;
+                    self.pending_boundary_after_save = None;
                 } else if failure.operation == StorageOperation::Open {
-                    self.storage_initialized = true;
+                    self.initial_storage_open_handled = true;
                     self.storage_tracker.set_failed();
                 }
                 if failure.operation == StorageOperation::Load {
@@ -561,31 +510,18 @@ impl App {
     }
 
     fn restore_session(&mut self, stored: StoredSession) {
-        let recovered = recover_default_metrics(&stored.metrics);
-        self.recovery_messages = recovered
-            .issues
+        let keyboard = stored.metadata.keyboard.clone();
+        let (working_session, recovery_issues) = WorkingSession::restore(stored);
+        self.recovery_messages = recovery_issues
             .iter()
             .map(metric_recovery_message)
             .collect();
-        self.metrics = recovered.metrics;
-        let metadata = stored.metadata;
-        self.model.clone_from(&metadata.keyboard.model);
-        self.layout.clone_from(&metadata.keyboard.layout);
-        self.variant.clone_from(&metadata.keyboard.variant);
+        self.model.clone_from(&keyboard.model);
+        self.layout.clone_from(&keyboard.layout);
+        self.variant.clone_from(&keyboard.variant);
         self.available_variants = xkb_helper::get_variants(&self.layout);
         self.reinit_xkb();
-        self.session = CurrentSession {
-            id: Some(metadata.id),
-            name: metadata.name,
-            created_at_ms: metadata.created_at_ms,
-            last_opened_at_ms: metadata.last_opened_at_ms,
-            captured_duration: Duration::from_nanos(
-                u64::try_from(metadata.captured_duration_ns).unwrap_or_default(),
-            ),
-            capture_started_at: None,
-            keyboard: metadata.keyboard,
-            restored: true,
-        };
+        self.working_session = working_session;
         self.listener = None;
         self.listener_state = ListenerState::Idle;
         self.clear_in_flight();
@@ -594,17 +530,18 @@ impl App {
 
     fn new_working_session(&mut self) {
         let now_ms = unix_now_ms().unwrap_or_default();
-        self.metrics = default_metrics();
-        self.physical_keys.clear();
-        self.session = CurrentSession::untitled(
+        self.working_session = WorkingSession::untitled(
             now_ms,
-            self.model.clone(),
-            self.layout.clone(),
-            self.variant.clone(),
+            KeyboardContext {
+                display_name: None,
+                model: self.model.clone(),
+                layout: self.layout.clone(),
+                variant: self.variant.clone(),
+            },
         );
         self.listener = None;
         self.listener_state = ListenerState::Idle;
-        self.storage_tracker.loaded(false);
+        self.storage_tracker.reset_unsaved();
         self.checkpoint_schedule.clear();
         self.recovery_messages.clear();
         self.settings.set_last_session_id(None);
@@ -622,7 +559,7 @@ impl App {
     }
 
     fn working_dirty(&self) -> bool {
-        if self.session.id.is_some() {
+        if self.working_session.id.is_some() {
             self.storage_tracker.is_dirty()
         } else {
             self.session_has_content()
@@ -630,10 +567,7 @@ impl App {
     }
 
     fn session_has_content(&self) -> bool {
-        self.session.name.is_some()
-            || !self.session.captured_duration.is_zero()
-            || self.session.capture_started_at.is_some()
-            || self.metrics.iter().any(|metric| metric.has_data())
+        self.working_session.has_content()
     }
 
     fn request_save(&mut self, after: Option<BoundaryTarget>) {
@@ -647,11 +581,11 @@ impl App {
     fn begin_save(&mut self, after: Option<BoundaryTarget>) {
         if self.storage_tracker.in_flight().is_some() {
             if after.is_some() {
-                self.after_save = after;
+                self.pending_boundary_after_save = after;
             }
             return;
         }
-        if self.session.id.is_none()
+        if self.working_session.id.is_none()
             && matches!(
                 self.storage_tracker.status(),
                 StorageStatus::Failed | StorageStatus::Saved
@@ -680,7 +614,7 @@ impl App {
                 return;
             }
         };
-        self.after_save = after;
+        self.pending_boundary_after_save = after;
         let command = StorageCommand::Save(SaveRequest {
             generation,
             snapshot,
@@ -690,36 +624,18 @@ impl App {
             Some(Err(error)) => {
                 let _ = self.storage_tracker.fail(generation);
                 self.storage_error = Some(format!("Could not request save: {error}"));
-                self.after_save = None;
+                self.pending_boundary_after_save = None;
             }
             None => {
                 let _ = self.storage_tracker.fail(generation);
                 self.storage_error = Some("Storage worker is unavailable".to_owned());
-                self.after_save = None;
+                self.pending_boundary_after_save = None;
             }
         }
     }
 
     fn session_snapshot(&self) -> Result<SessionSnapshot, String> {
-        let duration_ns = i64::try_from(self.session.duration().as_nanos())
-            .map_err(|_| "Capture duration exceeds the storage range".to_owned())?;
-        let metrics = self
-            .metrics
-            .iter()
-            .map(|metric| metric.snapshot().map_err(|error| error.to_string()))
-            .collect::<Result<Vec<_>, _>>()?;
-        let now_ms = unix_now_ms()?;
-        Ok(SessionSnapshot {
-            id: self.session.id,
-            name: self.session.name.clone(),
-            created_at_ms: self.session.created_at_ms,
-            updated_at_ms: now_ms,
-            last_opened_at_ms: self.session.last_opened_at_ms.max(now_ms),
-            captured_duration_ns: duration_ns,
-            application_version: env!("CARGO_PKG_VERSION").to_owned(),
-            keyboard: self.session.keyboard.clone(),
-            metrics,
-        })
+        self.working_session.snapshot(unix_now_ms()?)
     }
 
     fn request_session_list(&mut self) {
@@ -733,7 +649,7 @@ impl App {
 
     fn request_boundary(&mut self, target: BoundaryTarget) {
         if self.listener.is_some() {
-            self.deferred_boundary = Some(target);
+            self.pending_boundary_after_stop = Some(target);
             self.stop_listener();
         } else {
             self.clear_in_flight();
@@ -750,7 +666,7 @@ impl App {
     }
 
     fn execute_boundary(&mut self, target: BoundaryTarget) {
-        self.after_save = None;
+        self.pending_boundary_after_save = None;
         self.boundary_prompt = None;
         match target {
             BoundaryTarget::New => self.new_working_session(),
@@ -835,14 +751,15 @@ impl App {
         else {
             return;
         };
-        self.session.keyboard = KeyboardContext {
+        self.working_session.keyboard = KeyboardContext {
             display_name: Some(device.name.clone()),
             model: self.model.clone(),
             layout: self.layout.clone(),
             variant: self.variant.clone(),
         };
-        self.session.last_opened_at_ms = unix_now_ms().unwrap_or(self.session.last_opened_at_ms);
-        self.session.restored = false;
+        self.working_session.last_opened_at_ms =
+            unix_now_ms().unwrap_or(self.working_session.last_opened_at_ms);
+        self.working_session.restored = false;
         self.note_session_dirty();
         self.listener = Some(listener::spawn(device.path, self.wake_signal.clone()));
         self.listener_state = ListenerState::Connecting;
@@ -855,13 +772,13 @@ impl App {
             Some(Ok(())) => self.listener_state = ListenerState::Stopping,
             Some(Err(error)) => {
                 self.listener = None;
-                if self.session.finish_capture_segment() {
+                if self.working_session.finish_capture_segment() {
                     self.note_session_dirty();
                 }
                 self.clear_in_flight();
                 self.listener_state = ListenerState::Failed;
                 self.capture_error = Some(format!("Could not stop listener: {error:#}"));
-                if let Some(target) = self.deferred_boundary.take() {
+                if let Some(target) = self.pending_boundary_after_stop.take() {
                     self.continue_boundary(target);
                 } else if self.settings.autosave_enabled() && self.working_dirty() {
                     self.request_save(None);
@@ -880,14 +797,14 @@ impl App {
         let name = (!trimmed.is_empty()).then(|| trimmed.to_owned());
         if let Some(name) = &name
             && self.sessions.iter().any(|session| {
-                Some(session.id) != self.session.id && session.name.as_ref() == Some(name)
+                Some(session.id) != self.working_session.id && session.name.as_ref() == Some(name)
             })
         {
             self.rename_error = Some("Another saved session already uses that name.".to_owned());
             return;
         }
-        if self.session.name != name {
-            self.session.name = name;
+        if self.working_session.name != name {
+            self.working_session.name = name;
             self.note_session_dirty();
         }
         self.rename_open = false;
@@ -895,19 +812,14 @@ impl App {
     }
 
     fn reset_statistics(&mut self) {
-        for metric in &mut self.metrics {
-            metric.reset();
-        }
-        self.physical_keys.clear();
-        self.session.captured_duration = Duration::ZERO;
-        self.session.capture_started_at = None;
+        self.working_session.reset_statistics();
         self.note_session_dirty();
         self.confirm_reset = false;
     }
 
     fn delete_current_session(&mut self) {
         self.confirm_delete = false;
-        let Some(session_id) = self.session.id else {
+        let Some(session_id) = self.working_session.id else {
             self.new_working_session();
             return;
         };
@@ -931,507 +843,13 @@ impl App {
         }
     }
 
-    fn render_session_management(&mut self, ui: &mut egui::Ui) {
-        ui.group(|ui| {
-            ui.set_width(ui.available_width());
-            ui.heading("Session");
-            let busy = self.loading_session
-                || self.storage_tracker.in_flight().is_some()
-                || self.deleting_session
-                || self.deleting_all
-                || self.listener_state == ListenerState::Stopping;
-            let mut requested_target = None;
-            ui.horizontal_wrapped(|ui| {
-                ui.add_enabled_ui(!busy, |ui| {
-                    egui::ComboBox::from_label("Current")
-                        .selected_text(self.session.display_name())
-                        .show_ui(ui, |ui| {
-                            for saved in &self.sessions {
-                                let selected = self.session.id == Some(saved.id);
-                                let label = session_selector_label(saved);
-                                if ui.selectable_label(selected, label).clicked() && !selected {
-                                    requested_target = Some(BoundaryTarget::Load(saved.id));
-                                }
-                            }
-                        });
-                });
-                if ui
-                    .add_enabled(!busy, egui::Button::new("New session"))
-                    .clicked()
-                {
-                    requested_target = Some(BoundaryTarget::New);
-                }
-                if ui
-                    .add_enabled(!busy, egui::Button::new("Save now"))
-                    .clicked()
-                {
-                    self.request_save(None);
-                }
-                if ui.add_enabled(!busy, egui::Button::new("Rename")).clicked() {
-                    self.rename_buffer = self.session.name.clone().unwrap_or_default();
-                    self.rename_open = true;
-                    self.rename_error = None;
-                }
-                if ui
-                    .add_enabled(
-                        self.listener.is_none() && !busy,
-                        egui::Button::new("Reset statistics"),
-                    )
-                    .clicked()
-                {
-                    self.confirm_reset = true;
-                }
-                if ui
-                    .add_enabled(
-                        self.listener.is_none() && !busy,
-                        egui::Button::new("Delete session"),
-                    )
-                    .clicked()
-                {
-                    self.confirm_delete = true;
-                }
-            });
-            if let Some(target) = requested_target {
-                self.request_boundary(target);
-            }
-
-            ui.horizontal_wrapped(|ui| {
-                let mut autosave = self.settings.autosave_enabled();
-                if ui.checkbox(&mut autosave, "Autosave sessions").changed() {
-                    if autosave {
-                        if self.settings.storage_disclosure_acknowledged() {
-                            self.settings.set_autosave_enabled(true);
-                            if self.save_settings() {
-                                if self.working_dirty() {
-                                    self.request_save(None);
-                                }
-                            } else {
-                                self.settings.set_autosave_enabled(false);
-                            }
-                        } else {
-                            self.disclosure_prompt = Some(DisclosureIntent::EnableAutosave);
-                        }
-                    } else {
-                        self.settings.set_autosave_enabled(false);
-                        if self.save_settings() {
-                            self.checkpoint_schedule.clear();
-                        } else {
-                            self.settings.set_autosave_enabled(true);
-                        }
-                    }
-                }
-                ui.label(storage_status_label(
-                    self.storage_tracker.status(),
-                    self.session.id.is_some(),
-                ));
-                let retryable = matches!(
-                    self.last_failed_operation,
-                    Some(StorageOperation::Open | StorageOperation::Save)
-                );
-                if retryable && ui.button("Retry storage operation").clicked() {
-                    if self.last_failed_operation == Some(StorageOperation::Open) {
-                        if let Some(worker) = &self.storage {
-                            let _ = worker.send(StorageCommand::RetryOpen {
-                                last_session_id: self.settings.last_session_id(),
-                            });
-                        }
-                    } else {
-                        self.request_save(None);
-                    }
-                }
-            });
-            ui.small(format!(
-                "Capture duration: {} · Created: {}",
-                format_duration(self.session.duration()),
-                format_local_timestamp(self.session.created_at_ms)
-            ));
-            if self.session.restored {
-                ui.weak("Restored from disk; capture is paused until you start listening.");
-            }
-            if let Some(error) = &self.storage_error {
-                ui.colored_label(egui::Color32::RED, error);
-            }
-            ui.horizontal_wrapped(|ui| {
-                ui.small(format!(
-                    "Storage: {} ({})",
-                    self.paths.database_file().display(),
-                    format_byte_size(database_disk_usage(&self.paths.database_file()))
-                ));
-                if ui
-                    .add_enabled(
-                        !self.sessions.is_empty() && !busy,
-                        egui::Button::new("Delete all saved sessions"),
-                    )
-                    .clicked()
-                {
-                    self.confirm_delete_all = true;
-                }
-            });
-        });
-    }
-
-    fn render_capture_setup(&mut self, ui: &mut egui::Ui) {
-        ui.group(|ui| {
-            ui.set_width(ui.available_width());
-            ui.heading("Capture setup");
-            self.render_device_picker(ui);
-            ui.add_space(4.0);
-            self.render_keyboard_configuration(ui);
-            ui.add_space(4.0);
-            self.render_capture_controls(ui);
-            self.render_capture_status(ui);
-        });
-    }
-
-    fn render_device_picker(&mut self, ui: &mut egui::Ui) {
-        let picker_enabled = self.listener.is_none()
-            && !matches!(self.listener_state, ListenerState::Stopping)
-            && !self.loading_session;
-        let mut request_scan = false;
-        ui.horizontal_wrapped(|ui| {
-            match &self.devices {
-                None => {
-                    ui.spinner();
-                    ui.label("Scanning for keyboards…");
-                }
-                Some(devices) if devices.is_empty() => {
-                    ui.label("No readable keyboards");
-                }
-                Some(devices) => {
-                    let text = self
-                        .selected_device
-                        .and_then(|index| devices.get(index))
-                        .map_or("Select a keyboard", |device| device.name.as_str());
-                    ui.add_enabled_ui(picker_enabled, |ui| {
-                        egui::ComboBox::from_label("Keyboard")
-                            .selected_text(text)
-                            .show_ui(ui, |ui| {
-                                for (index, device) in devices.iter().enumerate() {
-                                    ui.selectable_value(
-                                        &mut self.selected_device,
-                                        Some(index),
-                                        &device.name,
-                                    )
-                                    .on_hover_ui(|ui| {
-                                        ui.label(format!(
-                                            "{} ({})",
-                                            device.physical_path, device.path
-                                        ));
-                                    });
-                                }
-                            });
-                    });
-                }
-            }
-            if ui
-                .add_enabled(
-                    picker_enabled && self.devices.is_some(),
-                    egui::Button::new("Rescan"),
-                )
-                .clicked()
-            {
-                request_scan = true;
-            }
-        });
-        if self.session.keyboard.display_name.is_some() {
-            ui.weak("The session's remembered keyboard is a suggestion; any readable keyboard may be used.");
-        }
-        if request_scan {
-            self.request_scan();
-        }
-    }
-
-    fn render_keyboard_configuration(&mut self, ui: &mut egui::Ui) {
-        let enabled = self.listener.is_none() && !self.loading_session;
-        let mut changed = false;
-        ui.add_enabled_ui(enabled, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                egui::ComboBox::from_label("Model")
-                    .width(80.0)
-                    .selected_text(&self.model)
-                    .show_ui(ui, |ui| {
-                        for model in &self.available_models {
-                            changed |= ui
-                                .selectable_value(&mut self.model, model.clone(), model)
-                                .clicked();
-                        }
-                    });
-                egui::ComboBox::from_label("Layout")
-                    .selected_text(&self.layout)
-                    .show_ui(ui, |ui| {
-                        let mut update_variants = false;
-                        for layout in &self.available_layouts {
-                            if ui
-                                .selectable_value(&mut self.layout, layout.clone(), layout)
-                                .clicked()
-                            {
-                                changed = true;
-                                update_variants = true;
-                            }
-                        }
-                        if update_variants {
-                            self.update_variants();
-                        }
-                    });
-                let variant_text = if self.variant.is_empty() {
-                    "Default"
-                } else {
-                    &self.variant
-                };
-                egui::ComboBox::from_label("Variant")
-                    .selected_text(variant_text)
-                    .show_ui(ui, |ui| {
-                        changed |= ui
-                            .selectable_value(&mut self.variant, String::new(), "Default")
-                            .clicked();
-                        for variant in &self.available_variants {
-                            if !variant.is_empty() {
-                                changed |= ui
-                                    .selectable_value(&mut self.variant, variant.clone(), variant)
-                                    .clicked();
-                            }
-                        }
-                    });
-            });
-        });
-        if changed {
-            self.reinit_xkb();
-            self.save_keyboard_settings();
-            self.session.keyboard.model.clone_from(&self.model);
-            self.session.keyboard.layout.clone_from(&self.layout);
-            self.session.keyboard.variant.clone_from(&self.variant);
-            if self.session.id.is_some() || self.session_has_content() {
-                self.note_session_dirty();
-            }
-        }
-    }
-
-    fn render_capture_controls(&mut self, ui: &mut egui::Ui) {
-        let busy = self.loading_session
-            || self.deleting_session
-            || self.deleting_all
-            || matches!(self.listener_state, ListenerState::Stopping);
-        ui.horizontal_wrapped(|ui| {
-            if self.listener.is_some() {
-                if ui
-                    .add_enabled(!busy, egui::Button::new("Stop listening"))
-                    .clicked()
-                {
-                    self.stop_listener();
-                }
-            } else {
-                let selected_index = self.selected_device;
-                if ui
-                    .add_enabled(
-                        selected_index.is_some() && !busy,
-                        egui::Button::new("Start listening"),
-                    )
-                    .clicked()
-                    && let Some(index) = selected_index
-                {
-                    self.begin_listening(index);
-                }
-            }
-        });
-    }
-
-    fn render_capture_status(&self, ui: &mut egui::Ui) {
-        for error in [
-            self.scan_error.as_ref(),
-            self.keyboard_error.as_ref(),
-            self.settings_error.as_ref(),
-            self.capture_error.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            ui.colored_label(egui::Color32::RED, error);
-        }
-        if let Some(warning) = &self.scan_warning {
-            ui.colored_label(egui::Color32::YELLOW, warning);
-        }
-        match self.listener_state {
-            ListenerState::Idle => ui.weak("Not listening"),
-            ListenerState::Connecting => ui.label("Connecting to keyboard…"),
-            ListenerState::Listening => ui.colored_label(egui::Color32::GREEN, "Listening"),
-            ListenerState::Stopping => ui.label("Stopping listener…"),
-            ListenerState::Failed => {
-                ui.colored_label(egui::Color32::RED, "Capture stopped because of an error")
-            }
-        };
-    }
-
-    fn render_prompts(&mut self, ctx: &egui::Context) {
-        if let Some(intent) = self.disclosure_prompt {
-            egui::Window::new("Save sensitive aggregate statistics?")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .show(ctx, |ui| {
-                    ui.label("evtap reads global keyboard input while listening. Saving writes sensitive character, bigram, correction, key-usage, count, and timing aggregates to a local, unencrypted SQLite database.");
-                    ui.label("Raw event sequences, device paths, pressed-key state, and unfinished timing or correction context are not stored. No telemetry or synchronization is performed.");
-                    ui.colored_label(egui::Color32::YELLOW, "Anyone who can read your files, including backups or privileged processes, may read the saved aggregates.");
-                    ui.horizontal(|ui| {
-                        if ui.button("Allow local saves").clicked() {
-                            self.settings.acknowledge_storage_disclosure();
-                            if self.save_settings() {
-                                self.disclosure_prompt = None;
-                                match intent {
-                                    DisclosureIntent::Save(after) => self.begin_save(after),
-                                    DisclosureIntent::EnableAutosave => {
-                                        self.settings.set_autosave_enabled(true);
-                                        if self.save_settings() {
-                                            if self.working_dirty() {
-                                                self.begin_save(None);
-                                            }
-                                        } else {
-                                            self.settings.set_autosave_enabled(false);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if ui.button("Cancel").clicked() {
-                            self.disclosure_prompt = None;
-                        }
-                    });
-                });
-        }
-
-        if let Some(target) = self.boundary_prompt {
-            let exiting = target == BoundaryTarget::Exit;
-            egui::Window::new(if exiting {
-                "Save changes before exiting?"
-            } else {
-                "Save changes before switching sessions?"
-            })
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .show(ctx, |ui| {
-                ui.label(format!(
-                    "{} has unsaved changes.",
-                    self.session.display_name()
-                ));
-                ui.horizontal(|ui| {
-                    if ui
-                        .button(if exiting {
-                            "Save and exit"
-                        } else {
-                            "Save and switch"
-                        })
-                        .clicked()
-                    {
-                        self.boundary_prompt = None;
-                        self.request_save(Some(target));
-                    }
-                    if ui
-                        .button(if self.session.id.is_some() {
-                            "Discard changes"
-                        } else {
-                            "Discard session"
-                        })
-                        .clicked()
-                    {
-                        self.boundary_prompt = None;
-                        self.execute_boundary(target);
-                    }
-                    if ui.button("Cancel").clicked() {
-                        self.boundary_prompt = None;
-                    }
-                });
-            });
-        }
-
-        if self.rename_open {
-            egui::Window::new("Rename session")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .show(ctx, |ui| {
-                    ui.label("Leave the name empty to keep this session untitled.");
-                    ui.text_edit_singleline(&mut self.rename_buffer);
-                    if let Some(error) = &self.rename_error {
-                        ui.colored_label(egui::Color32::RED, error);
-                    }
-                    ui.horizontal(|ui| {
-                        if ui.button("Apply").clicked() {
-                            self.apply_rename();
-                        }
-                        if ui.button("Cancel").clicked() {
-                            self.rename_open = false;
-                            self.rename_error = None;
-                        }
-                    });
-                });
-        }
-
-        if self.confirm_reset {
-            egui::Window::new("Reset statistics?")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .show(ctx, |ui| {
-                    ui.label("All aggregate statistics and capture duration in the current session will be reset.");
-                    ui.horizontal(|ui| {
-                        if ui.button("Reset statistics").clicked() {
-                            self.reset_statistics();
-                        }
-                        if ui.button("Cancel").clicked() {
-                            self.confirm_reset = false;
-                        }
-                    });
-                });
-        }
-
-        if self.confirm_delete {
-            egui::Window::new("Delete session?")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .show(ctx, |ui| {
-                    if self.session.id.is_some() {
-                        ui.label("The saved copy and all current unsaved changes will be deleted. This cannot be undone.");
-                    } else {
-                        ui.label("The current in-memory session will be discarded. This cannot be undone.");
-                    }
-                    ui.horizontal(|ui| {
-                        if ui.button("Delete permanently").clicked() {
-                            self.delete_current_session();
-                        }
-                        if ui.button("Cancel").clicked() {
-                            self.confirm_delete = false;
-                        }
-                    });
-                });
-        }
-
-        if self.confirm_delete_all {
-            egui::Window::new("Delete all saved sessions?")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .show(ctx, |ui| {
-                    ui.label("Every saved session and the current working state will be removed. Filesystem backups and snapshots may retain copies.");
-                    ui.horizontal(|ui| {
-                        if ui.button("Delete all permanently").clicked() {
-                            self.delete_all_sessions();
-                        }
-                        if ui.button("Cancel").clicked() {
-                            self.confirm_delete_all = false;
-                        }
-                    });
-                });
-        }
-    }
-
     fn handle_close_request(&mut self, ctx: &egui::Context) {
         let close_requested = ctx.input(|input| input.viewport().close_requested());
         if close_requested && !self.allow_close {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             if self.boundary_prompt.is_none()
                 && self.disclosure_prompt.is_none()
-                && self.after_save.is_none()
+                && self.pending_boundary_after_save.is_none()
             {
                 self.request_boundary(BoundaryTarget::Exit);
             }
@@ -1504,81 +922,11 @@ fn storage_operation_label(operation: StorageOperation) -> &'static str {
     }
 }
 
-fn session_selector_label(metadata: &SessionMetadata) -> String {
-    let keyboard = metadata
-        .keyboard
-        .display_name
-        .as_deref()
-        .unwrap_or("No keyboard");
-    format!(
-        "{} — {} — {}",
-        metadata.display_name(),
-        keyboard,
-        format_local_timestamp(metadata.updated_at_ms)
-    )
-}
-
-fn database_disk_usage(database_path: &Path) -> u64 {
-    let sidecar = |suffix: &str| {
-        let mut path = database_path.as_os_str().to_os_string();
-        path.push(suffix);
-        std::path::PathBuf::from(path)
-    };
-    [
-        database_path.to_path_buf(),
-        sidecar("-wal"),
-        sidecar("-shm"),
-    ]
-    .into_iter()
-    .filter_map(|path| path.metadata().ok().map(|metadata| metadata.len()))
-    .fold(0_u64, u64::saturating_add)
-}
-
-fn format_byte_size(bytes: u64) -> String {
-    const KIBIBYTE: u64 = 1024;
-    const MEBIBYTE: u64 = 1024 * KIBIBYTE;
-    if bytes >= MEBIBYTE {
-        format!("{:.1} MiB", bytes as f64 / MEBIBYTE as f64)
-    } else if bytes >= KIBIBYTE {
-        format!("{:.1} KiB", bytes as f64 / KIBIBYTE as f64)
-    } else {
-        format!("{bytes} B")
-    }
-}
-
-fn format_duration(duration: Duration) -> String {
-    let seconds = duration.as_secs();
-    let hours = seconds / 3_600;
-    let minutes = (seconds % 3_600) / 60;
-    let seconds = seconds % 60;
-    format!("{hours:02}:{minutes:02}:{seconds:02}")
-}
-
-fn format_local_timestamp(timestamp_ms: i64) -> String {
-    Local
-        .timestamp_millis_opt(timestamp_ms)
-        .single()
-        .map(|timestamp| timestamp.format("%Y-%m-%d %H:%M:%S %:z").to_string())
-        .unwrap_or_else(|| format!("{timestamp_ms} ms since Unix epoch"))
-}
-
 fn boundary_policy(dirty: bool, autosave: bool) -> BoundaryPolicy {
     match (dirty, autosave) {
         (false, _) => BoundaryPolicy::Proceed,
         (true, true) => BoundaryPolicy::Save,
         (true, false) => BoundaryPolicy::Prompt,
-    }
-}
-
-fn storage_status_label(status: StorageStatus, has_id: bool) -> &'static str {
-    match status {
-        StorageStatus::Loading => "Loading saved sessions…",
-        StorageStatus::Unsaved => "Unsaved session",
-        StorageStatus::Saved if has_id => "Saved",
-        StorageStatus::Saved => "Unsaved session",
-        StorageStatus::Dirty => "Unsaved changes",
-        StorageStatus::Saving => "Saving…",
-        StorageStatus::Failed => "Storage operation failed",
     }
 }
 
@@ -1624,7 +972,7 @@ impl eframe::App for App {
                     ui.heading("Session analytics");
                     ui.small("Only aggregate snapshots are saved; input sequences and unfinished event context remain in memory.");
                     ui.add_space(4.0);
-                    for metric in &self.metrics {
+                    for metric in &self.working_session.metrics {
                         ui.group(|ui| {
                             ui.set_width(ui.available_width());
                             render_metric(ui, metric.as_ref());
@@ -1645,7 +993,7 @@ impl eframe::App for App {
                 thread::sleep(Duration::from_millis(10));
             }
         }
-        if self.session.finish_capture_segment() {
+        if self.working_session.finish_capture_segment() {
             self.note_session_dirty();
         }
         self.clear_in_flight();
@@ -1677,620 +1025,4 @@ impl eframe::App for App {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{
-        fs, thread,
-        time::{Duration, SystemTime},
-    };
-
-    use super::{
-        App, BoundaryPolicy, HACK_FONT_NAME, ListenerState, SessionMetadata, StorageOperation,
-        StorageStatus, boundary_policy, database_disk_usage, font_definitions,
-        session_selector_label, storage_status_label,
-    };
-    use crate::{
-        input::KeyEventKind,
-        paths::AppPaths,
-        session::{KeyboardContext, SessionId},
-    };
-    use eframe::egui;
-    use egui_kittest::{Harness, kittest::Queryable};
-    use evdev::KeyCode;
-
-    fn headless_harness(paths: AppPaths) -> Harness<'static, App> {
-        Harness::builder()
-            .with_size(egui::vec2(900.0, 1_200.0))
-            .build_eframe(move |creation_context| App::new(creation_context, paths).unwrap())
-    }
-
-    fn wait_for_app(harness: &mut Harness<'_, App>, predicate: impl Fn(&App) -> bool) {
-        wait_for_app_attempts(harness, 200, predicate);
-    }
-
-    fn wait_for_app_attempts(
-        harness: &mut Harness<'_, App>,
-        attempts: usize,
-        predicate: impl Fn(&App) -> bool,
-    ) {
-        for _ in 0..attempts {
-            harness.step();
-            if predicate(harness.state()) {
-                return;
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
-        panic!("headless app did not reach the expected state");
-    }
-
-    fn request_headless_close(harness: &mut Harness<'_, App>) {
-        harness
-            .input_mut()
-            .viewports
-            .get_mut(&egui::ViewportId::ROOT)
-            .unwrap()
-            .events
-            .push(egui::ViewportEvent::Close);
-        harness.step();
-        harness
-            .input_mut()
-            .viewports
-            .get_mut(&egui::ViewportId::ROOT)
-            .unwrap()
-            .events
-            .clear();
-    }
-
-    fn shutdown_harness(harness: &mut Harness<'_, App>) {
-        eframe::App::on_exit(harness.state_mut(), None);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn headless_manual_save_disclosure_and_restart() {
-        let temporary = tempfile::tempdir().unwrap();
-        let paths = AppPaths::with_roots(
-            temporary.path().join("config"),
-            temporary.path().join("data"),
-        );
-        paths.prepare_data_dir().unwrap();
-        let database = paths.database_file();
-
-        let saved_session_id = {
-            let mut harness = headless_harness(paths.clone());
-            wait_for_app(&mut harness, |app| app.storage_initialized);
-
-            assert_eq!(harness.state().session.display_name(), "Untitled session");
-            assert_eq!(harness.state().listener_state, ListenerState::Idle);
-            assert!(!database.exists());
-
-            harness.state_mut().process_input(
-                SystemTime::now(),
-                KeyCode::KEY_A,
-                KeyEventKind::Press,
-            );
-            harness.step();
-            assert!(harness.state().working_dirty());
-            assert!(harness.query_by_label("Presses: 1").is_some());
-
-            harness.get_by_label("Save now").click();
-            harness.run();
-            assert!(
-                harness
-                    .query_by_label("Save sensitive aggregate statistics?")
-                    .is_some()
-            );
-            assert!(!database.exists());
-
-            harness.get_by_label("Cancel").click();
-            harness.run();
-            assert!(!database.exists());
-
-            harness.get_by_label("Save now").click();
-            harness.run();
-            harness.get_by_label("Allow local saves").click();
-            harness.run();
-            wait_for_app(&mut harness, |app| {
-                app.session.id.is_some() && app.storage_tracker.status() == StorageStatus::Saved
-            });
-
-            let saved_session_id = harness.state().session.id.unwrap();
-            assert!(database.exists());
-            assert!(harness.state().settings.storage_disclosure_acknowledged());
-            shutdown_harness(&mut harness);
-            saved_session_id
-        };
-
-        let mut restarted = headless_harness(paths);
-        wait_for_app(&mut restarted, |app| {
-            app.storage_initialized && !app.loading_session && app.session.restored
-        });
-
-        assert_eq!(restarted.state().session.id, Some(saved_session_id));
-        assert_eq!(restarted.state().listener_state, ListenerState::Idle);
-        assert_eq!(
-            restarted.state().storage_tracker.status(),
-            StorageStatus::Saved
-        );
-        assert!(restarted.query_by_label("Presses: 1").is_some());
-        assert!(
-            restarted
-                .query_by_label_contains("Restored from disk; capture is paused")
-                .is_some()
-        );
-        shutdown_harness(&mut restarted);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn headless_dirty_close_can_cancel_or_save() {
-        let temporary = tempfile::tempdir().unwrap();
-        let paths = AppPaths::with_roots(
-            temporary.path().join("config"),
-            temporary.path().join("data"),
-        );
-        paths.prepare_data_dir().unwrap();
-        let mut harness = headless_harness(paths);
-        wait_for_app(&mut harness, |app| app.storage_initialized);
-
-        harness.get_by_label("Save now").click();
-        harness.run();
-        harness.get_by_label("Allow local saves").click();
-        harness.run();
-        wait_for_app(&mut harness, |app| {
-            app.session.id.is_some() && app.storage_tracker.status() == StorageStatus::Saved
-        });
-
-        harness.get_by_label("Rename").click();
-        harness.run();
-        harness
-            .get_by_role(egui::accesskit::Role::TextInput)
-            .focus();
-        harness.run();
-        harness
-            .get_by_role(egui::accesskit::Role::TextInput)
-            .type_text("Closing test");
-        harness.run();
-        harness.get_by_label("Apply").click();
-        harness.run();
-        assert!(harness.state().working_dirty());
-
-        request_headless_close(&mut harness);
-        assert!(
-            harness
-                .query_by_label("Save changes before exiting?")
-                .is_some()
-        );
-        harness.get_by_label("Cancel").click();
-        harness.run();
-        assert!(!harness.state().allow_close);
-        assert!(harness.state().working_dirty());
-
-        request_headless_close(&mut harness);
-        harness.get_by_label("Save and exit").click();
-        harness.step();
-        wait_for_app(&mut harness, |app| {
-            app.allow_close && app.storage_tracker.status() == StorageStatus::Saved
-        });
-        assert_eq!(
-            harness.state().session.name.as_deref(),
-            Some("Closing test")
-        );
-        shutdown_harness(&mut harness);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn headless_failed_save_stays_dirty_and_retries_latest_state() {
-        let temporary = tempfile::tempdir().unwrap();
-        let paths = AppPaths::with_roots(
-            temporary.path().join("config"),
-            temporary.path().join("data"),
-        );
-        paths.prepare_data_dir().unwrap();
-        let mut harness = headless_harness(paths.clone());
-        wait_for_app(&mut harness, |app| app.storage_initialized);
-
-        harness.get_by_label("Save now").click();
-        harness.run();
-        harness.get_by_label("Allow local saves").click();
-        harness.step();
-        wait_for_app(&mut harness, |app| {
-            app.session.id.is_some() && app.storage_tracker.status() == StorageStatus::Saved
-        });
-
-        let lock = rusqlite::Connection::open(paths.database_file()).unwrap();
-        lock.execute_batch("BEGIN IMMEDIATE; UPDATE sessions SET updated_at_ms = updated_at_ms;")
-            .unwrap();
-
-        harness.get_by_label("Rename").click();
-        harness.run();
-        harness
-            .get_by_role(egui::accesskit::Role::TextInput)
-            .focus();
-        harness.run();
-        harness
-            .get_by_role(egui::accesskit::Role::TextInput)
-            .type_text("Retry test");
-        harness.run();
-        harness.get_by_label("Apply").click();
-        harness.run();
-        harness.get_by_label("Save now").click();
-        harness.step();
-        wait_for_app_attempts(&mut harness, 1_200, |app| {
-            app.last_failed_operation == Some(StorageOperation::Save)
-        });
-        assert!(harness.state().working_dirty());
-        assert_eq!(
-            harness.state().storage_tracker.status(),
-            StorageStatus::Failed
-        );
-        assert!(harness.query_by_label("Retry storage operation").is_some());
-
-        harness.get_by_label("Rename").click();
-        harness.run();
-        harness
-            .get_by_role(egui::accesskit::Role::TextInput)
-            .focus();
-        harness.run();
-        harness
-            .get_by_role(egui::accesskit::Role::TextInput)
-            .type_text(" latest");
-        harness.run();
-        harness.get_by_label("Apply").click();
-        harness.run();
-        drop(lock);
-        harness.get_by_label("Retry storage operation").click();
-        harness.step();
-        wait_for_app(&mut harness, |app| {
-            app.storage_tracker.status() == StorageStatus::Saved && app.session.id.is_some()
-        });
-        assert_eq!(
-            harness.state().session.name.as_deref(),
-            Some("Retry test latest")
-        );
-        shutdown_harness(&mut harness);
-
-        let mut restarted = headless_harness(paths);
-        wait_for_app(&mut restarted, |app| {
-            app.storage_initialized && app.session.restored
-        });
-        assert_eq!(
-            restarted.state().session.name.as_deref(),
-            Some("Retry test latest")
-        );
-        shutdown_harness(&mut restarted);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn headless_autosave_switch_and_close_need_no_prompt() {
-        let temporary = tempfile::tempdir().unwrap();
-        let paths = AppPaths::with_roots(
-            temporary.path().join("config"),
-            temporary.path().join("data"),
-        );
-        paths.prepare_data_dir().unwrap();
-        let mut harness = headless_harness(paths);
-        wait_for_app(&mut harness, |app| app.storage_initialized);
-
-        harness.get_by_label("Autosave sessions").click();
-        harness.run();
-        assert!(
-            harness
-                .query_by_label("Save sensitive aggregate statistics?")
-                .is_some()
-        );
-        harness.get_by_label("Cancel").click();
-        harness.run();
-        assert!(!harness.state().settings.autosave_enabled());
-
-        harness.get_by_label("Autosave sessions").click();
-        harness.run();
-        harness.get_by_label("Allow local saves").click();
-        harness.run();
-        assert!(harness.state().settings.autosave_enabled());
-
-        harness.get_by_label("Rename").click();
-        harness.run();
-        harness
-            .get_by_role(egui::accesskit::Role::TextInput)
-            .focus();
-        harness.run();
-        harness
-            .get_by_role(egui::accesskit::Role::TextInput)
-            .type_text("Autosaved Home");
-        harness.run();
-        harness.get_by_label("Apply").click();
-        harness.run();
-        harness.get_by_label("New session").click();
-        harness.run();
-        wait_for_app(&mut harness, |app| {
-            app.session.id.is_none()
-                && app
-                    .sessions
-                    .iter()
-                    .any(|saved| saved.name.as_deref() == Some("Autosaved Home"))
-        });
-        assert!(
-            harness
-                .query_by_label("Save changes before switching sessions?")
-                .is_none()
-        );
-
-        harness.get_by_label("Rename").click();
-        harness.run();
-        harness
-            .get_by_role(egui::accesskit::Role::TextInput)
-            .focus();
-        harness.run();
-        harness
-            .get_by_role(egui::accesskit::Role::TextInput)
-            .type_text("Autosaved Work");
-        harness.run();
-        harness.get_by_label("Apply").click();
-        harness.run();
-        request_headless_close(&mut harness);
-        assert!(
-            harness
-                .query_by_label("Save changes before exiting?")
-                .is_none()
-        );
-        wait_for_app(&mut harness, |app| {
-            app.allow_close
-                && app.session.id.is_some()
-                && app.storage_tracker.status() == StorageStatus::Saved
-        });
-        assert_eq!(
-            harness.state().session.name.as_deref(),
-            Some("Autosaved Work")
-        );
-        shutdown_harness(&mut harness);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn headless_session_switch_prompts_and_deletion() {
-        let temporary = tempfile::tempdir().unwrap();
-        let paths = AppPaths::with_roots(
-            temporary.path().join("config"),
-            temporary.path().join("data"),
-        );
-        paths.prepare_data_dir().unwrap();
-        let database = paths.database_file();
-        let mut harness = headless_harness(paths.clone());
-        wait_for_app(&mut harness, |app| app.storage_initialized);
-
-        harness.get_by_label("Rename").click();
-        harness.run();
-        harness
-            .get_by_role(egui::accesskit::Role::TextInput)
-            .focus();
-        harness.run();
-        harness
-            .get_by_role(egui::accesskit::Role::TextInput)
-            .type_text("Home");
-        harness.run();
-        harness.get_by_label("Apply").click();
-        harness.run();
-        assert_eq!(harness.state().session.name.as_deref(), Some("Home"));
-
-        harness.get_by_label("Save now").click();
-        harness.run();
-        harness.get_by_label("Allow local saves").click();
-        harness.run();
-        wait_for_app(&mut harness, |app| {
-            app.session.id.is_some() && app.storage_tracker.status() == StorageStatus::Saved
-        });
-        let home_id = harness.state().session.id.unwrap();
-
-        harness.get_by_label("New session").click();
-        harness.run();
-        assert_eq!(harness.state().session.id, None);
-        harness.get_by_label("Save now").click();
-        harness.run();
-        wait_for_app(&mut harness, |app| {
-            app.session.id.is_some() && app.storage_tracker.status() == StorageStatus::Saved
-        });
-        let work_id = harness.state().session.id.unwrap();
-
-        harness.get_by_label("Rename").click();
-        harness.run();
-        harness
-            .get_by_role(egui::accesskit::Role::TextInput)
-            .focus();
-        harness.run();
-        harness
-            .get_by_role(egui::accesskit::Role::TextInput)
-            .type_text("Work");
-        harness.run();
-        harness.get_by_label("Apply").click();
-        harness.run();
-        assert!(harness.state().working_dirty());
-
-        harness
-            .get_by_role_and_label(egui::accesskit::Role::ComboBox, "Current")
-            .click();
-        harness.run();
-        harness.get_by_label_contains("Home —").click();
-        harness.run();
-        assert!(
-            harness
-                .query_by_label("Save changes before switching sessions?")
-                .is_some()
-        );
-        harness.get_by_label("Cancel").click();
-        harness.run();
-        assert_eq!(harness.state().session.id, Some(work_id));
-        assert_eq!(harness.state().session.name.as_deref(), Some("Work"));
-
-        harness
-            .get_by_role_and_label(egui::accesskit::Role::ComboBox, "Current")
-            .click();
-        harness.run();
-        harness.get_by_label_contains("Home —").click();
-        harness.run();
-        harness.get_by_label("Discard changes").click();
-        harness.run();
-        wait_for_app(&mut harness, |app| {
-            app.session.id == Some(home_id) && !app.loading_session
-        });
-        assert_eq!(harness.state().session.name.as_deref(), Some("Home"));
-
-        harness
-            .get_by_role_and_label(egui::accesskit::Role::ComboBox, "Current")
-            .click();
-        harness.run();
-        harness.get_by_label_contains("Untitled session —").click();
-        harness.run();
-        wait_for_app(&mut harness, |app| {
-            app.session.id == Some(work_id) && !app.loading_session
-        });
-
-        harness.get_by_label("Rename").click();
-        harness.run();
-        harness
-            .get_by_role(egui::accesskit::Role::TextInput)
-            .focus();
-        harness.run();
-        harness
-            .get_by_role(egui::accesskit::Role::TextInput)
-            .type_text("Home");
-        harness.run();
-        harness.get_by_label("Apply").click();
-        harness.run();
-        assert!(harness.state().rename_error.is_some());
-        assert_eq!(harness.state().session.name, None);
-        harness.get_by_label("Cancel").click();
-        harness.run();
-
-        harness.get_by_label("Rename").click();
-        harness.run();
-        harness
-            .get_by_role(egui::accesskit::Role::TextInput)
-            .focus();
-        harness.run();
-        harness
-            .get_by_role(egui::accesskit::Role::TextInput)
-            .type_text("Work");
-        harness.run();
-        harness.get_by_label("Apply").click();
-        harness.run();
-        harness
-            .get_by_role_and_label(egui::accesskit::Role::ComboBox, "Current")
-            .click();
-        harness.run();
-        harness.get_by_label_contains("Home —").click();
-        harness.run();
-        harness.get_by_label("Save and switch").click();
-        harness.step();
-        wait_for_app(&mut harness, |app| {
-            app.session.id == Some(home_id)
-                && !app.loading_session
-                && app
-                    .sessions
-                    .iter()
-                    .any(|saved| saved.id == work_id && saved.name.as_deref() == Some("Work"))
-        });
-
-        harness.get_by_label("Reset statistics").click();
-        harness.run();
-        harness
-            .get_all_by_role_and_label(egui::accesskit::Role::Button, "Reset statistics")
-            .last()
-            .unwrap()
-            .click();
-        harness.run();
-        assert!(harness.state().working_dirty());
-        assert_eq!(harness.state().session.name.as_deref(), Some("Home"));
-
-        harness.get_by_label("Delete session").click();
-        harness.run();
-        assert!(harness.query_by_label("Delete session?").is_some());
-        harness.get_by_label("Delete permanently").click();
-        harness.run();
-        wait_for_app(&mut harness, |app| {
-            !app.deleting_session && app.session.id.is_none()
-        });
-        assert_eq!(harness.state().session.display_name(), "Untitled session");
-        shutdown_harness(&mut harness);
-
-        let mut restarted = headless_harness(paths);
-        wait_for_app(&mut restarted, |app| app.storage_initialized);
-        assert_eq!(restarted.state().session.id, None);
-        assert!(!restarted.state().session.restored);
-        assert!(
-            restarted
-                .state()
-                .sessions
-                .iter()
-                .any(|saved| saved.id == work_id)
-        );
-
-        restarted.get_by_label("Delete all saved sessions").click();
-        restarted.run();
-        restarted.get_by_label("Delete all permanently").click();
-        restarted.run();
-        wait_for_app(&mut restarted, |app| {
-            !app.deleting_all && app.sessions.is_empty()
-        });
-        assert!(!database.exists());
-        shutdown_harness(&mut restarted);
-    }
-
-    #[test]
-    fn proportional_font_family_supports_bigram_arrow() {
-        let fonts = font_definitions();
-        assert!(fonts.font_data.contains_key(HACK_FONT_NAME));
-        assert!(
-            fonts
-                .families
-                .get(&egui::FontFamily::Proportional)
-                .unwrap()
-                .iter()
-                .any(|font| font == HACK_FONT_NAME)
-        );
-    }
-
-    #[test]
-    fn dirty_boundaries_follow_editor_style_save_policy() {
-        assert_eq!(boundary_policy(false, false), BoundaryPolicy::Proceed);
-        assert_eq!(boundary_policy(false, true), BoundaryPolicy::Proceed);
-        assert_eq!(boundary_policy(true, false), BoundaryPolicy::Prompt);
-        assert_eq!(boundary_policy(true, true), BoundaryPolicy::Save);
-    }
-
-    #[test]
-    fn storage_labels_cover_unsaved_and_saved_sessions() {
-        assert_eq!(
-            storage_status_label(StorageStatus::Unsaved, false),
-            "Unsaved session"
-        );
-        assert_eq!(storage_status_label(StorageStatus::Saved, true), "Saved");
-    }
-
-    #[test]
-    fn selector_distinguishes_untitled_sessions_with_metadata() {
-        let metadata = SessionMetadata {
-            id: SessionId::new(1).unwrap(),
-            name: None,
-            created_at_ms: 1,
-            updated_at_ms: 1,
-            last_opened_at_ms: 1,
-            captured_duration_ns: 0,
-            application_version: "test".to_owned(),
-            keyboard: KeyboardContext {
-                display_name: Some("Work keyboard".to_owned()),
-                ..Default::default()
-            },
-        };
-        let label = session_selector_label(&metadata);
-        assert!(label.contains("Untitled session"));
-        assert!(label.contains("Work keyboard"));
-    }
-
-    #[test]
-    fn disk_usage_includes_sqlite_sidecars() {
-        let temporary = tempfile::tempdir().unwrap();
-        let database = temporary.path().join("evtap.sqlite3");
-        fs::write(&database, [0_u8; 3]).unwrap();
-        fs::write(temporary.path().join("evtap.sqlite3-wal"), [0_u8; 5]).unwrap();
-        fs::write(temporary.path().join("evtap.sqlite3-shm"), [0_u8; 7]).unwrap();
-
-        assert_eq!(database_disk_usage(&database), 15);
-    }
-}
+mod tests;

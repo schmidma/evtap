@@ -9,7 +9,7 @@ use std::{
 use thiserror::Error;
 
 use crate::{
-    database::Repository,
+    database::{Repository, RepositoryError},
     session::{SessionId, SessionMetadata, SessionSnapshot, StoredSession},
     wake::WakeSignal,
 };
@@ -58,12 +58,16 @@ impl DirtyTracker {
         self.in_flight = None;
     }
 
-    pub fn loaded(&mut self, saved: bool) {
-        self.status = if saved {
-            StorageStatus::Saved
-        } else {
-            StorageStatus::Unsaved
-        };
+    pub fn reset_saved(&mut self) {
+        self.reset(StorageStatus::Saved);
+    }
+
+    pub fn reset_unsaved(&mut self) {
+        self.reset(StorageStatus::Unsaved);
+    }
+
+    fn reset(&mut self, status: StorageStatus) {
+        self.status = status;
         self.current = DirtyGeneration::default();
         self.saved = DirtyGeneration::default();
         self.in_flight = None;
@@ -399,6 +403,26 @@ pub enum StorageWorkerError {
     WorkerPanicked,
 }
 
+#[derive(Debug, Error)]
+enum WorkerStateError {
+    #[error(transparent)]
+    Repository(#[from] RepositoryError),
+    #[error("storage is unavailable")]
+    Unavailable,
+    #[error("failed to remove analytics file {path}")]
+    RemoveFile {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to synchronize analytics directory {path}")]
+    SyncDirectory {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
 struct WorkerState {
     repository: Option<Repository>,
     database_path: PathBuf,
@@ -415,47 +439,39 @@ impl WorkerState {
     fn open(
         &mut self,
         last_session_id: Option<SessionId>,
-    ) -> Result<(Vec<SessionMetadata>, Option<StoredSession>), String> {
-        self.repository = Repository::open_existing(self.database_path.clone())
-            .map_err(|error| error.to_string())?;
+    ) -> Result<(Vec<SessionMetadata>, Option<StoredSession>), WorkerStateError> {
+        self.repository = Repository::open_existing(self.database_path.clone())?;
         let Some(repository) = &self.repository else {
             return Ok((Vec::new(), None));
         };
-        let sessions = repository
-            .list_sessions(SESSION_LIST_LIMIT)
-            .map_err(|error| error.to_string())?;
+        let sessions = repository.list_sessions(SESSION_LIST_LIMIT)?;
         let selected = last_session_id
             .map(|session_id| repository.load_session(session_id))
-            .transpose()
-            .map_err(|error| error.to_string())?
+            .transpose()?
             .flatten();
         Ok((sessions, selected))
     }
 
-    fn repository_mut(&mut self) -> Result<&mut Repository, String> {
+    fn repository_mut(&mut self) -> Result<&mut Repository, WorkerStateError> {
         if self.repository.is_none() {
-            self.repository = Some(
-                Repository::open(self.database_path.clone()).map_err(|error| error.to_string())?,
-            );
+            self.repository = Some(Repository::open(self.database_path.clone())?);
         }
         self.repository
             .as_mut()
-            .ok_or_else(|| "storage is unavailable".to_owned())
+            .ok_or(WorkerStateError::Unavailable)
     }
 
-    fn save(&mut self, request: SaveRequest) -> Result<SessionId, String> {
-        self.repository_mut()?
-            .save(&request.snapshot)
-            .map_err(|error| error.to_string())
+    fn save(&mut self, request: SaveRequest) -> Result<SessionId, WorkerStateError> {
+        Ok(self.repository_mut()?.save(&request.snapshot)?)
     }
 
-    fn list_sessions(&self) -> Result<Vec<SessionMetadata>, String> {
+    fn list_sessions(&self) -> Result<Vec<SessionMetadata>, WorkerStateError> {
         self.repository.as_ref().map_or_else(
             || Ok(Vec::new()),
             |repository| {
                 repository
                     .list_sessions(SESSION_LIST_LIMIT)
-                    .map_err(|error| error.to_string())
+                    .map_err(Into::into)
             },
         )
     }
@@ -464,68 +480,63 @@ impl WorkerState {
         &mut self,
         session_id: SessionId,
         opened_at_ms: i64,
-    ) -> Result<Option<StoredSession>, String> {
+    ) -> Result<Option<StoredSession>, WorkerStateError> {
         let Some(repository) = self.repository.as_mut() else {
             return Ok(None);
         };
-        let session = repository
-            .load_session(session_id)
-            .map_err(|error| error.to_string())?;
-        if session.is_some() {
-            repository
-                .mark_opened(session_id, opened_at_ms)
-                .map_err(|error| error.to_string())?;
-            return repository
-                .load_session(session_id)
-                .map_err(|error| error.to_string());
-        }
-        Ok(None)
+        repository
+            .load_and_mark_opened(session_id, opened_at_ms)
+            .map_err(Into::into)
     }
 
-    fn delete_session(&mut self, session_id: SessionId) -> Result<bool, String> {
+    fn delete_session(&mut self, session_id: SessionId) -> Result<bool, WorkerStateError> {
         let Some(repository) = self.repository.as_mut() else {
             return Ok(false);
         };
-        repository
-            .delete_session(session_id)
-            .map_err(|error| error.to_string())
+        repository.delete_session(session_id).map_err(Into::into)
     }
 
-    fn reclaim_after_deletion(&self) -> Result<(), String> {
+    fn reclaim_after_deletion(&self) -> Result<(), WorkerStateError> {
         self.repository
             .as_ref()
-            .ok_or_else(|| "storage is unavailable".to_owned())?
+            .ok_or(WorkerStateError::Unavailable)?
             .reclaim_after_deletion()
-            .map_err(|error| error.to_string())
+            .map_err(Into::into)
     }
 
-    fn delete_all(&mut self) -> Result<(), String> {
+    fn delete_all(&mut self) -> Result<(), WorkerStateError> {
         self.repository = None;
         remove_database_files(&self.database_path)
     }
 }
 
-fn remove_database_files(database_path: &Path) -> Result<(), String> {
+fn database_files(database_path: &Path) -> [PathBuf; 4] {
     let sidecar = |suffix: &str| {
         let mut path = database_path.as_os_str().to_os_string();
         path.push(suffix);
         PathBuf::from(path)
     };
-    for path in [
+    [
         database_path.to_path_buf(),
         sidecar("-wal"),
         sidecar("-shm"),
         sidecar("-journal"),
-    ] {
+    ]
+}
+
+pub fn database_disk_usage(database_path: &Path) -> u64 {
+    database_files(database_path)
+        .into_iter()
+        .filter_map(|path| path.metadata().ok().map(|metadata| metadata.len()))
+        .fold(0_u64, u64::saturating_add)
+}
+
+fn remove_database_files(database_path: &Path) -> Result<(), WorkerStateError> {
+    for path in database_files(database_path) {
         match fs::remove_file(&path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(format!(
-                    "failed to remove analytics file {}: {error}",
-                    path.display()
-                ));
-            }
+            Err(source) => return Err(WorkerStateError::RemoveFile { path, source }),
         }
     }
     if let Some(parent) = database_path.parent()
@@ -533,7 +544,10 @@ fn remove_database_files(database_path: &Path) -> Result<(), String> {
     {
         fs::File::open(parent)
             .and_then(|directory| directory.sync_all())
-            .map_err(|error| format!("failed to synchronize analytics directory: {error}"))?;
+            .map_err(|source| WorkerStateError::SyncDirectory {
+                path: parent.to_path_buf(),
+                source,
+            })?;
     }
     Ok(())
 }
@@ -697,7 +711,7 @@ fn emit_open_result(
     events: &Sender<StorageEvent>,
     wake: &WakeSignal,
     state: &WorkerState,
-    result: Result<(Vec<SessionMetadata>, Option<StoredSession>), String>,
+    result: Result<(Vec<SessionMetadata>, Option<StoredSession>), WorkerStateError>,
 ) {
     match result {
         Ok((sessions, selected)) => emit(events, wake, StorageEvent::Opened { sessions, selected }),
@@ -717,7 +731,7 @@ fn emit_failure(
     state: &WorkerState,
     operation: StorageOperation,
     generation: Option<DirtyGeneration>,
-    details: String,
+    details: impl std::fmt::Display,
 ) {
     emit(
         events,
@@ -726,7 +740,7 @@ fn emit_failure(
             operation,
             generation,
             database_path: state.database_path.clone(),
-            details,
+            details: details.to_string(),
         }),
     );
 }
@@ -804,7 +818,7 @@ mod tests {
     #[test]
     fn dirty_acknowledgement_does_not_save_newer_changes() {
         let mut tracker = DirtyTracker::default();
-        tracker.loaded(true);
+        tracker.reset_saved();
         let first = tracker.mark_dirty().unwrap();
         assert_eq!(tracker.begin_save().unwrap(), Some(first));
         tracker.mark_dirty().unwrap();

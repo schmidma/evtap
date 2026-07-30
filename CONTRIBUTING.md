@@ -47,9 +47,13 @@ The main internal boundaries are:
 - `metric_view`: generic egui rendering for metric reports.
 - `session`: mutable saved-session metadata and isolated metric recovery.
 - `settings` and `paths`: atomic privacy preferences and XDG locations.
+- `private_fs`: shared Unix permission enforcement with normal operating-system symlink resolution.
 - `database`: SQLite identity/schema validation and transactional mutable-session storage.
-- `storage`: the background command/event protocol; it accepts aggregate `SessionSnapshot` values and must never import `KeyEvent`.
-- `app`: capture/session lifecycle, editor-style save boundaries, dirty tracking, and UI orchestration.
+- `storage`: dirty-generation tracking and the background command/event protocol; it accepts aggregate `SessionSnapshot` values and must never import `KeyEvent`.
+- `app`: the thin capture, persistence, and editor-style boundary coordinator.
+- `app/working_session`: the loaded mutable session, metrics, transient context, and the durable snapshot boundary.
+- `app/view`: egui presentation and modal interaction; it does not own durable state.
+- `app/tests`: headless lifecycle fixtures and end-to-end UI scenarios.
 
 A metric must not depend directly on evdev, Tokio, or egui. To add one:
 

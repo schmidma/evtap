@@ -1,7 +1,7 @@
 use std::{
-    fs::{self, DirBuilder, File, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{Read, Write},
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -9,11 +9,15 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::session::SessionId;
+use crate::{
+    private_fs::{PrivatePathError, ensure_private_directory, set_private_permissions},
+    session::SessionId,
+};
 
 const SETTINGS_SCHEMA_VERSION: u32 = 2;
 const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
 const MAX_KEYBOARD_VALUE_BYTES: usize = 256;
+const MAX_TEMP_FILE_ATTEMPTS: usize = 100;
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -178,19 +182,9 @@ impl SettingsStore {
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or(SettingsError::InvalidFileName)?;
-        let sequence = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let temporary = parent.join(format!(
-            ".{file_name}.tmp-{}-{sequence}",
-            std::process::id()
-        ));
+        let (temporary, mut file) = create_temporary_file(parent, file_name, &TEMP_FILE_COUNTER)?;
 
         let result = (|| {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&temporary)
-                .map_err(|source| SettingsError::CreateTemporary { source })?;
             file.write_all(&encoded)
                 .map_err(|source| SettingsError::Write { source })?;
             file.sync_all()
@@ -212,28 +206,29 @@ impl SettingsStore {
     }
 }
 
-fn ensure_private_directory(path: &Path) -> Result<(), SettingsError> {
-    match fs::metadata(path) {
-        Ok(metadata) => {
-            if !metadata.is_dir() {
-                return Err(SettingsError::NotDirectory);
-            }
+fn create_temporary_file(
+    parent: &Path,
+    file_name: &str,
+    counter: &AtomicU64,
+) -> Result<(PathBuf, File), SettingsError> {
+    for _ in 0..MAX_TEMP_FILE_ATTEMPTS {
+        let sequence = counter.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(
+            ".{file_name}.tmp-{}-{sequence}",
+            std::process::id()
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(source) => return Err(SettingsError::CreateTemporary { source }),
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let mut builder = DirBuilder::new();
-            builder.recursive(true).mode(0o700);
-            builder
-                .create(path)
-                .map_err(|source| SettingsError::CreateDirectory { source })?;
-        }
-        Err(source) => return Err(SettingsError::ReadDirectoryMetadata { source }),
     }
-    set_private_permissions(path, 0o700)
-}
-
-fn set_private_permissions(path: &Path, mode: u32) -> Result<(), SettingsError> {
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))
-        .map_err(|source| SettingsError::SetPermissions { source })
+    Err(SettingsError::TemporaryNameExhausted)
 }
 
 #[derive(Debug, Error)]
@@ -244,8 +239,6 @@ pub enum SettingsError {
     InvalidFileName,
     #[error("settings path is not a regular file")]
     NotRegularFile,
-    #[error("settings directory path is not a directory")]
-    NotDirectory,
     #[error("settings file exceeds the size limit")]
     FileTooLarge,
     #[error("settings schema version {actual} is unsupported; expected {supported}")]
@@ -259,21 +252,8 @@ pub enum SettingsError {
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to read settings directory metadata")]
-    ReadDirectoryMetadata {
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to create settings directory")]
-    CreateDirectory {
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to set private settings permissions")]
-    SetPermissions {
-        #[source]
-        source: std::io::Error,
-    },
+    #[error(transparent)]
+    PrivatePath(#[from] PrivatePathError),
     #[error("failed to open settings")]
     Open {
         #[source]
@@ -294,6 +274,8 @@ pub enum SettingsError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("could not find an unused temporary settings file name")]
+    TemporaryNameExhausted,
     #[error("failed to create temporary settings file")]
     CreateTemporary {
         #[source]
@@ -323,13 +305,15 @@ pub enum SettingsError {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::PermissionsExt as _};
+    use std::{fs, os::unix::fs::PermissionsExt as _, sync::atomic::AtomicU64};
 
     use tempfile::tempdir;
 
     use crate::session::SessionId;
 
-    use super::{Settings, SettingsError, SettingsStore};
+    use super::{
+        MAX_TEMP_FILE_ATTEMPTS, Settings, SettingsError, SettingsStore, create_temporary_file,
+    };
 
     #[test]
     fn missing_settings_use_defaults_without_creating_files() {
@@ -371,6 +355,40 @@ mod tests {
             fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn temporary_file_creation_retries_collisions_and_is_bounded() {
+        let temporary = tempdir().unwrap();
+        let parent = temporary.path();
+        let process_id = std::process::id();
+        fs::write(
+            parent.join(format!(".settings.json.tmp-{process_id}-0")),
+            [],
+        )
+        .unwrap();
+        let counter = AtomicU64::new(0);
+
+        let (path, file) = create_temporary_file(parent, "settings.json", &counter).unwrap();
+
+        drop(file);
+        assert!(path.ends_with(format!(".settings.json.tmp-{process_id}-1")));
+
+        let exhausted = tempdir().unwrap();
+        for sequence in 0..MAX_TEMP_FILE_ATTEMPTS {
+            fs::write(
+                exhausted
+                    .path()
+                    .join(format!(".settings.json.tmp-{process_id}-{sequence}")),
+                [],
+            )
+            .unwrap();
+        }
+        let counter = AtomicU64::new(0);
+        assert!(matches!(
+            create_temporary_file(exhausted.path(), "settings.json", &counter),
+            Err(SettingsError::TemporaryNameExhausted)
+        ));
     }
 
     #[test]

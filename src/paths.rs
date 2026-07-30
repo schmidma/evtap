@@ -1,11 +1,9 @@
-use std::{
-    fs::{self, DirBuilder},
-    os::unix::fs::{DirBuilderExt, PermissionsExt},
-    path::PathBuf,
-};
+use std::path::PathBuf;
 
 use directories::ProjectDirs;
 use thiserror::Error;
+
+use crate::private_fs::{PrivatePathError, ensure_private_directory};
 
 const APPLICATION_NAME: &str = "evtap";
 
@@ -34,23 +32,7 @@ impl AppPaths {
     }
 
     pub fn prepare_data_dir(&self) -> Result<(), AppPathsError> {
-        match fs::metadata(&self.data_dir) {
-            Ok(metadata) => {
-                if !metadata.is_dir() {
-                    return Err(AppPathsError::NotDataDirectory);
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let mut builder = DirBuilder::new();
-                builder.recursive(true).mode(0o700);
-                builder
-                    .create(&self.data_dir)
-                    .map_err(|source| AppPathsError::CreateDataDirectory { source })?;
-            }
-            Err(source) => return Err(AppPathsError::ReadDataDirectory { source }),
-        }
-        fs::set_permissions(&self.data_dir, fs::Permissions::from_mode(0o700))
-            .map_err(|source| AppPathsError::SetDataDirectoryPermissions { source })
+        ensure_private_directory(&self.data_dir).map_err(Into::into)
     }
 
     pub fn settings_file(&self) -> PathBuf {
@@ -70,23 +52,8 @@ impl AppPaths {
 pub enum AppPathsError {
     #[error("could not determine configuration and data directories")]
     DirectoriesUnavailable,
-    #[error("application data path is not a directory")]
-    NotDataDirectory,
-    #[error("failed to read application data directory metadata")]
-    ReadDataDirectory {
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to create private application data directory")]
-    CreateDataDirectory {
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to set private application data directory permissions")]
-    SetDataDirectoryPermissions {
-        #[source]
-        source: std::io::Error,
-    },
+    #[error(transparent)]
+    PrivatePath(#[from] PrivatePathError),
 }
 
 #[cfg(test)]

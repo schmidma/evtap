@@ -11,6 +11,7 @@ mod listener;
 mod metric;
 mod metric_view;
 mod paths;
+mod private_fs;
 mod scanner;
 mod session;
 mod settings;

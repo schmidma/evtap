@@ -1,7 +1,6 @@
 use std::{
     collections::HashSet,
-    fs::{self, DirBuilder},
-    os::unix::fs::{DirBuilderExt, PermissionsExt},
+    fs,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -12,9 +11,12 @@ use rusqlite::{
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::session::{
-    KeyboardContext, SessionId, SessionMetadata, SessionSnapshot, StoredMetricSnapshot,
-    StoredSession,
+use crate::{
+    private_fs::{PrivatePathError, ensure_private_directory, set_private_permissions},
+    session::{
+        KeyboardContext, SessionId, SessionMetadata, SessionSnapshot, StoredMetricSnapshot,
+        StoredSession,
+    },
 };
 
 const APPLICATION_ID: i64 = 0x4556_5450; // "EVTP"
@@ -194,19 +196,28 @@ impl Repository {
         &self,
         session_id: SessionId,
     ) -> Result<Option<StoredSession>, RepositoryError> {
-        let metadata = self
+        load_session(&self.connection, session_id)
+    }
+
+    pub fn load_and_mark_opened(
+        &mut self,
+        session_id: SessionId,
+        opened_at_ms: i64,
+    ) -> Result<Option<StoredSession>, RepositoryError> {
+        validate_timestamp(opened_at_ms)?;
+        let transaction = self
             .connection
-            .query_row(
-                &format!("{} WHERE id = ?1", session_metadata_query()),
-                [session_id.get()],
-                raw_metadata_from_row,
-            )
-            .optional()?
-            .map(SessionMetadata::try_from)
-            .transpose()?;
-        metadata
-            .map(|metadata| self.load_stored_session(metadata))
-            .transpose()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE sessions SET last_opened_at_ms = ?1 WHERE id = ?2",
+            params![opened_at_ms, session_id.get()],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let session = load_session(&transaction, session_id)?;
+        transaction.commit()?;
+        Ok(session)
     }
 
     pub fn list_sessions(&self, limit: u32) -> Result<Vec<SessionMetadata>, RepositoryError> {
@@ -217,23 +228,6 @@ impl Repository {
         ))?;
         let rows = statement.query_map([limit], raw_metadata_from_row)?;
         rows.map(|row| SessionMetadata::try_from(row?)).collect()
-    }
-
-    pub fn mark_opened(
-        &mut self,
-        session_id: SessionId,
-        opened_at_ms: i64,
-    ) -> Result<(), RepositoryError> {
-        validate_timestamp(opened_at_ms)?;
-        let changed = self.connection.execute(
-            "UPDATE sessions SET last_opened_at_ms = ?1 WHERE id = ?2",
-            params![opened_at_ms, session_id.get()],
-        )?;
-        if changed == 1 {
-            Ok(())
-        } else {
-            Err(RepositoryError::SessionNotFound(session_id.get()))
-        }
     }
 
     pub fn delete_session(&mut self, session_id: SessionId) -> Result<bool, RepositoryError> {
@@ -325,34 +319,47 @@ impl Repository {
             .clone()
             .unwrap_or_else(|| PathBuf::from("<in-memory database>"))
     }
+}
 
-    fn load_stored_session(
-        &self,
-        metadata: SessionMetadata,
-    ) -> Result<StoredSession, RepositoryError> {
-        let metrics = self.metric_snapshots(metadata.id)?;
-        Ok(StoredSession { metadata, metrics })
-    }
+fn load_session(
+    connection: &Connection,
+    session_id: SessionId,
+) -> Result<Option<StoredSession>, RepositoryError> {
+    let metadata = connection
+        .query_row(
+            &format!("{} WHERE id = ?1", session_metadata_query()),
+            [session_id.get()],
+            raw_metadata_from_row,
+        )
+        .optional()?
+        .map(SessionMetadata::try_from)
+        .transpose()?;
+    metadata
+        .map(|metadata| {
+            let metrics = metric_snapshots(connection, metadata.id)?;
+            Ok(StoredSession { metadata, metrics })
+        })
+        .transpose()
+}
 
-    fn metric_snapshots(
-        &self,
-        session_id: SessionId,
-    ) -> Result<Vec<StoredMetricSnapshot>, RepositoryError> {
-        let mut statement = self.connection.prepare(
-            "SELECT metric_id, metric_schema_version, payload_json
-             FROM metric_snapshots
-             WHERE session_id = ?1
-             ORDER BY metric_id",
-        )?;
-        let rows = statement.query_map([session_id.get()], |row| {
-            Ok(StoredMetricSnapshot {
-                metric_id: row.get(0)?,
-                schema_version: row.get(1)?,
-                payload_json: row.get(2)?,
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
-    }
+fn metric_snapshots(
+    connection: &Connection,
+    session_id: SessionId,
+) -> Result<Vec<StoredMetricSnapshot>, RepositoryError> {
+    let mut statement = connection.prepare(
+        "SELECT metric_id, metric_schema_version, payload_json
+         FROM metric_snapshots
+         WHERE session_id = ?1
+         ORDER BY metric_id",
+    )?;
+    let rows = statement.query_map([session_id.get()], |row| {
+        Ok(StoredMetricSnapshot {
+            metric_id: row.get(0)?,
+            schema_version: row.get(1)?,
+            payload_json: row.get(2)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
 fn open_connection(path: &Path, create: bool) -> Result<Connection, RepositoryError> {
@@ -527,33 +534,7 @@ impl TryFrom<RawSessionMetadata> for SessionMetadata {
 
 fn prepare_database_path(path: &Path) -> Result<(), RepositoryError> {
     let parent = path.parent().ok_or(RepositoryError::MissingParent)?;
-    ensure_private_directory(parent)
-}
-
-fn ensure_private_directory(path: &Path) -> Result<(), RepositoryError> {
-    match fs::metadata(path) {
-        Ok(metadata) if metadata.is_dir() => {}
-        Ok(_) => return Err(RepositoryError::NotDirectory(path.to_path_buf())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let mut builder = DirBuilder::new();
-            builder.recursive(true).mode(0o700);
-            builder
-                .create(path)
-                .map_err(|source| RepositoryError::CreateDirectory { source })?;
-        }
-        Err(source) => {
-            return Err(RepositoryError::ReadMetadata {
-                path: path.to_path_buf(),
-                source,
-            });
-        }
-    }
-    set_private_permissions(path, 0o700)
-}
-
-fn set_private_permissions(path: &Path, mode: u32) -> Result<(), RepositoryError> {
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))
-        .map_err(|source| RepositoryError::SetPermissions { source })
+    ensure_private_directory(parent).map_err(Into::into)
 }
 
 #[derive(Debug, Error)]
@@ -564,24 +545,14 @@ pub enum RepositoryError {
     MissingParent,
     #[error("database path is not a regular file: {0}")]
     NotRegularFile(PathBuf),
-    #[error("database directory path is not a directory: {0}")]
-    NotDirectory(PathBuf),
     #[error("failed to read database path metadata: {path}")]
     ReadMetadata {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to create private database directory")]
-    CreateDirectory {
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to set private database permissions")]
-    SetPermissions {
-        #[source]
-        source: std::io::Error,
-    },
+    #[error(transparent)]
+    PrivatePath(#[from] PrivatePathError),
     #[error("nonempty database has no evtap application identity: {0}")]
     UnidentifiedDatabase(PathBuf),
     #[error("database belongs to another application ({actual:#x}): {path}")]
@@ -805,6 +776,51 @@ mod tests {
         assert_eq!(restored.metadata.name.as_deref(), Some("Before"));
         assert_eq!(restored.metadata.updated_at_ms, 10);
         assert_eq!(restored.metrics[0].payload_json, r#"{"count":3}"#);
+    }
+
+    #[test]
+    fn saves_preserve_open_time_and_loading_updates_it_atomically() {
+        let mut repository = Repository::open_in_memory().unwrap();
+        let id = repository.save(&snapshot(None, Some("Home"), 10)).unwrap();
+
+        let mut changed = snapshot(Some(id), Some("Home"), 20);
+        changed.last_opened_at_ms = 10;
+        repository.save(&changed).unwrap();
+
+        let saved = repository.load_session(id).unwrap().unwrap();
+        assert_eq!(saved.metadata.updated_at_ms, 20);
+        assert_eq!(saved.metadata.last_opened_at_ms, 10);
+
+        let opened = repository.load_and_mark_opened(id, 30).unwrap().unwrap();
+        assert_eq!(opened.metadata.updated_at_ms, 20);
+        assert_eq!(opened.metadata.last_opened_at_ms, 30);
+        assert!(
+            repository
+                .load_and_mark_opened(SessionId::new(999).unwrap(), 40)
+                .unwrap()
+                .is_none()
+        );
+
+        repository
+            .connection
+            .execute(
+                "UPDATE sessions SET created_at_ms = -1 WHERE id = ?1",
+                [id.get()],
+            )
+            .unwrap();
+        assert!(matches!(
+            repository.load_and_mark_opened(id, 40),
+            Err(RepositoryError::InvalidStoredSession)
+        ));
+        let last_opened_at_ms: i64 = repository
+            .connection
+            .query_row(
+                "SELECT last_opened_at_ms FROM sessions WHERE id = ?1",
+                [id.get()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(last_opened_at_ms, 30);
     }
 
     #[test]
