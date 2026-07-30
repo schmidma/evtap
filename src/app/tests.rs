@@ -152,7 +152,7 @@ async fn headless_manual_save_disclosure_and_restart() {
         harness.get_by_label("Save now").click();
         harness.run();
         harness.get_by_label("Allow local saves").click();
-        harness.run();
+        harness.step();
         wait_for_app(&mut harness, |app| {
             app.working_session.id.is_some() && app.storage_tracker.status() == StorageStatus::Saved
         });
@@ -282,12 +282,14 @@ async fn headless_autosave_switch_and_close_need_no_prompt() {
     harness.get_by_label("Autosave sessions").click();
     harness.run();
     harness.get_by_label("Allow local saves").click();
-    harness.run();
-    assert!(harness.state().settings.autosave_enabled());
+    harness.step();
+    wait_for_app(&mut harness, |app| {
+        app.settings.autosave_enabled() && app.storage_tracker.status() != StorageStatus::Saving
+    });
 
     rename_session(&mut harness, "Autosaved Home");
     harness.get_by_label("New session").click();
-    harness.run();
+    harness.step();
     wait_for_app(&mut harness, |app| {
         app.working_session.id.is_none()
             && app
@@ -339,7 +341,7 @@ async fn headless_session_switch_prompts_and_deletion() {
     harness.run();
     assert_eq!(harness.state().working_session.id, None);
     harness.get_by_label("Save now").click();
-    harness.run();
+    harness.step();
     wait_for_app(&mut harness, |app| {
         app.working_session.id.is_some() && app.storage_tracker.status() == StorageStatus::Saved
     });
@@ -374,7 +376,7 @@ async fn headless_session_switch_prompts_and_deletion() {
     harness.get_by_label_contains("Home —").click();
     harness.run();
     harness.get_by_label("Discard changes").click();
-    harness.run();
+    harness.step();
     wait_for_app(&mut harness, |app| {
         app.working_session.id == Some(home_id) && !app.loading_session
     });
@@ -388,7 +390,7 @@ async fn headless_session_switch_prompts_and_deletion() {
         .click();
     harness.run();
     harness.get_by_label_contains("Untitled session —").click();
-    harness.run();
+    harness.step();
     wait_for_app(&mut harness, |app| {
         app.working_session.id == Some(work_id) && !app.loading_session
     });
@@ -435,7 +437,7 @@ async fn headless_session_switch_prompts_and_deletion() {
     harness.run();
     assert!(harness.query_by_label("Delete session?").is_some());
     harness.get_by_label("Delete permanently").click();
-    harness.run();
+    harness.step();
     wait_for_app(&mut harness, |app| {
         !app.deleting_session && app.working_session.id.is_none()
     });
