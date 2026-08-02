@@ -5,11 +5,8 @@ use std::{
 
 use crate::{
     input::{KeyEvent, PhysicalKey},
-    metric::{Metric, default_metrics},
-    session::{
-        KeyboardContext, MetricRecoveryIssue, SessionId, SessionSnapshot, StoredSession,
-        recover_default_metrics,
-    },
+    metric::SessionMetrics,
+    session::{KeyboardContext, MetricRecoveryIssue, SessionId, SessionSnapshot, StoredSession},
 };
 
 pub(super) struct WorkingSession {
@@ -21,7 +18,7 @@ pub(super) struct WorkingSession {
     capture_started_at: Option<Instant>,
     pub(super) keyboard: KeyboardContext,
     pub(super) restored: bool,
-    pub(super) metrics: Vec<Box<dyn Metric>>,
+    pub(super) metrics: SessionMetrics,
     physical_keys: HashMap<u16, PhysicalKey>,
 }
 
@@ -36,13 +33,13 @@ impl WorkingSession {
             capture_started_at: None,
             keyboard,
             restored: false,
-            metrics: default_metrics(),
+            metrics: SessionMetrics::default(),
             physical_keys: HashMap::new(),
         }
     }
 
     pub(super) fn restore(stored: StoredSession) -> (Self, Vec<MetricRecoveryIssue>) {
-        let recovered = recover_default_metrics(&stored.metrics);
+        let (metrics, recovery_issues) = SessionMetrics::restore(&stored.metrics);
         let metadata = stored.metadata;
         let captured_duration =
             Duration::from_nanos(u64::try_from(metadata.captured_duration_ns).unwrap_or_default());
@@ -56,10 +53,10 @@ impl WorkingSession {
                 capture_started_at: None,
                 keyboard: metadata.keyboard,
                 restored: true,
-                metrics: recovered.metrics,
+                metrics,
                 physical_keys: HashMap::new(),
             },
-            recovered.issues,
+            recovery_issues,
         )
     }
 
@@ -99,15 +96,11 @@ impl WorkingSession {
     }
 
     pub(super) fn process(&mut self, event: &KeyEvent) {
-        for metric in &mut self.metrics {
-            metric.process(event);
-        }
+        self.metrics.process(event);
     }
 
     pub(super) fn clear_in_flight(&mut self) {
-        for metric in &mut self.metrics {
-            metric.clear_in_flight();
-        }
+        self.metrics.clear_in_flight();
         self.physical_keys.clear();
     }
 
@@ -115,13 +108,11 @@ impl WorkingSession {
         self.name.is_some()
             || !self.captured_duration.is_zero()
             || self.capture_started_at.is_some()
-            || self.metrics.iter().any(|metric| metric.has_data())
+            || self.metrics.has_data()
     }
 
     pub(super) fn reset_statistics(&mut self) {
-        for metric in &mut self.metrics {
-            metric.reset();
-        }
+        self.metrics.reset();
         self.physical_keys.clear();
         self.captured_duration = Duration::ZERO;
         self.capture_started_at = None;
@@ -132,9 +123,8 @@ impl WorkingSession {
             .map_err(|_| "Capture duration exceeds the storage range".to_owned())?;
         let metrics = self
             .metrics
-            .iter()
-            .map(|metric| metric.snapshot().map_err(|error| error.to_string()))
-            .collect::<Result<Vec<_>, _>>()?;
+            .snapshots()
+            .map_err(|error| error.to_string())?;
         Ok(SessionSnapshot {
             id: self.id,
             name: self.name.clone(),

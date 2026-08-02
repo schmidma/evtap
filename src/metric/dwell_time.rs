@@ -3,22 +3,25 @@ use std::{
     time::SystemTime,
 };
 
+use eframe::egui;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    app::view::components::{
+        TextTokenContext, describe_text_token, disclosure_list, format_duration_ms,
+        format_exact_count_u128, inline_empty_state, metric_summary_value, ranked_bar_with_label,
+        text_token,
+    },
     input::{KeyEvent, KeyEventKind, PhysicalKey},
     metric::{
-        DurationStats, Metric, MetricDescriptor, MetricReport, MetricSnapshot, MetricSnapshotError,
-        ReportSection, ReportValue, validate_dimension, validate_entry_count,
+        DurationStats, Metric, MetricSnapshot, MetricSnapshotError, validate_dimension,
+        validate_entry_count,
     },
 };
 
+const METRIC_ID: &str = "dwell-time";
 const SNAPSHOT_VERSION: u32 = 1;
-const DESCRIPTOR: MetricDescriptor = MetricDescriptor {
-    id: "dwell-time",
-    name: "Dwell Time",
-    description: "Average time each character key is held down.",
-};
+const INITIAL_ANALYSIS_ROWS: usize = 8;
 
 struct PressedKey {
     timestamp: SystemTime,
@@ -29,6 +32,26 @@ struct PressedKey {
 pub struct DwellTime {
     pressed_keys: HashMap<PhysicalKey, PressedKey>,
     stats: HashMap<String, DurationStats>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum SortChoice {
+    #[default]
+    Slowest,
+    Fastest,
+    Label,
+    SampleCount,
+}
+
+impl SortChoice {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Slowest => "Slowest",
+            Self::Fastest => "Fastest",
+            Self::Label => "Label",
+            Self::SampleCount => "Sample count",
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -45,10 +68,106 @@ struct DurationEntry {
     samples: u64,
 }
 
-impl Metric for DwellTime {
-    fn descriptor(&self) -> &'static MetricDescriptor {
-        &DESCRIPTOR
+impl DwellTime {
+    fn overall_average(&self) -> Option<(f64, u128)> {
+        let samples = self
+            .stats
+            .values()
+            .map(|stats| u128::from(stats.samples))
+            .sum::<u128>();
+        if samples == 0 {
+            return None;
+        }
+        let total_nanoseconds = self
+            .stats
+            .values()
+            .map(|stats| stats.total.as_nanos())
+            .sum::<u128>();
+        Some((
+            total_nanoseconds as f64 / samples as f64 / 1_000_000.0,
+            samples,
+        ))
     }
+
+    fn sorted_stats(&self, sort: SortChoice) -> Vec<(&str, DurationStats)> {
+        let mut stats: Vec<_> = self
+            .stats
+            .iter()
+            .map(|(text, stats)| (text.as_str(), *stats))
+            .collect();
+        stats.sort_by(|(left_text, left), (right_text, right)| match sort {
+            SortChoice::Slowest => right
+                .compare_average(*left)
+                .then_with(|| left_text.cmp(right_text)),
+            SortChoice::Fastest => left
+                .compare_average(*right)
+                .then_with(|| left_text.cmp(right_text)),
+            SortChoice::Label => left_text.cmp(right_text),
+            SortChoice::SampleCount => right
+                .samples
+                .cmp(&left.samples)
+                .then_with(|| left_text.cmp(right_text)),
+        });
+        stats
+    }
+
+    fn maximum_average(&self) -> f64 {
+        self.stats
+            .values()
+            .copied()
+            .max_by(|left, right| left.compare_average(*right))
+            .map(DurationStats::average_milliseconds)
+            .unwrap_or(0.0)
+    }
+}
+
+fn sort_state_id() -> egui::Id {
+    egui::Id::new((METRIC_ID, "analysis-sort-state"))
+}
+
+fn expansion_state_id() -> egui::Id {
+    egui::Id::new((METRIC_ID, "analysis-expansion-state"))
+}
+
+fn sample_count_label(samples: u128) -> String {
+    let count = format_exact_count_u128(samples);
+    let noun = if samples == 1 { "sample" } else { "samples" };
+    format!("{count} {noun}")
+}
+
+fn dwell_empty_state(ui: &mut egui::Ui) {
+    inline_empty_state(
+        ui,
+        egui_phosphor::regular::CLOCK,
+        "No dwell samples yet",
+        "Character hold durations will appear here when they are captured.",
+    );
+}
+
+fn dwell_bar(ui: &mut egui::Ui, text: &str, stats: DurationStats, maximum: f64) {
+    let average = stats.average_milliseconds();
+    let visible_average = format_duration_ms(average);
+    let samples = sample_count_label(u128::from(stats.samples));
+    let visible_value = format!("{visible_average} · {samples}");
+    let token = describe_text_token(text, TextTokenContext::ProducedText);
+    let accessible_label = format!(
+        "Dwell time for {}: {visible_average} average across {samples}",
+        token.accessible_label
+    );
+    ranked_bar_with_label(
+        ui,
+        &accessible_label,
+        average,
+        maximum,
+        &visible_value,
+        |ui| {
+            text_token(ui, text, TextTokenContext::ProducedText);
+        },
+    );
+}
+
+impl Metric for DwellTime {
+    const ID: &'static str = METRIC_ID;
 
     fn process(&mut self, event: &KeyEvent) {
         match event.kind() {
@@ -76,32 +195,75 @@ impl Metric for DwellTime {
         }
     }
 
-    fn report(&self) -> MetricReport {
-        let mut data: Vec<_> = self.stats.iter().collect();
-        data.sort_by(|(left_key, left), (right_key, right)| {
-            right
-                .average_milliseconds()
-                .total_cmp(&left.average_milliseconds())
-                .then_with(|| left_key.cmp(right_key))
-        });
+    fn summary_ui(&self, ui: &mut egui::Ui) {
+        let Some((average, samples)) = self.overall_average() else {
+            dwell_empty_state(ui);
+            return;
+        };
+        let visible_average = format_duration_ms(average);
+        metric_summary_value(
+            ui,
+            egui_phosphor::regular::TIMER,
+            "Average dwell time",
+            &visible_average,
+            &visible_average,
+            &format!("Across {}.", sample_count_label(samples)),
+        );
+    }
 
-        MetricReport {
-            sections: vec![ReportSection::Table {
-                title: None,
-                columns: &["Key", "Average", "Samples"],
-                rows: data
-                    .into_iter()
-                    .take(5)
-                    .map(|(key, stats)| {
-                        vec![
-                            ReportValue::Text(key.clone()),
-                            ReportValue::Milliseconds(stats.average_milliseconds()),
-                            ReportValue::Count(stats.samples),
-                        ]
-                    })
-                    .collect(),
-            }],
+    fn analysis_ui(&self, ui: &mut egui::Ui) {
+        if self.stats.is_empty() {
+            dwell_empty_state(ui);
+            return;
         }
+
+        let sort_id = sort_state_id();
+        let mut sort = ui
+            .ctx()
+            .data(|data| data.get_temp::<SortChoice>(sort_id))
+            .unwrap_or_default();
+        let previous_sort = sort;
+        ui.horizontal(|ui| {
+            ui.label("Sort");
+            egui::ComboBox::from_id_salt((METRIC_ID, "analysis-sort-control"))
+                .selected_text(sort.label())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut sort,
+                        SortChoice::Slowest,
+                        SortChoice::Slowest.label(),
+                    );
+                    ui.selectable_value(
+                        &mut sort,
+                        SortChoice::Fastest,
+                        SortChoice::Fastest.label(),
+                    );
+                    ui.selectable_value(&mut sort, SortChoice::Label, SortChoice::Label.label());
+                    ui.selectable_value(
+                        &mut sort,
+                        SortChoice::SampleCount,
+                        SortChoice::SampleCount.label(),
+                    );
+                });
+        });
+        if sort != previous_sort {
+            ui.ctx().data_mut(|data| data.insert_temp(sort_id, sort));
+        }
+
+        let stats = self.sorted_stats(sort);
+        let total_rows = stats.len();
+        let maximum = self.maximum_average();
+        disclosure_list(
+            ui,
+            expansion_state_id(),
+            total_rows,
+            INITIAL_ANALYSIS_ROWS,
+            |ui, shown_rows| {
+                for (text, stats) in stats.into_iter().take(shown_rows) {
+                    dwell_bar(ui, text, stats, maximum);
+                }
+            },
+        );
     }
 
     fn has_data(&self) -> bool {
@@ -109,11 +271,11 @@ impl Metric for DwellTime {
     }
 
     fn snapshot(&self) -> Result<MetricSnapshot, MetricSnapshotError> {
-        validate_entry_count(DESCRIPTOR.id, self.stats.len())?;
+        validate_entry_count(Self::ID, self.stats.len())?;
         let mut entries = Vec::with_capacity(self.stats.len());
         for (text, stats) in &self.stats {
-            validate_dimension(DESCRIPTOR.id, text)?;
-            let (total_ns, samples) = stats.snapshot_parts(DESCRIPTOR.id)?;
+            validate_dimension(Self::ID, text)?;
+            let (total_ns, samples) = stats.snapshot_parts(Self::ID)?;
             entries.push(DurationEntry {
                 text: text.clone(),
                 total_ns,
@@ -121,25 +283,25 @@ impl Metric for DwellTime {
             });
         }
         entries.sort_by(|left, right| left.text.cmp(&right.text));
-        MetricSnapshot::encode(DESCRIPTOR.id, SNAPSHOT_VERSION, &SnapshotV1 { entries })
+        MetricSnapshot::encode(Self::ID, SNAPSHOT_VERSION, &SnapshotV1 { entries })
     }
 
     fn restore(&mut self, snapshot: &MetricSnapshot) -> Result<(), MetricSnapshotError> {
-        let state: SnapshotV1 = snapshot.decode(DESCRIPTOR.id, SNAPSHOT_VERSION)?;
-        validate_entry_count(DESCRIPTOR.id, state.entries.len())?;
+        let state: SnapshotV1 = snapshot.decode(Self::ID, SNAPSHOT_VERSION)?;
+        validate_entry_count(Self::ID, state.entries.len())?;
 
         let mut labels = HashSet::with_capacity(state.entries.len());
         let mut stats = HashMap::with_capacity(state.entries.len());
         for entry in state.entries {
-            validate_dimension(DESCRIPTOR.id, &entry.text)?;
+            validate_dimension(Self::ID, &entry.text)?;
             if !labels.insert(entry.text.clone()) {
                 return Err(MetricSnapshotError::invalid_payload(
-                    DESCRIPTOR.id,
+                    Self::ID,
                     "duplicate duration dimension",
                 ));
             }
             let duration =
-                DurationStats::from_snapshot_parts(DESCRIPTOR.id, entry.total_ns, entry.samples)?;
+                DurationStats::from_snapshot_parts(Self::ID, entry.total_ns, entry.samples)?;
             stats.insert(entry.text, duration);
         }
 
@@ -163,12 +325,16 @@ impl Metric for DwellTime {
 mod tests {
     use std::time::{Duration, SystemTime};
 
+    use eframe::egui;
+    use egui_kittest::{Harness, kittest::Queryable};
+
     use crate::{
+        app::view::components::{TextTokenContext, describe_text_token},
         input::{KeyEvent, KeyEventKind, KeyRole, PhysicalKey},
-        metric::Metric,
+        metric::{DurationStats, Metric},
     };
 
-    use super::DwellTime;
+    use super::{DwellTime, SortChoice};
 
     fn event(at_ms: u64, kind: KeyEventKind, text: Option<&str>) -> KeyEvent {
         KeyEvent::new(
@@ -180,6 +346,13 @@ mod tests {
         )
     }
 
+    fn duration_stats(total_ms: u64, samples: u64) -> DurationStats {
+        DurationStats {
+            total: Duration::from_millis(total_ms),
+            samples,
+        }
+    }
+
     #[test]
     fn uses_text_captured_when_key_was_pressed() {
         let mut metric = DwellTime::default();
@@ -189,6 +362,106 @@ mod tests {
 
         assert_eq!(metric.stats.get("A").map(|stats| stats.samples), Some(1));
         assert_eq!(metric.stats.get("a").map(|stats| stats.samples), None);
+    }
+
+    #[test]
+    fn overall_average_is_weighted_by_samples() {
+        let mut metric = DwellTime::default();
+        metric.stats.insert("a".to_owned(), duration_stats(100, 2));
+        metric.stats.insert("b".to_owned(), duration_stats(100, 1));
+        metric.stats.insert("c".to_owned(), duration_stats(150, 3));
+
+        let (average, samples) = metric
+            .overall_average()
+            .expect("populated dwell stats should have an average");
+        assert_eq!(samples, 6);
+        assert!((average - 350.0 / 6.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sorting_is_deterministic_for_averages_labels_and_sample_counts() {
+        let mut metric = DwellTime::default();
+        metric
+            .stats
+            .insert("alpha".to_owned(), duration_stats(100, 2));
+        metric
+            .stats
+            .insert("beta".to_owned(), duration_stats(100, 1));
+        metric
+            .stats
+            .insert("delta".to_owned(), duration_stats(150, 3));
+
+        let order = |sort| {
+            metric
+                .sorted_stats(sort)
+                .into_iter()
+                .map(|(text, _)| text)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(order(SortChoice::Slowest), ["beta", "alpha", "delta"]);
+        assert_eq!(order(SortChoice::Fastest), ["alpha", "delta", "beta"]);
+        assert_eq!(order(SortChoice::Label), ["alpha", "beta", "delta"]);
+        assert_eq!(order(SortChoice::SampleCount), ["delta", "alpha", "beta"]);
+
+        metric.stats.clear();
+        metric.stats.insert(
+            "alphabetically-first".to_owned(),
+            DurationStats {
+                total: Duration::from_nanos(i64::MAX as u64 - 1),
+                samples: 1,
+            },
+        );
+        metric.stats.insert(
+            "truly-slower".to_owned(),
+            DurationStats {
+                total: Duration::from_nanos(i64::MAX as u64),
+                samples: 1,
+            },
+        );
+        let order = |sort| {
+            metric
+                .sorted_stats(sort)
+                .into_iter()
+                .map(|(text, _)| text)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            order(SortChoice::Slowest),
+            ["truly-slower", "alphabetically-first"]
+        );
+    }
+
+    #[test]
+    fn analysis_rows_are_accessible_and_expansion_uses_temporary_state() {
+        let mut metric = DwellTime::default();
+        for index in 0..9 {
+            metric
+                .stats
+                .insert(format!("text-{index}"), duration_stats(100, 1));
+        }
+        let mut harness = Harness::new_ui(move |ui| {
+            metric.analysis_ui(ui);
+        });
+
+        let token = describe_text_token("text-0", TextTokenContext::ProducedText);
+        let accessible_label = format!(
+            "Dwell time for {}: 100.0 ms average across 1 sample",
+            token.accessible_label
+        );
+        assert!(
+            harness
+                .query_by_role_and_label(
+                    egui::accesskit::Role::ProgressIndicator,
+                    &accessible_label,
+                )
+                .is_some()
+        );
+        assert!(harness.query_by_label("Showing 8 of 9").is_some());
+        harness.get_by_label("Show 1 more").click();
+        harness.step();
+        harness.step();
+        assert!(harness.query_by_label("Showing 9 of 9").is_some());
+        assert!(harness.query_by_label("Show fewer").is_some());
     }
 
     #[test]
@@ -212,7 +485,10 @@ mod tests {
         assert_eq!(metric.pressed_keys.len(), 1);
 
         let mut restored = DwellTime::default();
-        restored.restore(&metric.snapshot().unwrap()).unwrap();
+        let snapshot = metric.snapshot().expect("dwell snapshot should encode");
+        restored
+            .restore(&snapshot)
+            .expect("dwell snapshot should restore");
         assert_eq!(restored.stats, metric.stats);
         assert!(restored.pressed_keys.is_empty());
 

@@ -52,7 +52,7 @@ jobs:
           archive="${directory}.tar.gz"
 
           install -Dm755 target/release/evtap "dist/${directory}/evtap"
-          install -Dm644 README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE -t "dist/${directory}"
+          install -Dm644 README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE LICENSE-INTER -t "dist/${directory}"
           install -Dm644 docs/*.md -t "dist/${directory}/docs"
           source_date_epoch="$(git show -s --format=%ct HEAD)"
           tar --sort=name \

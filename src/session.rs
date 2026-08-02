@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::metric::{Metric, MetricSnapshot, MetricSnapshotError, default_metrics};
+use crate::metric::{MetricSnapshot, MetricSnapshotError, SessionMetrics};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct SessionId(i64);
@@ -92,11 +92,6 @@ pub struct StoredSession {
     pub metrics: Vec<StoredMetricSnapshot>,
 }
 
-pub struct RecoveredMetrics {
-    pub metrics: Vec<Box<dyn Metric>>,
-    pub issues: Vec<MetricRecoveryIssue>,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MetricRecoveryIssue {
     Unknown { metric_id: String },
@@ -104,49 +99,53 @@ pub enum MetricRecoveryIssue {
     Invalid { metric_id: String, details: String },
 }
 
-pub fn recover_default_metrics(snapshots: &[StoredMetricSnapshot]) -> RecoveredMetrics {
-    let mut metrics = default_metrics();
-    let mut issues = Vec::new();
-    let mut encountered = HashSet::with_capacity(snapshots.len());
+impl SessionMetrics {
+    pub fn restore(
+        snapshots: &[StoredMetricSnapshot],
+    ) -> (SessionMetrics, Vec<MetricRecoveryIssue>) {
+        let mut metrics = SessionMetrics::default();
+        let mut issues = Vec::new();
+        let mut encountered = HashSet::with_capacity(snapshots.len());
 
-    for stored in snapshots {
-        if !encountered.insert(stored.metric_id.as_str()) {
-            issues.push(MetricRecoveryIssue::Duplicate {
-                metric_id: stored.metric_id.clone(),
-            });
-            continue;
+        for stored in snapshots {
+            if !encountered.insert(stored.metric_id.as_str()) {
+                issues.push(MetricRecoveryIssue::Duplicate {
+                    metric_id: stored.metric_id.clone(),
+                });
+                continue;
+            }
+            if !SessionMetrics::contains_id(&stored.metric_id) {
+                issues.push(MetricRecoveryIssue::Unknown {
+                    metric_id: stored.metric_id.clone(),
+                });
+                continue;
+            }
+            let result = stored
+                .to_metric_snapshot()
+                .map_err(|error| error.to_string())
+                .and_then(|snapshot| {
+                    metrics
+                        .restore_snapshot(&snapshot)
+                        .map_err(|error| error.to_string())
+                });
+            if let Err(details) = result {
+                issues.push(MetricRecoveryIssue::Invalid {
+                    metric_id: stored.metric_id.clone(),
+                    details,
+                });
+            }
         }
-        let Some(metric) = metrics
-            .iter_mut()
-            .find(|metric| metric.descriptor().id == stored.metric_id)
-        else {
-            issues.push(MetricRecoveryIssue::Unknown {
-                metric_id: stored.metric_id.clone(),
-            });
-            continue;
-        };
-        let result = stored
-            .to_metric_snapshot()
-            .map_err(|error| error.to_string())
-            .and_then(|snapshot| metric.restore(&snapshot).map_err(|error| error.to_string()));
-        if let Err(details) = result {
-            issues.push(MetricRecoveryIssue::Invalid {
-                metric_id: stored.metric_id.clone(),
-                details,
-            });
-        }
+
+        (metrics, issues)
     }
-
-    RecoveredMetrics { metrics, issues }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::metric::MetricSnapshot;
+    use crate::metric::{MetricSnapshot, SessionMetrics};
 
     use super::{
         MetricRecoveryIssue, SessionId, SessionMetadata, StoredMetricError, StoredMetricSnapshot,
-        recover_default_metrics,
     };
 
     #[test]
@@ -173,7 +172,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_isolates_invalid_and_unknown_metrics() {
+    fn recovery_isolates_partial_unknown_duplicate_and_invalid_metrics() {
         let snapshots = vec![
             StoredMetricSnapshot {
                 metric_id: "total-presses".to_owned(),
@@ -190,26 +189,50 @@ mod tests {
                 schema_version: 1,
                 payload_json: "{}".to_owned(),
             },
+            StoredMetricSnapshot {
+                metric_id: "total-presses".to_owned(),
+                schema_version: 1,
+                payload_json: r#"{"count":99}"#.to_owned(),
+            },
         ];
 
-        let recovered = recover_default_metrics(&snapshots);
-
-        let total = recovered
-            .metrics
+        let (recovered, issues) = SessionMetrics::restore(&snapshots);
+        let recovered_snapshots = recovered.snapshots().unwrap();
+        let total = recovered_snapshots
             .iter()
-            .find(|metric| metric.descriptor().id == "total-presses")
-            .unwrap()
-            .snapshot()
+            .find(|snapshot| snapshot.metric_id() == "total-presses")
             .unwrap();
+        let key_usage = recovered_snapshots
+            .iter()
+            .find(|snapshot| snapshot.metric_id() == "key-usage")
+            .unwrap();
+
         assert_eq!(total.payload_json(), r#"{"count":17}"#);
-        assert!(recovered.issues.iter().any(|issue| matches!(
-            issue,
+        assert_eq!(key_usage.payload_json(), r#"{"keys":[]}"#);
+        let defaults = SessionMetrics::default().snapshots().unwrap();
+        for recovered in recovered_snapshots
+            .iter()
+            .filter(|snapshot| snapshot.metric_id() != "total-presses")
+        {
+            let default = defaults
+                .iter()
+                .find(|snapshot| snapshot.metric_id() == recovered.metric_id())
+                .unwrap();
+            assert_eq!(recovered, default);
+        }
+        assert_eq!(issues.len(), 3);
+        assert!(matches!(
+            &issues[0],
             MetricRecoveryIssue::Invalid { metric_id, .. } if metric_id == "key-usage"
-        )));
-        assert!(recovered.issues.iter().any(|issue| matches!(
-            issue,
+        ));
+        assert!(matches!(
+            &issues[1],
             MetricRecoveryIssue::Unknown { metric_id } if metric_id == "future-metric"
-        )));
+        ));
+        assert!(matches!(
+            &issues[2],
+            MetricRecoveryIssue::Duplicate { metric_id } if metric_id == "total-presses"
+        ));
     }
 
     #[test]

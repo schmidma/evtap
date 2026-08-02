@@ -65,6 +65,21 @@ CREATE TABLE metric_snapshots (
 ) WITHOUT ROWID;
 "#;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionListOrder {
+    LastOpened,
+    LastUpdated,
+}
+
+impl SessionListOrder {
+    fn sql(self) -> &'static str {
+        match self {
+            Self::LastOpened => "last_opened_at_ms DESC, id DESC",
+            Self::LastUpdated => "updated_at_ms DESC, id DESC",
+        }
+    }
+}
+
 pub struct Repository {
     connection: Connection,
     path: Option<PathBuf>,
@@ -117,19 +132,7 @@ impl Repository {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        if let Some(name) = &snapshot.name {
-            let duplicate: bool = transaction.query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM sessions
-                    WHERE name = ?1 AND (?2 IS NULL OR id != ?2)
-                )",
-                params![name, snapshot.id.map(SessionId::get)],
-                |row| row.get(0),
-            )?;
-            if duplicate {
-                return Err(RepositoryError::DuplicateSessionName);
-            }
-        }
+        ensure_unique_session_name(&transaction, snapshot.name.as_deref(), snapshot.id)?;
 
         let session_id = if let Some(session_id) = snapshot.id {
             let changed = transaction.execute(
@@ -220,14 +223,59 @@ impl Repository {
         Ok(session)
     }
 
-    pub fn list_sessions(&self, limit: u32) -> Result<Vec<SessionMetadata>, RepositoryError> {
+    pub fn list_sessions(
+        &self,
+        limit: u32,
+        order: SessionListOrder,
+    ) -> Result<Vec<SessionMetadata>, RepositoryError> {
         let limit = limit.clamp(1, MAX_SESSION_LIST_SIZE);
         let mut statement = self.connection.prepare(&format!(
-            "{} ORDER BY last_opened_at_ms DESC, id DESC LIMIT ?1",
-            session_metadata_query()
+            "{} ORDER BY {} LIMIT ?1",
+            session_metadata_query(),
+            order.sql()
         ))?;
         let rows = statement.query_map([limit], raw_metadata_from_row)?;
         rows.map(|row| SessionMetadata::try_from(row?)).collect()
+    }
+
+    pub fn rename_session(
+        &mut self,
+        session_id: SessionId,
+        name: Option<&str>,
+        updated_at_ms: i64,
+    ) -> Result<Option<SessionMetadata>, RepositoryError> {
+        validate_session_name(name)?;
+        validate_timestamp(updated_at_ms)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+            [session_id.get()],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Ok(None);
+        }
+        ensure_unique_session_name(&transaction, name, Some(session_id))?;
+
+        let changed = transaction.execute(
+            "UPDATE sessions SET name = ?1, updated_at_ms = ?2 WHERE id = ?3",
+            params![name, updated_at_ms, session_id.get()],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+
+        let metadata = transaction.query_row(
+            &format!("{} WHERE id = ?1", session_metadata_query()),
+            [session_id.get()],
+            raw_metadata_from_row,
+        )?;
+        let metadata = SessionMetadata::try_from(metadata)?;
+        transaction.commit()?;
+        Ok(Some(metadata))
     }
 
     pub fn delete_session(&mut self, session_id: SessionId) -> Result<bool, RepositoryError> {
@@ -321,6 +369,29 @@ impl Repository {
     }
 }
 
+fn ensure_unique_session_name(
+    transaction: &Transaction<'_>,
+    name: Option<&str>,
+    session_id: Option<SessionId>,
+) -> Result<(), RepositoryError> {
+    let Some(name) = name else {
+        return Ok(());
+    };
+    let duplicate: bool = transaction.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sessions
+            WHERE name = ?1 AND (?2 IS NULL OR id != ?2)
+        )",
+        params![name, session_id.map(SessionId::get)],
+        |row| row.get(0),
+    )?;
+    if duplicate {
+        Err(RepositoryError::DuplicateSessionName)
+    } else {
+        Ok(())
+    }
+}
+
 fn load_session(
     connection: &Connection,
     session_id: SessionId,
@@ -408,11 +479,7 @@ fn validate_snapshot(snapshot: &SessionSnapshot) -> Result<(), RepositoryError> 
     {
         return Err(RepositoryError::InvalidApplicationVersion);
     }
-    if let Some(name) = &snapshot.name
-        && (name.trim() != name || name.is_empty() || name.len() > MAX_SESSION_NAME_BYTES)
-    {
-        return Err(RepositoryError::InvalidSessionName);
-    }
+    validate_session_name(snapshot.name.as_deref())?;
     if snapshot
         .keyboard
         .display_name
@@ -446,6 +513,16 @@ fn validate_snapshot(snapshot: &SessionSnapshot) -> Result<(), RepositoryError> 
         })?;
     }
     Ok(())
+}
+
+fn validate_session_name(name: Option<&str>) -> Result<(), RepositoryError> {
+    if name.is_some_and(|name| {
+        name.trim() != name || name.is_empty() || name.len() > MAX_SESSION_NAME_BYTES
+    }) {
+        Err(RepositoryError::InvalidSessionName)
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_timestamp(value: i64) -> Result<(), RepositoryError> {
@@ -610,7 +687,9 @@ mod tests {
         session::{KeyboardContext, SessionId, SessionSnapshot},
     };
 
-    use super::{APPLICATION_ID, DATABASE_SCHEMA_VERSION, Repository, RepositoryError};
+    use super::{
+        APPLICATION_ID, DATABASE_SCHEMA_VERSION, Repository, RepositoryError, SessionListOrder,
+    };
 
     fn snapshot(id: Option<SessionId>, name: Option<&str>, now: i64) -> SessionSnapshot {
         SessionSnapshot {
@@ -639,7 +718,12 @@ mod tests {
         let path = temporary.path().join("data/evtap/evtap.sqlite3");
         let repository = Repository::open(path.clone()).unwrap();
 
-        assert!(repository.list_sessions(10).unwrap().is_empty());
+        assert!(
+            repository
+                .list_sessions(10, SessionListOrder::LastOpened)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             fs::metadata(path.parent().unwrap())
                 .unwrap()
@@ -678,7 +762,9 @@ mod tests {
             MetricSnapshot::from_json("total-presses", 1, r#"{"count":9}"#.to_owned()).unwrap();
         repository.save(&changed).unwrap();
 
-        let sessions = repository.list_sessions(10).unwrap();
+        let sessions = repository
+            .list_sessions(10, SessionListOrder::LastOpened)
+            .unwrap();
         assert_eq!(
             sessions.iter().map(|item| item.id).collect::<Vec<_>>(),
             vec![home, work]
@@ -699,7 +785,163 @@ mod tests {
             repository.save(&snapshot(None, Some("Home"), 13)),
             Err(RepositoryError::DuplicateSessionName)
         ));
-        assert_eq!(repository.list_sessions(10).unwrap().len(), 3);
+        assert_eq!(
+            repository
+                .list_sessions(10, SessionListOrder::LastOpened)
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn unloaded_rename_preserves_open_time_and_supports_distinct_list_orders() {
+        let mut repository = Repository::open_in_memory().unwrap();
+        let home = repository.save(&snapshot(None, Some("Home"), 10)).unwrap();
+        let work = repository.save(&snapshot(None, Some("Work"), 20)).unwrap();
+        repository.load_and_mark_opened(home, 30).unwrap();
+
+        let renamed = repository
+            .rename_session(work, Some("Project"), 40)
+            .unwrap()
+            .unwrap();
+        assert_eq!(renamed.name.as_deref(), Some("Project"));
+        assert_eq!(renamed.created_at_ms, 1);
+        assert_eq!(renamed.updated_at_ms, 40);
+        assert_eq!(renamed.last_opened_at_ms, 20);
+        assert_eq!(renamed.captured_duration_ns, 42);
+        assert_eq!(renamed.application_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(renamed.keyboard.display_name.as_deref(), Some("Keyboard"));
+        assert_eq!(renamed.keyboard.model, "pc105");
+        assert_eq!(renamed.keyboard.layout, "us");
+        assert_eq!(renamed.keyboard.variant, "");
+        assert_eq!(
+            repository.load_session(work).unwrap().unwrap().metrics[0].payload_json,
+            r#"{"count":3}"#
+        );
+
+        let opened = repository
+            .list_sessions(10, SessionListOrder::LastOpened)
+            .unwrap();
+        assert_eq!(
+            opened.iter().map(|session| session.id).collect::<Vec<_>>(),
+            vec![home, work]
+        );
+        let updated = repository
+            .list_sessions(10, SessionListOrder::LastUpdated)
+            .unwrap();
+        assert_eq!(
+            updated.iter().map(|session| session.id).collect::<Vec<_>>(),
+            vec![work, home]
+        );
+        assert_eq!(
+            repository
+                .list_sessions(0, SessionListOrder::LastUpdated)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        assert!(repository.rename_session(work, None, 50).unwrap().is_some());
+        assert!(
+            repository
+                .rename_session(SessionId::new(999).unwrap(), Some("Missing"), 60)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn session_list_order_ties_use_the_newest_session_id() {
+        let mut repository = Repository::open_in_memory().unwrap();
+        let first = repository.save(&snapshot(None, Some("First"), 10)).unwrap();
+        let second = repository
+            .save(&snapshot(None, Some("Second"), 10))
+            .unwrap();
+
+        for order in [SessionListOrder::LastOpened, SessionListOrder::LastUpdated] {
+            let sessions = repository.list_sessions(10, order).unwrap();
+            assert_eq!(
+                sessions
+                    .into_iter()
+                    .map(|session| session.id)
+                    .collect::<Vec<_>>(),
+                vec![second, first]
+            );
+        }
+    }
+
+    #[test]
+    fn session_lists_remain_capped_at_ten_thousand() {
+        let mut repository = Repository::open_in_memory().unwrap();
+        let transaction = repository.connection.transaction().unwrap();
+        {
+            let mut statement = transaction
+                .prepare(
+                    "INSERT INTO sessions (
+                        id, name, created_at_ms, updated_at_ms, last_opened_at_ms,
+                        captured_duration_ns, application_version, keyboard_name,
+                        xkb_model, xkb_layout, xkb_variant
+                    ) VALUES (?1, NULL, 1, ?1, ?1, 0, 'test', NULL, '', '', '')",
+                )
+                .unwrap();
+            for id in 1..=10_001_i64 {
+                statement.execute([id]).unwrap();
+            }
+        }
+        transaction.commit().unwrap();
+
+        let sessions = repository
+            .list_sessions(u32::MAX, SessionListOrder::LastUpdated)
+            .unwrap();
+        assert_eq!(sessions.len(), 10_000);
+        assert_eq!(sessions.first().unwrap().id.get(), 10_001);
+        assert_eq!(sessions.last().unwrap().id.get(), 2);
+    }
+
+    #[test]
+    fn unloaded_rename_validates_names_and_rolls_back_conflicts() {
+        let mut repository = Repository::open_in_memory().unwrap();
+        let first = repository.save(&snapshot(None, Some("First"), 10)).unwrap();
+        repository
+            .save(&snapshot(None, Some("Reserved"), 20))
+            .unwrap();
+        let eighty_bytes = "é".repeat(40);
+
+        let renamed = repository
+            .rename_session(first, Some(&eighty_bytes), 30)
+            .unwrap()
+            .unwrap();
+        assert_eq!(renamed.name.as_deref(), Some(eighty_bytes.as_str()));
+        assert!(matches!(
+            repository.rename_session(first, Some(&"é".repeat(41)), 40),
+            Err(RepositoryError::InvalidSessionName)
+        ));
+        for invalid in ["", " leading", "trailing ", &"x".repeat(81)] {
+            assert!(matches!(
+                repository.rename_session(first, Some(invalid), 40),
+                Err(RepositoryError::InvalidSessionName)
+            ));
+        }
+        assert!(matches!(
+            repository.rename_session(first, Some("Reserved"), 40),
+            Err(RepositoryError::DuplicateSessionName)
+        ));
+        assert!(
+            repository
+                .rename_session(SessionId::new(999).unwrap(), Some("Reserved"), 40,)
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            repository.rename_session(first, Some("Valid"), -1),
+            Err(RepositoryError::InvalidTimestamp)
+        ));
+
+        let unchanged = repository.load_session(first).unwrap().unwrap().metadata;
+        assert_eq!(unchanged.name.as_deref(), Some(eighty_bytes.as_str()));
+        assert_eq!(unchanged.updated_at_ms, 30);
+        assert_eq!(unchanged.last_opened_at_ms, 10);
     }
 
     #[test]
@@ -830,9 +1072,20 @@ mod tests {
         repository.save(&snapshot(None, Some("Two"), 20)).unwrap();
 
         assert!(repository.delete_session(first).unwrap());
-        assert_eq!(repository.list_sessions(10).unwrap().len(), 1);
+        assert_eq!(
+            repository
+                .list_sessions(10, SessionListOrder::LastOpened)
+                .unwrap()
+                .len(),
+            1
+        );
         assert_eq!(repository.delete_all_sessions().unwrap(), 1);
-        assert!(repository.list_sessions(10).unwrap().is_empty());
+        assert!(
+            repository
+                .list_sessions(10, SessionListOrder::LastOpened)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

@@ -3,365 +3,57 @@ use std::time::Duration;
 use chrono::{Local, TimeZone};
 use eframe::egui;
 
-use crate::{
-    session::SessionMetadata,
-    storage::{StorageCommand, StorageOperation, StorageStatus, database_disk_usage},
-};
+#[cfg(test)]
+use crate::session::SessionMetadata;
+use crate::storage::{StorageOperation, StorageStatus};
 
-use super::{App, BoundaryTarget, DisclosureIntent, ListenerState};
+use super::{App, BoundaryTarget, DisclosureIntent, MAX_SESSION_NAME_BYTES};
+
+pub(crate) mod components;
+mod sessions;
+mod settings;
+mod shell;
+pub(super) mod theme;
 
 impl App {
-    pub(super) fn render_session_management(&mut self, ui: &mut egui::Ui) {
-        ui.group(|ui| {
-            ui.set_width(ui.available_width());
-            ui.heading("Session");
-            let busy = self.loading_session
-                || self.storage_tracker.in_flight().is_some()
-                || self.deleting_session
-                || self.deleting_all
-                || self.listener_state == ListenerState::Stopping;
-            let mut requested_target = None;
-            ui.horizontal_wrapped(|ui| {
-                ui.add_enabled_ui(!busy, |ui| {
-                    egui::ComboBox::from_label("Current")
-                        .selected_text(self.working_session.display_name())
-                        .show_ui(ui, |ui| {
-                            for saved in &self.sessions {
-                                let selected = self.working_session.id == Some(saved.id);
-                                let label = session_selector_label(saved);
-                                if ui.selectable_label(selected, label).clicked() && !selected {
-                                    requested_target = Some(BoundaryTarget::Load(saved.id));
-                                }
-                            }
-                        });
-                });
-                if ui
-                    .add_enabled(!busy, egui::Button::new("New session"))
-                    .clicked()
-                {
-                    requested_target = Some(BoundaryTarget::New);
-                }
-                if ui
-                    .add_enabled(!busy, egui::Button::new("Save now"))
-                    .clicked()
-                {
-                    self.request_save(None);
-                }
-                if ui.add_enabled(!busy, egui::Button::new("Rename")).clicked() {
-                    self.rename_buffer = self.working_session.name.clone().unwrap_or_default();
-                    self.rename_open = true;
-                    self.rename_error = None;
-                }
-                if ui
-                    .add_enabled(
-                        self.listener.is_none() && !busy,
-                        egui::Button::new("Reset statistics"),
-                    )
-                    .clicked()
-                {
-                    self.confirm_reset = true;
-                }
-                if ui
-                    .add_enabled(
-                        self.listener.is_none() && !busy,
-                        egui::Button::new("Delete session"),
-                    )
-                    .clicked()
-                {
-                    self.confirm_delete = true;
-                }
-            });
-            if let Some(target) = requested_target {
-                self.request_boundary(target);
-            }
-
-            ui.horizontal_wrapped(|ui| {
-                let mut autosave = self.settings.autosave_enabled();
-                if ui.checkbox(&mut autosave, "Autosave sessions").changed() {
-                    if autosave {
-                        if self.settings.storage_disclosure_acknowledged() {
-                            self.settings.set_autosave_enabled(true);
-                            if self.save_settings() {
-                                if self.working_dirty() {
-                                    self.request_save(None);
-                                }
-                            } else {
-                                self.settings.set_autosave_enabled(false);
-                            }
-                        } else {
-                            self.disclosure_prompt = Some(DisclosureIntent::EnableAutosave);
-                        }
-                    } else {
-                        self.settings.set_autosave_enabled(false);
-                        if self.save_settings() {
-                            self.checkpoint_schedule.clear();
-                        } else {
-                            self.settings.set_autosave_enabled(true);
-                        }
-                    }
-                }
-                ui.label(storage_status_label(
-                    self.storage_tracker.status(),
-                    self.working_session.id.is_some(),
-                ));
-                let retryable = matches!(
-                    self.last_failed_operation,
-                    Some(StorageOperation::Open | StorageOperation::Save)
-                );
-                if retryable && ui.button("Retry storage operation").clicked() {
-                    if self.last_failed_operation == Some(StorageOperation::Open) {
-                        if let Some(worker) = &self.storage {
-                            let _ = worker.send(StorageCommand::RetryOpen {
-                                last_session_id: self.settings.last_session_id(),
-                            });
-                        }
-                    } else {
-                        self.request_save(None);
-                    }
-                }
-            });
-            ui.small(format!(
-                "Capture duration: {} · Created: {}",
-                format_duration(self.working_session.duration()),
-                format_local_timestamp(self.working_session.created_at_ms)
-            ));
-            if self.working_session.restored {
-                ui.weak("Restored from disk; capture is paused until you start listening.");
-            }
-            if let Some(error) = &self.storage_error {
-                ui.colored_label(egui::Color32::RED, error);
-            }
-            ui.horizontal_wrapped(|ui| {
-                ui.small(format!(
-                    "Storage: {} ({})",
-                    self.paths.database_file().display(),
-                    format_byte_size(database_disk_usage(&self.paths.database_file()))
-                ));
-                if ui
-                    .add_enabled(
-                        !self.sessions.is_empty() && !busy,
-                        egui::Button::new("Delete all saved sessions"),
-                    )
-                    .clicked()
-                {
-                    self.confirm_delete_all = true;
-                }
-            });
-        });
-    }
-
-    pub(super) fn render_capture_setup(&mut self, ui: &mut egui::Ui) {
-        ui.group(|ui| {
-            ui.set_width(ui.available_width());
-            ui.heading("Capture setup");
-            self.render_device_picker(ui);
-            ui.add_space(4.0);
-            self.render_keyboard_configuration(ui);
-            ui.add_space(4.0);
-            self.render_capture_controls(ui);
-            self.render_capture_status(ui);
-        });
-    }
-
-    fn render_device_picker(&mut self, ui: &mut egui::Ui) {
-        let picker_enabled = self.listener.is_none()
-            && !matches!(self.listener_state, ListenerState::Stopping)
-            && !self.loading_session;
-        let mut request_scan = false;
-        ui.horizontal_wrapped(|ui| {
-            match &self.devices {
-                None => {
-                    ui.spinner();
-                    ui.label("Scanning for keyboards…");
-                }
-                Some(devices) if devices.is_empty() => {
-                    ui.label("No readable keyboards");
-                }
-                Some(devices) => {
-                    let text = self
-                        .selected_device
-                        .and_then(|index| devices.get(index))
-                        .map_or("Select a keyboard", |device| device.name.as_str());
-                    ui.add_enabled_ui(picker_enabled, |ui| {
-                        egui::ComboBox::from_label("Keyboard")
-                            .selected_text(text)
-                            .show_ui(ui, |ui| {
-                                for (index, device) in devices.iter().enumerate() {
-                                    ui.selectable_value(
-                                        &mut self.selected_device,
-                                        Some(index),
-                                        &device.name,
-                                    )
-                                    .on_hover_ui(|ui| {
-                                        ui.label(format!(
-                                            "{} ({})",
-                                            device.physical_path, device.path
-                                        ));
-                                    });
-                                }
-                            });
-                    });
-                }
-            }
-            if ui
-                .add_enabled(
-                    picker_enabled && self.devices.is_some(),
-                    egui::Button::new("Rescan"),
-                )
-                .clicked()
-            {
-                request_scan = true;
-            }
-        });
-        if self.working_session.keyboard.display_name.is_some() {
-            ui.weak("The session's remembered keyboard is a suggestion; any readable keyboard may be used.");
-        }
-        if request_scan {
-            self.request_scan();
-        }
-    }
-
-    fn render_keyboard_configuration(&mut self, ui: &mut egui::Ui) {
-        let enabled = self.listener.is_none() && !self.loading_session;
-        let mut changed = false;
-        ui.add_enabled_ui(enabled, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                egui::ComboBox::from_label("Model")
-                    .width(80.0)
-                    .selected_text(&self.model)
-                    .show_ui(ui, |ui| {
-                        for model in &self.available_models {
-                            changed |= ui
-                                .selectable_value(&mut self.model, model.clone(), model)
-                                .clicked();
-                        }
-                    });
-                egui::ComboBox::from_label("Layout")
-                    .selected_text(&self.layout)
-                    .show_ui(ui, |ui| {
-                        let mut update_variants = false;
-                        for layout in &self.available_layouts {
-                            if ui
-                                .selectable_value(&mut self.layout, layout.clone(), layout)
-                                .clicked()
-                            {
-                                changed = true;
-                                update_variants = true;
-                            }
-                        }
-                        if update_variants {
-                            self.update_variants();
-                        }
-                    });
-                let variant_text = if self.variant.is_empty() {
-                    "Default"
-                } else {
-                    &self.variant
-                };
-                egui::ComboBox::from_label("Variant")
-                    .selected_text(variant_text)
-                    .show_ui(ui, |ui| {
-                        changed |= ui
-                            .selectable_value(&mut self.variant, String::new(), "Default")
-                            .clicked();
-                        for variant in &self.available_variants {
-                            if !variant.is_empty() {
-                                changed |= ui
-                                    .selectable_value(&mut self.variant, variant.clone(), variant)
-                                    .clicked();
-                            }
-                        }
-                    });
-            });
-        });
-        if changed {
-            self.reinit_xkb();
-            self.save_keyboard_settings();
-            self.working_session.keyboard.model.clone_from(&self.model);
-            self.working_session
-                .keyboard
-                .layout
-                .clone_from(&self.layout);
-            self.working_session
-                .keyboard
-                .variant
-                .clone_from(&self.variant);
-            if self.working_session.id.is_some() || self.session_has_content() {
-                self.note_session_dirty();
-            }
-        }
-    }
-
-    fn render_capture_controls(&mut self, ui: &mut egui::Ui) {
-        let busy = self.loading_session
-            || self.deleting_session
-            || self.deleting_all
-            || matches!(self.listener_state, ListenerState::Stopping);
-        ui.horizontal_wrapped(|ui| {
-            if self.listener.is_some() {
-                if ui
-                    .add_enabled(!busy, egui::Button::new("Stop listening"))
-                    .clicked()
-                {
-                    self.stop_listener();
-                }
-            } else {
-                let selected_index = self.selected_device;
-                if ui
-                    .add_enabled(
-                        selected_index.is_some() && !busy,
-                        egui::Button::new("Start listening"),
-                    )
-                    .clicked()
-                    && let Some(index) = selected_index
-                {
-                    self.begin_listening(index);
-                }
-            }
-        });
-    }
-
-    fn render_capture_status(&self, ui: &mut egui::Ui) {
-        for error in [
-            self.scan_error.as_ref(),
-            self.keyboard_error.as_ref(),
-            self.settings_error.as_ref(),
-            self.capture_error.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            ui.colored_label(egui::Color32::RED, error);
-        }
-        if let Some(warning) = &self.scan_warning {
-            ui.colored_label(egui::Color32::YELLOW, warning);
-        }
-        match self.listener_state {
-            ListenerState::Idle => ui.weak("Not listening"),
-            ListenerState::Connecting => ui.label("Connecting to keyboard…"),
-            ListenerState::Listening => ui.colored_label(egui::Color32::GREEN, "Listening"),
-            ListenerState::Stopping => ui.label("Stopping listener…"),
-            ListenerState::Failed => {
-                ui.colored_label(egui::Color32::RED, "Capture stopped because of an error")
-            }
-        };
-    }
-
-    pub(super) fn render_prompts(&mut self, ctx: &egui::Context) {
+    pub(super) fn render_prompts(&mut self, ctx: &egui::Context) -> bool {
+        let focus_to_restore = self.focus_after_prompt.take();
+        let mut text_edit_focused = false;
         if let Some(intent) = self.disclosure_prompt {
-            egui::Window::new("Save sensitive aggregate statistics?")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .show(ctx, |ui| {
-                    ui.label("evtap reads global keyboard input while listening. Saving writes sensitive character, bigram, correction, key-usage, count, and timing aggregates to a local, unencrypted SQLite database.");
-                    ui.label("Raw event sequences, device paths, pressed-key state, and unfinished timing or correction context are not stored. No telemetry or synchronization is performed.");
-                    ui.colored_label(egui::Color32::YELLOW, "Anyone who can read your files, including backups or privileged processes, may read the saved aggregates.");
-                    ui.horizontal(|ui| {
-                        if ui.button("Allow local saves").clicked() {
-                            self.settings.acknowledge_storage_disclosure();
+            let reviewing = intent == DisclosureIntent::Review;
+            let title = if reviewing {
+                "Local storage disclosure"
+            } else {
+                "Save sensitive aggregate statistics?"
+            };
+            let focus_primary = std::mem::take(&mut self.prompt_needs_focus);
+            let (_, should_close) = components::modal(ctx, "storage-disclosure", title, |ui| {
+                ui.label("evtap reads global keyboard input while listening. Saving writes sensitive character, bigram, correction, key-usage, count, and timing aggregates to a local, unencrypted SQLite database.");
+                ui.label("Raw event sequences, device paths, pressed-key state, and unfinished timing or correction context are not stored. No telemetry or synchronization is performed.");
+                ui.colored_label(
+                        theme::palette(ui.ctx().theme()).warning,
+                        "Anyone who can read your files, including backups or privileged processes, may read the saved aggregates.",
+                    );
+                components::modal_actions(ui, |ui| {
+                    if reviewing {
+                        let close = components::primary_button(ui, "Close");
+                        if focus_primary {
+                            close.request_focus();
+                        }
+                        if close.clicked() {
+                            self.disclosure_prompt = None;
+                            self.finish_prompt();
+                        }
+                    } else {
+                        let allow = components::primary_button(ui, "Allow local saves");
+                        if focus_primary {
+                            allow.request_focus();
+                        }
+                        if allow.clicked() {
+                            self.settings.set_storage_disclosure_acknowledged(true);
                             if self.save_settings() {
                                 self.disclosure_prompt = None;
+                                self.finish_prompt();
                                 match intent {
                                     DisclosureIntent::Save(after) => self.begin_save(after),
                                     DisclosureIntent::EnableAutosave => {
@@ -374,144 +66,265 @@ impl App {
                                             self.settings.set_autosave_enabled(false);
                                         }
                                     }
+                                    DisclosureIntent::Review => {}
                                 }
+                            } else {
+                                self.settings.set_storage_disclosure_acknowledged(false);
                             }
                         }
                         if ui.button("Cancel").clicked() {
                             self.disclosure_prompt = None;
+                            self.finish_prompt();
                         }
-                    });
+                    }
                 });
+            });
+            if should_close && self.disclosure_prompt.is_some() {
+                self.disclosure_prompt = None;
+                self.finish_prompt();
+            }
         }
 
         if let Some(target) = self.boundary_prompt {
             let exiting = target == BoundaryTarget::Exit;
-            egui::Window::new(if exiting {
+            let title = if exiting {
                 "Save changes before exiting?"
             } else {
                 "Save changes before switching sessions?"
-            })
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .show(ctx, |ui| {
+            };
+            let focus_primary = std::mem::take(&mut self.prompt_needs_focus);
+            let (_, should_close) = components::modal(ctx, "dirty-boundary", title, |ui| {
                 ui.label(format!(
                     "{} has unsaved changes.",
                     self.working_session.display_name()
                 ));
-                ui.horizontal(|ui| {
-                    if ui
-                        .button(if exiting {
+                components::modal_actions(ui, |ui| {
+                    let save = components::primary_button(
+                        ui,
+                        if exiting {
                             "Save and exit"
                         } else {
                             "Save and switch"
-                        })
-                        .clicked()
-                    {
+                        },
+                    );
+                    if focus_primary {
+                        save.request_focus();
+                    }
+                    if save.clicked() {
                         self.boundary_prompt = None;
+                        self.finish_prompt();
                         self.request_save(Some(target));
                     }
-                    if ui
-                        .button(if self.working_session.id.is_some() {
+                    if components::destructive_button(
+                        ui,
+                        if self.working_session.id.is_some() {
                             "Discard changes"
                         } else {
                             "Discard session"
-                        })
-                        .clicked()
+                        },
+                    )
+                    .clicked()
                     {
                         self.boundary_prompt = None;
+                        self.finish_prompt();
                         self.execute_boundary(target);
                     }
                     if ui.button("Cancel").clicked() {
                         self.boundary_prompt = None;
+                        self.finish_prompt();
                     }
                 });
             });
+            if should_close && self.boundary_prompt.is_some() {
+                self.boundary_prompt = None;
+                self.finish_prompt();
+            }
         }
 
-        if self.rename_open {
-            egui::Window::new("Rename session")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .show(ctx, |ui| {
+        let mut submit_rename = false;
+        let mut cancel_rename = false;
+        if let Some(dialog) = &mut self.rename_dialog {
+            let (_, should_close) =
+                components::modal(ctx, "rename-session", "Rename session", |ui| {
                     ui.label("Leave the name empty to keep this session untitled.");
-                    ui.text_edit_singleline(&mut self.rename_buffer);
-                    if let Some(error) = &self.rename_error {
+                    ui.label("Session name");
+                    let edit = ui.add(
+                        egui::TextEdit::singleline(&mut dialog.buffer)
+                            .id_salt("rename-session-name")
+                            .desired_width(f32::INFINITY),
+                    );
+                    edit.widget_info(|| {
+                        egui::WidgetInfo::labeled(
+                            egui::WidgetType::TextEdit,
+                            edit.enabled(),
+                            "Session name",
+                        )
+                    });
+                    if dialog.focus_text {
+                        edit.request_focus();
+                        let mut state =
+                            egui::TextEdit::load_state(ctx, edit.id).unwrap_or_default();
+                        state
+                            .cursor
+                            .set_char_range(Some(egui::text::CCursorRange::two(
+                                egui::text::CCursor::new(0),
+                                egui::text::CCursor::new(dialog.buffer.chars().count()),
+                            )));
+                        state.store(ctx, edit.id);
+                        dialog.focus_text = false;
+                    }
+                    text_edit_focused = edit.has_focus();
+                    let used_bytes = dialog.buffer.trim().len();
+                    if used_bytes >= 64 {
+                        let remaining = MAX_SESSION_NAME_BYTES.saturating_sub(used_bytes);
+                        ui.small(format!("{remaining} of 80 UTF-8 bytes remaining"));
+                    }
+                    if let Some(error) = &dialog.error {
                         ui.colored_label(egui::Color32::RED, error);
                     }
-                    ui.horizontal(|ui| {
-                        if ui.button("Apply").clicked() {
-                            self.apply_rename();
+                    if edit.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                        submit_rename = !dialog.submitting;
+                    }
+                    components::modal_actions(ui, |ui| {
+                        if ui
+                            .add_enabled_ui(!dialog.submitting, |ui| {
+                                components::primary_button(ui, "Apply")
+                            })
+                            .inner
+                            .clicked()
+                        {
+                            submit_rename = true;
                         }
                         if ui.button("Cancel").clicked() {
-                            self.rename_open = false;
-                            self.rename_error = None;
+                            cancel_rename = true;
+                        }
+                        if dialog.submitting {
+                            ui.weak("Renaming…");
                         }
                     });
                 });
+            cancel_rename |= should_close;
+        }
+        if submit_rename {
+            self.submit_rename();
+        } else if cancel_rename {
+            self.close_rename_dialog();
         }
 
         if self.confirm_reset {
-            egui::Window::new("Reset statistics?")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .show(ctx, |ui| {
-                    ui.label("All aggregate statistics and capture duration in the current session will be reset.");
-                    ui.horizontal(|ui| {
-                        if ui.button("Reset statistics").clicked() {
-                            self.reset_statistics();
+            let mut reset = false;
+            let mut cancel = false;
+            let focus_primary = std::mem::take(&mut self.prompt_needs_focus);
+            let (_, should_close) = components::modal(
+                ctx,
+                "reset-statistics",
+                "Reset statistics?",
+                |ui| {
+                    ui.label(format!(
+                        "All aggregate statistics and capture duration in {} will be reset. This cannot be undone.",
+                        self.working_session.display_name()
+                    ));
+                    components::modal_actions(ui, |ui| {
+                        let cancel_button = components::primary_button(ui, "Cancel");
+                        if focus_primary {
+                            cancel_button.request_focus();
                         }
-                        if ui.button("Cancel").clicked() {
-                            self.confirm_reset = false;
-                        }
+                        cancel = cancel_button.clicked();
+                        reset = components::destructive_button(ui, "Reset statistics").clicked();
                     });
-                });
+                },
+            );
+            if reset {
+                self.reset_statistics();
+            } else if cancel || should_close {
+                self.confirm_reset = false;
+                self.finish_prompt();
+            }
         }
 
-        if self.confirm_delete {
-            egui::Window::new("Delete session?")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .show(ctx, |ui| {
-                    if self.working_session.id.is_some() {
+        let mut delete_confirmed = false;
+        let mut delete_cancelled = false;
+        if let Some(prompt) = &self.confirm_delete {
+            let target = prompt.display_name.clone();
+            let current = prompt.current;
+            let saved = prompt.session_id.is_some();
+            let focus_primary = std::mem::take(&mut self.prompt_needs_focus);
+            let (_, should_close) = components::modal(
+                ctx,
+                "delete-session",
+                "Delete session?",
+                |ui| {
+                    ui.label(format!("Delete {target}?"));
+                    if current && saved {
                         ui.label("The saved copy and all current unsaved changes will be deleted. This cannot be undone.");
-                    } else {
+                    } else if current {
                         ui.label("The current in-memory session will be discarded. This cannot be undone.");
+                    } else {
+                        ui.label("Its saved aggregate statistics will be deleted. This cannot be undone.");
                     }
-                    ui.horizontal(|ui| {
-                        if ui.button("Delete permanently").clicked() {
-                            self.delete_current_session();
+                    components::modal_actions(ui, |ui| {
+                        let cancel = components::primary_button(ui, "Cancel");
+                        if focus_primary {
+                            cancel.request_focus();
                         }
-                        if ui.button("Cancel").clicked() {
-                            self.confirm_delete = false;
-                        }
+                        delete_cancelled = cancel.clicked();
+                        delete_confirmed =
+                            components::destructive_button(ui, "Delete permanently").clicked();
                     });
-                });
+                },
+            );
+            delete_cancelled |= should_close;
+        }
+        if delete_confirmed {
+            self.delete_prompted_session();
+        } else if delete_cancelled {
+            self.confirm_delete = None;
+            self.finish_prompt();
         }
 
         if self.confirm_delete_all {
-            egui::Window::new("Delete all saved sessions?")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .show(ctx, |ui| {
-                    ui.label("Every saved session and the current working state will be removed. Filesystem backups and snapshots may retain copies.");
-                    ui.horizontal(|ui| {
-                        if ui.button("Delete all permanently").clicked() {
-                            self.delete_all_sessions();
+            let delete_all_detail = if self.working_session.id.is_some() {
+                "Every saved session, including the active session and its unsaved changes, will be removed. Filesystem backups and snapshots may retain copies."
+            } else {
+                "Every saved session will be removed. The active unsaved session will remain in memory. Filesystem backups and snapshots may retain copies."
+            };
+            let mut delete_all = false;
+            let mut cancel = false;
+            let focus_primary = std::mem::take(&mut self.prompt_needs_focus);
+            let (_, should_close) = components::modal(
+                ctx,
+                "delete-all-sessions",
+                "Delete all saved sessions?",
+                |ui| {
+                    ui.label(delete_all_detail);
+                    components::modal_actions(ui, |ui| {
+                        let cancel_button = components::primary_button(ui, "Cancel");
+                        if focus_primary {
+                            cancel_button.request_focus();
                         }
-                        if ui.button("Cancel").clicked() {
-                            self.confirm_delete_all = false;
-                        }
+                        cancel = cancel_button.clicked();
+                        delete_all =
+                            components::destructive_button(ui, "Delete all permanently").clicked();
                     });
-                });
+                },
+            );
+            if delete_all {
+                self.delete_all_sessions();
+            } else if cancel || should_close {
+                self.confirm_delete_all = false;
+                self.finish_prompt();
+            }
         }
+
+        if let Some(opener) = focus_to_restore {
+            ctx.memory_mut(|memory| memory.request_focus(opener));
+        }
+
+        text_edit_focused
     }
 }
 
+#[cfg(test)]
 pub(super) fn session_selector_label(metadata: &SessionMetadata) -> String {
     let keyboard = metadata
         .keyboard
@@ -546,6 +359,14 @@ fn format_duration(duration: Duration) -> String {
     format!("{hours:02}:{minutes:02}:{seconds:02}")
 }
 
+pub(super) fn format_compact_local_timestamp(timestamp_ms: i64) -> String {
+    Local
+        .timestamp_millis_opt(timestamp_ms)
+        .single()
+        .map(|timestamp| timestamp.format("%b %-d, %H:%M").to_string())
+        .unwrap_or_else(|| format!("{timestamp_ms} ms"))
+}
+
 fn format_local_timestamp(timestamp_ms: i64) -> String {
     Local
         .timestamp_millis_opt(timestamp_ms)
@@ -554,14 +375,32 @@ fn format_local_timestamp(timestamp_ms: i64) -> String {
         .unwrap_or_else(|| format!("{timestamp_ms} ms since Unix epoch"))
 }
 
+#[cfg(test)]
 pub(super) fn storage_status_label(status: StorageStatus, has_id: bool) -> &'static str {
+    storage_status_label_for_operation(status, has_id, None)
+}
+
+pub(super) fn storage_status_label_for_operation(
+    status: StorageStatus,
+    has_id: bool,
+    failed_operation: Option<StorageOperation>,
+) -> &'static str {
     match status {
-        StorageStatus::Loading => "Loading saved sessions…",
-        StorageStatus::Unsaved => "Unsaved session",
+        StorageStatus::Loading => "Loading…",
+        StorageStatus::Unsaved => "Not saved",
         StorageStatus::Saved if has_id => "Saved",
-        StorageStatus::Saved => "Unsaved session",
+        StorageStatus::Saved => "Not saved",
         StorageStatus::Dirty => "Unsaved changes",
         StorageStatus::Saving => "Saving…",
-        StorageStatus::Failed => "Storage operation failed",
+        StorageStatus::Failed => match failed_operation {
+            Some(StorageOperation::Save | StorageOperation::ShutdownSave) => "Save failed",
+            Some(StorageOperation::Open) => "Storage unavailable",
+            Some(StorageOperation::Load) => "Load failed",
+            Some(StorageOperation::Rename) => "Rename failed",
+            Some(StorageOperation::Delete) => "Delete failed",
+            Some(StorageOperation::DeleteAll) => "Delete all failed",
+            Some(StorageOperation::List) => "Session list failed",
+            Some(StorageOperation::Maintenance) | None => "Storage failed",
+        },
     }
 }

@@ -20,12 +20,23 @@ const MAX_KEYBOARD_VALUE_BYTES: usize = 256;
 const MAX_TEMP_FILE_ATTEMPTS: usize = 100;
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AppearancePreference {
+    Light,
+    Dark,
+    #[default]
+    #[serde(other)]
+    System,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 pub struct Settings {
     schema_version: u32,
     storage: StorageSettings,
     keyboard: KeyboardSettings,
+    appearance: AppearancePreference,
 }
 
 impl Default for Settings {
@@ -34,6 +45,7 @@ impl Default for Settings {
             schema_version: SETTINGS_SCHEMA_VERSION,
             storage: StorageSettings::default(),
             keyboard: KeyboardSettings::default(),
+            appearance: AppearancePreference::default(),
         }
     }
 }
@@ -43,8 +55,8 @@ impl Settings {
         self.storage.disclosure_acknowledged
     }
 
-    pub fn acknowledge_storage_disclosure(&mut self) {
-        self.storage.disclosure_acknowledged = true;
+    pub fn set_storage_disclosure_acknowledged(&mut self, acknowledged: bool) {
+        self.storage.disclosure_acknowledged = acknowledged;
     }
 
     pub fn autosave_enabled(&self) -> bool {
@@ -81,6 +93,14 @@ impl Settings {
             layout,
             variant,
         };
+    }
+
+    pub fn appearance_preference(&self) -> AppearancePreference {
+        self.appearance
+    }
+
+    pub fn set_appearance_preference(&mut self, preference: AppearancePreference) {
+        self.appearance = preference;
     }
 
     fn validate(&self) -> Result<(), SettingsError> {
@@ -312,7 +332,8 @@ mod tests {
     use crate::session::SessionId;
 
     use super::{
-        MAX_TEMP_FILE_ATTEMPTS, Settings, SettingsError, SettingsStore, create_temporary_file,
+        AppearancePreference, MAX_TEMP_FILE_ATTEMPTS, Settings, SettingsError, SettingsStore,
+        create_temporary_file,
     };
 
     #[test]
@@ -326,6 +347,10 @@ mod tests {
         assert!(!settings.storage_disclosure_acknowledged());
         assert!(!settings.autosave_enabled());
         assert_eq!(settings.last_session_id(), None);
+        assert_eq!(
+            settings.appearance_preference(),
+            AppearancePreference::System
+        );
         assert!(!path.exists());
     }
 
@@ -335,10 +360,11 @@ mod tests {
         let path = temporary.path().join("config/evtap/settings.json");
         let store = SettingsStore::new(path.clone());
         let mut settings = Settings::default();
-        settings.acknowledge_storage_disclosure();
+        settings.set_storage_disclosure_acknowledged(true);
         settings.set_autosave_enabled(true);
         settings.set_last_session_id(SessionId::new(7));
         settings.set_keyboard("pc105".to_owned(), "de".to_owned(), "nodeadkeys".to_owned());
+        settings.set_appearance_preference(AppearancePreference::Dark);
 
         store.save(&settings).unwrap();
 
@@ -355,6 +381,97 @@ mod tests {
             fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn legacy_schema_two_settings_without_appearance_default_to_system() {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{
+  "schema_version": 2,
+  "storage": {
+    "disclosure_acknowledged": true,
+    "autosave_enabled": false,
+    "last_session_id": null
+  },
+  "keyboard": {
+    "model": "pc105",
+    "layout": "us",
+    "variant": ""
+  }
+}"#,
+        )
+        .unwrap();
+
+        let settings = SettingsStore::new(path).load().unwrap();
+
+        assert_eq!(
+            settings.appearance_preference(),
+            AppearancePreference::System
+        );
+        assert_eq!(settings.keyboard_model(), "pc105");
+    }
+
+    #[test]
+    fn unknown_appearance_defaults_to_system_without_discarding_other_settings() {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{
+  "schema_version": 2,
+  "storage": {
+    "disclosure_acknowledged": true,
+    "autosave_enabled": true,
+    "last_session_id": 7
+  },
+  "keyboard": {
+    "model": "pc105",
+    "layout": "de",
+    "variant": "nodeadkeys"
+  },
+  "appearance": "future-theme"
+}"#,
+        )
+        .unwrap();
+
+        let settings = SettingsStore::new(path).load().unwrap();
+
+        assert_eq!(
+            settings.appearance_preference(),
+            AppearancePreference::System
+        );
+        assert!(settings.storage_disclosure_acknowledged());
+        assert!(settings.autosave_enabled());
+        assert_eq!(settings.last_session_id(), SessionId::new(7));
+        assert_eq!(settings.keyboard_model(), "pc105");
+        assert_eq!(settings.keyboard_layout(), "de");
+        assert_eq!(settings.keyboard_variant(), "nodeadkeys");
+    }
+
+    #[test]
+    fn appearance_literals_and_all_preferences_round_trip() {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("settings.json");
+        let store = SettingsStore::new(path.clone());
+
+        for (preference, literal) in [
+            (AppearancePreference::System, "system"),
+            (AppearancePreference::Light, "light"),
+            (AppearancePreference::Dark, "dark"),
+        ] {
+            let mut settings = Settings::default();
+            settings.set_appearance_preference(preference);
+            store.save(&settings).unwrap();
+
+            let encoded: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(encoded["schema_version"], 2);
+            assert_eq!(encoded["appearance"], literal);
+            assert_eq!(store.load().unwrap().appearance_preference(), preference);
+        }
     }
 
     #[test]

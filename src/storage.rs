@@ -8,6 +8,7 @@ use std::{
 
 use thiserror::Error;
 
+pub use crate::database::SessionListOrder;
 use crate::{
     database::{Repository, RepositoryError},
     session::{SessionId, SessionMetadata, SessionSnapshot, StoredSession},
@@ -214,6 +215,7 @@ pub enum StorageOperation {
     Save,
     List,
     Load,
+    Rename,
     Delete,
     DeleteAll,
     Maintenance,
@@ -228,11 +230,18 @@ pub enum StorageCommand {
     Save(SaveRequest),
     ListSessions {
         request_id: u64,
+        order: SessionListOrder,
     },
     LoadSession {
         request_id: u64,
         session_id: SessionId,
         opened_at_ms: i64,
+    },
+    RenameSession {
+        request_id: u64,
+        session_id: SessionId,
+        name: Option<String>,
+        updated_at_ms: i64,
     },
     DeleteSession {
         session_id: SessionId,
@@ -265,9 +274,23 @@ pub enum StorageEvent {
         request_id: u64,
         sessions: Vec<SessionMetadata>,
     },
+    SessionListFailed {
+        request_id: u64,
+        order: SessionListOrder,
+        failure: StorageFailure,
+    },
     SessionLoaded {
         request_id: u64,
         session: Option<StoredSession>,
+    },
+    SessionRenamed {
+        request_id: u64,
+        session: Option<SessionMetadata>,
+    },
+    SessionRenameFailed {
+        request_id: u64,
+        session_id: SessionId,
+        failure: StorageFailure,
     },
     SessionDeleted {
         session_id: SessionId,
@@ -318,6 +341,21 @@ impl StorageWorker {
         self.commands
             .send(command)
             .map_err(|_| StorageWorkerError::CommandChannelClosed)
+    }
+
+    pub fn rename_session(
+        &self,
+        request_id: u64,
+        session_id: SessionId,
+        name: Option<String>,
+        updated_at_ms: i64,
+    ) -> Result<(), StorageWorkerError> {
+        self.send(StorageCommand::RenameSession {
+            request_id,
+            session_id,
+            name,
+            updated_at_ms,
+        })
     }
 
     pub fn try_recv(&self) -> Result<Option<StorageEvent>, StorageWorkerError> {
@@ -444,7 +482,8 @@ impl WorkerState {
         let Some(repository) = &self.repository else {
             return Ok((Vec::new(), None));
         };
-        let sessions = repository.list_sessions(SESSION_LIST_LIMIT)?;
+        let sessions =
+            repository.list_sessions(SESSION_LIST_LIMIT, SessionListOrder::LastOpened)?;
         let selected = last_session_id
             .map(|session_id| repository.load_session(session_id))
             .transpose()?
@@ -465,12 +504,15 @@ impl WorkerState {
         Ok(self.repository_mut()?.save(&request.snapshot)?)
     }
 
-    fn list_sessions(&self) -> Result<Vec<SessionMetadata>, WorkerStateError> {
+    fn list_sessions(
+        &self,
+        order: SessionListOrder,
+    ) -> Result<Vec<SessionMetadata>, WorkerStateError> {
         self.repository.as_ref().map_or_else(
             || Ok(Vec::new()),
             |repository| {
                 repository
-                    .list_sessions(SESSION_LIST_LIMIT)
+                    .list_sessions(SESSION_LIST_LIMIT, order)
                     .map_err(Into::into)
             },
         )
@@ -486,6 +528,20 @@ impl WorkerState {
         };
         repository
             .load_and_mark_opened(session_id, opened_at_ms)
+            .map_err(Into::into)
+    }
+
+    fn rename_session(
+        &mut self,
+        session_id: SessionId,
+        name: Option<&str>,
+        updated_at_ms: i64,
+    ) -> Result<Option<SessionMetadata>, WorkerStateError> {
+        let Some(repository) = self.repository.as_mut() else {
+            return Ok(None);
+        };
+        repository
+            .rename_session(session_id, name, updated_at_ms)
             .map_err(Into::into)
     }
 
@@ -590,19 +646,27 @@ fn worker_main(
                     ),
                 }
             }
-            StorageCommand::ListSessions { request_id } => match state.list_sessions() {
-                Ok(sessions) => emit(
-                    events,
-                    wake,
-                    StorageEvent::SessionsListed {
-                        request_id,
-                        sessions,
-                    },
-                ),
-                Err(details) => {
-                    emit_failure(events, wake, &state, StorageOperation::List, None, details)
+            StorageCommand::ListSessions { request_id, order } => {
+                match state.list_sessions(order) {
+                    Ok(sessions) => emit(
+                        events,
+                        wake,
+                        StorageEvent::SessionsListed {
+                            request_id,
+                            sessions,
+                        },
+                    ),
+                    Err(details) => emit(
+                        events,
+                        wake,
+                        StorageEvent::SessionListFailed {
+                            request_id,
+                            order,
+                            failure: storage_failure(&state, StorageOperation::List, None, details),
+                        },
+                    ),
                 }
-            },
+            }
             StorageCommand::LoadSession {
                 request_id,
                 session_id,
@@ -619,6 +683,30 @@ fn worker_main(
                 Err(details) => {
                     emit_failure(events, wake, &state, StorageOperation::Load, None, details)
                 }
+            },
+            StorageCommand::RenameSession {
+                request_id,
+                session_id,
+                name,
+                updated_at_ms,
+            } => match state.rename_session(session_id, name.as_deref(), updated_at_ms) {
+                Ok(session) => emit(
+                    events,
+                    wake,
+                    StorageEvent::SessionRenamed {
+                        request_id,
+                        session,
+                    },
+                ),
+                Err(details) => emit(
+                    events,
+                    wake,
+                    StorageEvent::SessionRenameFailed {
+                        request_id,
+                        session_id,
+                        failure: storage_failure(&state, StorageOperation::Rename, None, details),
+                    },
+                ),
             },
             StorageCommand::DeleteSession { session_id } => {
                 match state.delete_session(session_id) {
@@ -725,6 +813,20 @@ fn emit(events: &Sender<StorageEvent>, wake: &WakeSignal, event: StorageEvent) {
     }
 }
 
+fn storage_failure(
+    state: &WorkerState,
+    operation: StorageOperation,
+    generation: Option<DirtyGeneration>,
+    details: impl std::fmt::Display,
+) -> StorageFailure {
+    StorageFailure {
+        operation,
+        generation,
+        database_path: state.database_path.clone(),
+        details: details.to_string(),
+    }
+}
+
 fn emit_failure(
     events: &Sender<StorageEvent>,
     wake: &WakeSignal,
@@ -736,18 +838,14 @@ fn emit_failure(
     emit(
         events,
         wake,
-        StorageEvent::Failed(StorageFailure {
-            operation,
-            generation,
-            database_path: state.database_path.clone(),
-            details: details.to_string(),
-        }),
+        StorageEvent::Failed(storage_failure(state, operation, generation, details)),
     );
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
+        os::unix::fs::PermissionsExt as _,
         path::PathBuf,
         sync::{
             Arc,
@@ -765,7 +863,8 @@ mod tests {
     };
 
     use super::{
-        CheckpointSchedule, DirtyTracker, SaveRequest, StorageCommand, StorageEvent, StorageWorker,
+        CheckpointSchedule, DirtyTracker, SaveRequest, SessionListOrder, StorageCommand,
+        StorageEvent, StorageOperation, StorageWorker,
     };
 
     fn wake_signal() -> WakeSignal {
@@ -919,6 +1018,139 @@ mod tests {
             }
             event => panic!("unexpected event: {event:?}"),
         }
+        worker.shutdown(None).unwrap();
+    }
+
+    #[test]
+    fn worker_renames_unloaded_sessions_and_lists_each_product_order() {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("evtap.sqlite3");
+        let worker = StorageWorker::spawn(path.clone(), None, wake_signal()).unwrap();
+        assert!(matches!(recv_event(&worker), StorageEvent::Opened { .. }));
+        let mut tracker = DirtyTracker::default();
+
+        let first_generation = tracker.begin_save().unwrap().unwrap();
+        let mut first_snapshot = snapshot(10);
+        first_snapshot.name = Some("First".to_owned());
+        worker
+            .send(StorageCommand::Save(SaveRequest {
+                generation: first_generation,
+                snapshot: first_snapshot,
+            }))
+            .unwrap();
+        let first = match recv_event(&worker) {
+            StorageEvent::Saved { session_id, .. } => session_id,
+            event => panic!("unexpected event: {event:?}"),
+        };
+        tracker.acknowledge(first_generation).unwrap();
+
+        let second_generation = tracker.mark_dirty().unwrap();
+        assert_eq!(tracker.begin_save().unwrap(), Some(second_generation));
+        let mut second_snapshot = snapshot(20);
+        second_snapshot.name = Some("Second".to_owned());
+        worker
+            .send(StorageCommand::Save(SaveRequest {
+                generation: second_generation,
+                snapshot: second_snapshot,
+            }))
+            .unwrap();
+        let second = match recv_event(&worker) {
+            StorageEvent::Saved { session_id, .. } => session_id,
+            event => panic!("unexpected event: {event:?}"),
+        };
+
+        worker
+            .send(StorageCommand::LoadSession {
+                request_id: 1,
+                session_id: first,
+                opened_at_ms: 30,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_event(&worker),
+            StorageEvent::SessionLoaded {
+                request_id: 1,
+                session: Some(_)
+            }
+        ));
+
+        worker
+            .rename_session(2, second, Some("Project".to_owned()), 40)
+            .unwrap();
+        match recv_event(&worker) {
+            StorageEvent::SessionRenamed {
+                request_id: 2,
+                session: Some(session),
+            } => {
+                assert_eq!(session.id, second);
+                assert_eq!(session.name.as_deref(), Some("Project"));
+                assert_eq!(session.updated_at_ms, 40);
+                assert_eq!(session.last_opened_at_ms, 20);
+            }
+            event => panic!("unexpected event: {event:?}"),
+        }
+
+        for (request_id, order, expected) in [
+            (3, SessionListOrder::LastOpened, vec![first, second]),
+            (4, SessionListOrder::LastUpdated, vec![second, first]),
+        ] {
+            worker
+                .send(StorageCommand::ListSessions { request_id, order })
+                .unwrap();
+            match recv_event(&worker) {
+                StorageEvent::SessionsListed {
+                    request_id: actual_request_id,
+                    sessions,
+                } => {
+                    assert_eq!(actual_request_id, request_id);
+                    assert_eq!(
+                        sessions
+                            .into_iter()
+                            .map(|session| session.id)
+                            .collect::<Vec<_>>(),
+                        expected
+                    );
+                }
+                event => panic!("unexpected event: {event:?}"),
+            }
+        }
+
+        worker
+            .rename_session(5, first, Some("Project".to_owned()), 50)
+            .unwrap();
+        match recv_event(&worker) {
+            StorageEvent::SessionRenameFailed {
+                request_id: 5,
+                session_id,
+                failure,
+            } => {
+                assert_eq!(session_id, first);
+                assert_eq!(failure.operation, StorageOperation::Rename);
+                assert!(failure.details.contains("already uses that name"));
+            }
+            event => panic!("unexpected event: {event:?}"),
+        }
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        worker
+            .rename_session(
+                6,
+                crate::session::SessionId::new(999).unwrap(),
+                Some("Missing".to_owned()),
+                60,
+            )
+            .unwrap();
+        assert!(matches!(
+            recv_event(&worker),
+            StorageEvent::SessionRenamed {
+                request_id: 6,
+                session: None
+            }
+        ));
         worker.shutdown(None).unwrap();
     }
 

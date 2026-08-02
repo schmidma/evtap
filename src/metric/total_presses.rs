@@ -1,19 +1,16 @@
+use eframe::egui;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    input::{KeyEvent, KeyEventKind},
-    metric::{
-        Metric, MetricDescriptor, MetricReport, MetricSnapshot, MetricSnapshotError, ReportSection,
-        ReportValue, validate_scalar_count,
+    app::view::components::{
+        format_compact_count, format_exact_count, metric_summary_value, summary_value,
     },
+    input::{KeyEvent, KeyEventKind},
+    metric::{Metric, MetricSnapshot, MetricSnapshotError, validate_scalar_count},
 };
 
+const METRIC_ID: &str = "total-presses";
 const SNAPSHOT_VERSION: u32 = 1;
-const DESCRIPTOR: MetricDescriptor = MetricDescriptor {
-    id: "total-presses",
-    name: "Total Key Presses",
-    description: "Physical key presses in this session; automatic repeats are excluded.",
-};
 
 #[derive(Default)]
 pub struct TotalPresses {
@@ -27,9 +24,7 @@ struct SnapshotV1 {
 }
 
 impl Metric for TotalPresses {
-    fn descriptor(&self) -> &'static MetricDescriptor {
-        &DESCRIPTOR
-    }
+    const ID: &'static str = METRIC_ID;
 
     fn process(&mut self, event: &KeyEvent) {
         if event.kind() == KeyEventKind::Press {
@@ -37,13 +32,28 @@ impl Metric for TotalPresses {
         }
     }
 
-    fn report(&self) -> MetricReport {
-        MetricReport {
-            sections: vec![ReportSection::Scalar {
-                label: "Presses",
-                value: ReportValue::Count(self.count),
-            }],
-        }
+    fn summary_ui(&self, ui: &mut egui::Ui) {
+        let visible = format_compact_count(self.count);
+        let exact = format_exact_count(self.count);
+        metric_summary_value(
+            ui,
+            egui_phosphor::regular::KEYBOARD,
+            "Total presses",
+            &visible,
+            &exact,
+            "Physical presses; repeats excluded.",
+        );
+    }
+
+    fn analysis_ui(&self, ui: &mut egui::Ui) {
+        let exact = format_exact_count(self.count);
+        summary_value(
+            ui,
+            "Total presses",
+            &exact,
+            &exact,
+            "All physical key presses represented in the percentages below.",
+        );
     }
 
     fn has_data(&self) -> bool {
@@ -51,17 +61,17 @@ impl Metric for TotalPresses {
     }
 
     fn snapshot(&self) -> Result<MetricSnapshot, MetricSnapshotError> {
-        validate_scalar_count(DESCRIPTOR.id, self.count)?;
+        validate_scalar_count(Self::ID, self.count)?;
         MetricSnapshot::encode(
-            DESCRIPTOR.id,
+            Self::ID,
             SNAPSHOT_VERSION,
             &SnapshotV1 { count: self.count },
         )
     }
 
     fn restore(&mut self, snapshot: &MetricSnapshot) -> Result<(), MetricSnapshotError> {
-        let state: SnapshotV1 = snapshot.decode(DESCRIPTOR.id, SNAPSHOT_VERSION)?;
-        validate_scalar_count(DESCRIPTOR.id, state.count)?;
+        let state: SnapshotV1 = snapshot.decode(Self::ID, SNAPSHOT_VERSION)?;
+        validate_scalar_count(Self::ID, state.count)?;
         self.count = state.count;
         Ok(())
     }
@@ -80,7 +90,7 @@ mod tests {
         metric::{Metric, MetricSnapshot},
     };
 
-    use super::TotalPresses;
+    use super::{METRIC_ID, TotalPresses};
 
     fn event(kind: KeyEventKind) -> KeyEvent {
         KeyEvent::new(
@@ -114,21 +124,15 @@ mod tests {
         assert!(restored.has_data());
         assert_eq!(restored.count, 1);
 
-        let invalid = MetricSnapshot::from_json(
-            "total-presses",
-            1,
-            r#"{"count":2,"unknown":true}"#.to_owned(),
-        )
-        .unwrap();
+        let invalid =
+            MetricSnapshot::from_json(METRIC_ID, 1, r#"{"count":2,"unknown":true}"#.to_owned())
+                .unwrap();
         assert!(restored.restore(&invalid).is_err());
         assert_eq!(restored.count, 1);
 
-        let overflowing = MetricSnapshot::from_json(
-            "total-presses",
-            1,
-            r#"{"count":9223372036854775808}"#.to_owned(),
-        )
-        .unwrap();
+        let overflowing =
+            MetricSnapshot::from_json(METRIC_ID, 1, r#"{"count":9223372036854775808}"#.to_owned())
+                .unwrap();
         assert!(restored.restore(&overflowing).is_err());
         assert_eq!(restored.count, 1);
 

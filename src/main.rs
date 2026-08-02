@@ -9,7 +9,6 @@ mod database;
 mod input;
 mod listener;
 mod metric;
-mod metric_view;
 mod paths;
 mod private_fs;
 mod scanner;
@@ -31,6 +30,10 @@ async fn main() -> Result<()> {
     let app_paths = AppPaths::discover()?;
     app_paths.prepare_data_dir()?;
     let options = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_inner_size([1_000.0, 700.0])
+            .with_min_inner_size([800.0, 600.0])
+            .with_decorations(true),
         persistence_path: Some(app_paths.eframe_file()),
         ..Default::default()
     };

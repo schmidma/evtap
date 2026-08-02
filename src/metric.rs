@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use eframe::egui;
 use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
@@ -12,25 +13,27 @@ const MAX_AGGREGATE_COUNT: u64 = i64::MAX as u64;
 const MAX_DURATION_NANOSECONDS: u64 = i64::MAX as u64;
 
 mod bigram_speed;
+mod correction_signals;
 mod dwell_time;
-mod error_rate;
 mod flight_time;
 mod key_usage;
 mod total_presses;
 
-use bigram_speed::BigramSpeed;
-use dwell_time::DwellTime;
-use error_rate::ErrorRate;
-use flight_time::FlightTime;
-use key_usage::KeyUsage;
-use total_presses::TotalPresses;
+pub(crate) use bigram_speed::BigramSpeed;
+pub(crate) use correction_signals::CorrectionSignals;
+pub(crate) use dwell_time::DwellTime;
+pub(crate) use flight_time::FlightTime;
+pub(crate) use key_usage::KeyUsage;
+pub(crate) use total_presses::TotalPresses;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MetricDescriptor {
-    pub id: &'static str,
-    pub name: &'static str,
-    pub description: &'static str,
-}
+const SESSION_METRIC_IDS: [&str; 6] = [
+    <TotalPresses as Metric>::ID,
+    <KeyUsage as Metric>::ID,
+    <DwellTime as Metric>::ID,
+    <FlightTime as Metric>::ID,
+    <BigramSpeed as Metric>::ID,
+    <CorrectionSignals as Metric>::ID,
+];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MetricSnapshot {
@@ -170,35 +173,12 @@ impl MetricSnapshotError {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum ReportValue {
-    Text(String),
-    Count(u64),
-    Milliseconds(f64),
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum ReportSection {
-    Scalar {
-        label: &'static str,
-        value: ReportValue,
-    },
-    Table {
-        title: Option<&'static str>,
-        columns: &'static [&'static str],
-        rows: Vec<Vec<ReportValue>>,
-    },
-}
-
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct MetricReport {
-    pub sections: Vec<ReportSection>,
-}
-
 pub trait Metric {
-    fn descriptor(&self) -> &'static MetricDescriptor;
+    const ID: &'static str;
+
     fn process(&mut self, event: &KeyEvent);
-    fn report(&self) -> MetricReport;
+    fn summary_ui(&self, ui: &mut egui::Ui);
+    fn analysis_ui(&self, ui: &mut egui::Ui);
     fn has_data(&self) -> bool;
     fn snapshot(&self) -> Result<MetricSnapshot, MetricSnapshotError>;
     fn restore(&mut self, snapshot: &MetricSnapshot) -> Result<(), MetricSnapshotError>;
@@ -263,6 +243,12 @@ impl DurationStats {
         self.total.as_secs_f64() * 1_000.0 / self.samples as f64
     }
 
+    fn compare_average(self, other: Self) -> std::cmp::Ordering {
+        let left = self.total.as_nanos() * u128::from(other.samples);
+        let right = other.total.as_nanos() * u128::from(self.samples);
+        left.cmp(&right)
+    }
+
     fn snapshot_parts(self, metric_id: &str) -> Result<(u64, u64), MetricSnapshotError> {
         validate_count(metric_id, self.samples)?;
         let total_nanoseconds = u64::try_from(self.total.as_nanos()).map_err(|_| {
@@ -296,27 +282,137 @@ impl DurationStats {
     }
 }
 
-pub fn default_metrics() -> Vec<Box<dyn Metric>> {
-    vec![
-        Box::new(TotalPresses::default()),
-        Box::new(KeyUsage::default()),
-        Box::new(ErrorRate::default()),
-        Box::new(FlightTime::default()),
-        Box::new(DwellTime::default()),
-        Box::new(BigramSpeed::default()),
-    ]
+#[derive(Default)]
+pub struct SessionMetrics {
+    total_presses: TotalPresses,
+    key_usage: KeyUsage,
+    dwell_time: DwellTime,
+    flight_time: FlightTime,
+    bigram_speed: BigramSpeed,
+    corrections: CorrectionSignals,
+}
+
+impl SessionMetrics {
+    pub fn process(&mut self, event: &KeyEvent) {
+        self.total_presses.process(event);
+        self.key_usage.process(event);
+        self.dwell_time.process(event);
+        self.flight_time.process(event);
+        self.bigram_speed.process(event);
+        self.corrections.process(event);
+    }
+
+    pub fn clear_in_flight(&mut self) {
+        self.total_presses.clear_in_flight();
+        self.key_usage.clear_in_flight();
+        self.dwell_time.clear_in_flight();
+        self.flight_time.clear_in_flight();
+        self.bigram_speed.clear_in_flight();
+        self.corrections.clear_in_flight();
+    }
+
+    pub fn reset(&mut self) {
+        self.total_presses.reset();
+        self.key_usage.reset();
+        self.dwell_time.reset();
+        self.flight_time.reset();
+        self.bigram_speed.reset();
+        self.corrections.reset();
+    }
+
+    pub fn has_data(&self) -> bool {
+        self.total_presses.has_data()
+            || self.key_usage.has_data()
+            || self.dwell_time.has_data()
+            || self.flight_time.has_data()
+            || self.bigram_speed.has_data()
+            || self.corrections.has_data()
+    }
+
+    pub fn snapshots(&self) -> Result<Vec<MetricSnapshot>, MetricSnapshotError> {
+        Ok(vec![
+            self.total_presses.snapshot()?,
+            self.key_usage.snapshot()?,
+            self.dwell_time.snapshot()?,
+            self.flight_time.snapshot()?,
+            self.bigram_speed.snapshot()?,
+            self.corrections.snapshot()?,
+        ])
+    }
+
+    pub(crate) fn contains_id(metric_id: &str) -> bool {
+        SESSION_METRIC_IDS.contains(&metric_id)
+    }
+
+    pub(crate) fn restore_snapshot(
+        &mut self,
+        snapshot: &MetricSnapshot,
+    ) -> Result<(), MetricSnapshotError> {
+        match snapshot.metric_id() {
+            metric_id if metric_id == <TotalPresses as Metric>::ID => {
+                self.total_presses.restore(snapshot)
+            }
+            metric_id if metric_id == <KeyUsage as Metric>::ID => self.key_usage.restore(snapshot),
+            metric_id if metric_id == <DwellTime as Metric>::ID => {
+                self.dwell_time.restore(snapshot)
+            }
+            metric_id if metric_id == <FlightTime as Metric>::ID => {
+                self.flight_time.restore(snapshot)
+            }
+            metric_id if metric_id == <BigramSpeed as Metric>::ID => {
+                self.bigram_speed.restore(snapshot)
+            }
+            metric_id if metric_id == <CorrectionSignals as Metric>::ID => {
+                self.corrections.restore(snapshot)
+            }
+            metric_id => Err(MetricSnapshotError::MetricMismatch {
+                expected: "a built-in session metric".to_owned(),
+                actual: metric_id.to_owned(),
+            }),
+        }
+    }
+
+    pub(crate) fn total_presses(&self) -> &TotalPresses {
+        &self.total_presses
+    }
+
+    pub(crate) fn key_usage(&self) -> &KeyUsage {
+        &self.key_usage
+    }
+
+    pub(crate) fn dwell_time(&self) -> &DwellTime {
+        &self.dwell_time
+    }
+
+    pub(crate) fn flight_time(&self) -> &FlightTime {
+        &self.flight_time
+    }
+
+    pub(crate) fn bigram_speed(&self) -> &BigramSpeed {
+        &self.bigram_speed
+    }
+
+    pub(crate) fn corrections(&self) -> &CorrectionSignals {
+        &self.corrections
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::{
+        collections::HashSet,
+        time::{Duration, SystemTime},
+    };
 
     use serde::{Deserialize, Serialize};
 
+    use crate::input::{KeyEvent, KeyEventKind, KeyRole, PhysicalKey};
+
     use super::{
         DurationStats, MAX_AGGREGATE_COUNT, MAX_DIMENSION_BYTES, MAX_DIMENSION_ENTRIES,
-        MAX_DURATION_NANOSECONDS, MetricSnapshot, MetricSnapshotError, default_metrics,
-        validate_count, validate_dimension, validate_entry_count, validate_scalar_count,
+        MAX_DURATION_NANOSECONDS, MetricSnapshot, MetricSnapshotError, SESSION_METRIC_IDS,
+        SessionMetrics, validate_count, validate_dimension, validate_entry_count,
+        validate_scalar_count,
     };
 
     #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -381,37 +477,163 @@ mod tests {
         );
     }
 
-    #[test]
-    fn failed_restore_does_not_change_default_metrics() {
-        for mut metric in default_metrics() {
-            let before = metric.report();
-            let malformed =
-                MetricSnapshot::from_json(metric.descriptor().id, 1, "{".to_owned()).unwrap();
+    fn event(
+        code: u16,
+        label: &str,
+        text: Option<&str>,
+        at_ms: u64,
+        kind: KeyEventKind,
+        role: KeyRole,
+    ) -> KeyEvent {
+        KeyEvent::new(
+            PhysicalKey::new(code, label),
+            text.map(str::to_owned),
+            SystemTime::UNIX_EPOCH + Duration::from_millis(at_ms),
+            kind,
+            role,
+        )
+    }
 
-            assert!(metric.restore(&malformed).is_err());
-            assert_eq!(metric.report(), before);
+    fn populated_metrics() -> SessionMetrics {
+        let mut metrics = SessionMetrics::default();
+        metrics.process(&event(
+            30,
+            "A",
+            Some("a"),
+            0,
+            KeyEventKind::Press,
+            KeyRole::Other,
+        ));
+        metrics.process(&event(
+            30,
+            "A",
+            Some("a"),
+            10,
+            KeyEventKind::Release,
+            KeyRole::Other,
+        ));
+        metrics.process(&event(
+            48,
+            "B",
+            Some("b"),
+            20,
+            KeyEventKind::Press,
+            KeyRole::Other,
+        ));
+        metrics.process(&event(
+            48,
+            "B",
+            Some("b"),
+            30,
+            KeyEventKind::Release,
+            KeyRole::Other,
+        ));
+        metrics.process(&event(
+            14,
+            "BACKSPACE",
+            None,
+            40,
+            KeyEventKind::Press,
+            KeyRole::Backspace,
+        ));
+        metrics.process(&event(
+            46,
+            "C",
+            Some("c"),
+            50,
+            KeyEventKind::Press,
+            KeyRole::Other,
+        ));
+        metrics
+    }
+
+    fn restore_snapshots(snapshots: &[MetricSnapshot]) -> SessionMetrics {
+        let mut restored = SessionMetrics::default();
+        for snapshot in snapshots {
+            restored.restore_snapshot(snapshot).unwrap();
+        }
+        restored
+    }
+
+    #[test]
+    fn failed_restore_does_not_change_session_metrics() {
+        let mut metrics = populated_metrics();
+
+        for metric_id in SESSION_METRIC_IDS {
+            let before = metrics.snapshots().unwrap();
+            let malformed = MetricSnapshot::from_json(metric_id, 1, "{".to_owned()).unwrap();
+
+            assert!(metrics.restore_snapshot(&malformed).is_err());
+            assert_eq!(metrics.snapshots().unwrap(), before);
         }
     }
 
     #[test]
-    fn default_metric_ids_are_unique() {
-        let mut ids = HashSet::new();
+    fn session_metric_ids_have_a_stable_unique_order() {
+        let snapshots = SessionMetrics::default().snapshots().unwrap();
+        let ids: Vec<_> = snapshots.iter().map(MetricSnapshot::metric_id).collect();
+        let unique: HashSet<_> = ids.iter().copied().collect();
 
-        for metric in default_metrics() {
-            let id = metric.descriptor().id;
-            assert!(ids.insert(id), "duplicate metric id: {id}");
-        }
+        assert_eq!(ids, SESSION_METRIC_IDS);
+        assert_eq!(unique.len(), SESSION_METRIC_IDS.len());
+        assert!(
+            snapshots
+                .iter()
+                .all(|snapshot| snapshot.schema_version() == 1)
+        );
     }
 
     #[test]
-    fn default_metrics_round_trip_empty_snapshots() {
-        for mut metric in default_metrics() {
-            assert!(!metric.has_data());
-            let snapshot = metric.snapshot().unwrap();
-            assert_eq!(snapshot.metric_id(), metric.descriptor().id);
-            assert_eq!(snapshot.schema_version(), 1);
-            metric.restore(&snapshot).unwrap();
-            assert!(!metric.has_data());
-        }
+    fn session_metrics_round_trip_all_aggregates() {
+        let metrics = populated_metrics();
+        let snapshots = metrics.snapshots().unwrap();
+        let defaults = SessionMetrics::default().snapshots().unwrap();
+        assert!(
+            snapshots
+                .iter()
+                .zip(defaults)
+                .all(|(snapshot, default)| snapshot.payload_json() != default.payload_json())
+        );
+
+        let restored = restore_snapshots(&snapshots);
+
+        assert!(restored.has_data());
+        assert_eq!(restored.snapshots().unwrap(), snapshots);
+    }
+
+    #[test]
+    fn session_metrics_reset_every_metric() {
+        let mut metrics = populated_metrics();
+        assert!(metrics.has_data());
+
+        metrics.reset();
+
+        assert!(!metrics.has_data());
+        assert_eq!(
+            metrics.snapshots().unwrap(),
+            SessionMetrics::default().snapshots().unwrap()
+        );
+    }
+
+    #[test]
+    fn clearing_session_in_flight_state_prevents_cross_boundary_analysis() {
+        let mut metrics = SessionMetrics::default();
+        metrics.process(&event(
+            30,
+            "A",
+            Some("a"),
+            0,
+            KeyEventKind::Press,
+            KeyRole::Other,
+        ));
+        let snapshots = metrics.snapshots().unwrap();
+        let mut restored = restore_snapshots(&snapshots);
+
+        metrics.clear_in_flight();
+        let next = event(48, "B", Some("b"), 10, KeyEventKind::Press, KeyRole::Other);
+        metrics.process(&next);
+        restored.process(&next);
+
+        assert_eq!(metrics.snapshots().unwrap(), restored.snapshots().unwrap());
     }
 }
