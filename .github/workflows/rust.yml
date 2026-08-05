@@ -67,6 +67,9 @@ jobs:
         with:
           persist-credentials: false
       - name: Install cargo-audit
-        run: cargo install cargo-audit --version 0.22.2 --locked
+        uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2.85.8
+        with:
+          tool: cargo-audit@0.22.2
+          fallback: none
       - name: Audit dependencies
         run: cargo audit
