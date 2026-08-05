@@ -14,6 +14,7 @@ const MAX_DURATION_NANOSECONDS: u64 = i64::MAX as u64;
 
 mod bigram_speed;
 mod correction_signals;
+mod duration_analysis;
 mod dwell_time;
 mod flight_time;
 mod key_usage;

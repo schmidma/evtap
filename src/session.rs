@@ -2,6 +2,11 @@ use std::collections::HashSet;
 
 use crate::metric::{MetricSnapshot, MetricSnapshotError, SessionMetrics};
 
+const MAX_APPLICATION_VERSION_BYTES: usize = 128;
+const MAX_SESSION_NAME_BYTES: usize = 80;
+const MAX_KEYBOARD_NAME_BYTES: usize = 1_024;
+const MAX_KEYBOARD_VALUE_BYTES: usize = 256;
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct SessionId(i64);
 
@@ -36,6 +41,22 @@ pub struct SessionSnapshot {
     pub metrics: Vec<MetricSnapshot>,
 }
 
+impl SessionSnapshot {
+    pub(crate) fn validate_metadata(&self) -> Result<(), SessionMetadataValidationError> {
+        validate_session_metadata(
+            self.name.as_deref(),
+            [
+                self.created_at_ms,
+                self.updated_at_ms,
+                self.last_opened_at_ms,
+            ],
+            self.captured_duration_ns,
+            &self.application_version,
+            &self.keyboard,
+        )
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionMetadata {
     pub id: SessionId,
@@ -52,6 +73,79 @@ impl SessionMetadata {
     pub fn display_name(&self) -> &str {
         self.name.as_deref().unwrap_or("Untitled session")
     }
+
+    pub(crate) fn validate_metadata(&self) -> Result<(), SessionMetadataValidationError> {
+        validate_session_metadata(
+            self.name.as_deref(),
+            [
+                self.created_at_ms,
+                self.updated_at_ms,
+                self.last_opened_at_ms,
+            ],
+            self.captured_duration_ns,
+            &self.application_version,
+            &self.keyboard,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SessionMetadataValidationError {
+    Name,
+    Timestamp,
+    Duration,
+    ApplicationVersion,
+    KeyboardContext,
+}
+
+pub(crate) fn validate_session_name(
+    name: Option<&str>,
+) -> Result<(), SessionMetadataValidationError> {
+    if name.is_some_and(|name| {
+        name.trim() != name || name.is_empty() || name.len() > MAX_SESSION_NAME_BYTES
+    }) {
+        Err(SessionMetadataValidationError::Name)
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn validate_session_timestamp(value: i64) -> Result<(), SessionMetadataValidationError> {
+    if value < 0 {
+        Err(SessionMetadataValidationError::Timestamp)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_session_metadata(
+    name: Option<&str>,
+    timestamps: [i64; 3],
+    captured_duration_ns: i64,
+    application_version: &str,
+    keyboard: &KeyboardContext,
+) -> Result<(), SessionMetadataValidationError> {
+    for timestamp in timestamps {
+        validate_session_timestamp(timestamp)?;
+    }
+    if captured_duration_ns < 0 {
+        return Err(SessionMetadataValidationError::Duration);
+    }
+    if application_version.is_empty() || application_version.len() > MAX_APPLICATION_VERSION_BYTES {
+        return Err(SessionMetadataValidationError::ApplicationVersion);
+    }
+    validate_session_name(name)?;
+    if keyboard
+        .display_name
+        .as_ref()
+        .is_some_and(|name| name.len() > MAX_KEYBOARD_NAME_BYTES)
+        || [&keyboard.model, &keyboard.layout, &keyboard.variant]
+            .iter()
+            .any(|value| value.len() > MAX_KEYBOARD_VALUE_BYTES)
+    {
+        return Err(SessionMetadataValidationError::KeyboardContext);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

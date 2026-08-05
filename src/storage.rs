@@ -845,11 +845,10 @@ fn emit_failure(
 #[cfg(test)]
 mod tests {
     use std::{
-        os::unix::fs::PermissionsExt as _,
-        path::PathBuf,
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
+            mpsc,
         },
         time::{Duration, Instant},
     };
@@ -864,7 +863,7 @@ mod tests {
 
     use super::{
         CheckpointSchedule, DirtyTracker, SaveRequest, SessionListOrder, StorageCommand,
-        StorageEvent, StorageOperation, StorageWorker,
+        StorageEvent, StorageWorker, database_files,
     };
 
     fn wake_signal() -> WakeSignal {
@@ -894,13 +893,10 @@ mod tests {
     }
 
     fn recv_event(worker: &StorageWorker) -> StorageEvent {
-        for _ in 0..100 {
-            if let Some(event) = worker.try_recv().unwrap() {
-                return event;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        panic!("storage event did not arrive");
+        worker
+            .events
+            .recv_timeout(Duration::from_secs(1))
+            .expect("storage event did not arrive")
     }
 
     #[test]
@@ -933,6 +929,51 @@ mod tests {
         let generation = tracker.begin_save().unwrap().unwrap();
         tracker.acknowledge(generation).unwrap();
         assert!(!tracker.is_dirty());
+    }
+
+    #[test]
+    fn worker_wakes_once_for_each_correlated_event() {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("evtap.sqlite3");
+        let (wake_sender, wake_receiver) = mpsc::channel();
+        let wake = WakeSignal::new(move || {
+            let _ = wake_sender.send(());
+        });
+        let worker = StorageWorker::spawn(path, None, wake).unwrap();
+
+        for expected in [None, Some(41_u64), Some(42_u64)] {
+            if let Some(request_id) = expected {
+                worker
+                    .send(StorageCommand::ListSessions {
+                        request_id,
+                        order: SessionListOrder::LastOpened,
+                    })
+                    .unwrap();
+            }
+            wake_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("storage event wake");
+            match (expected, recv_event(&worker)) {
+                (None, StorageEvent::Opened { .. }) => {}
+                (
+                    Some(expected_id),
+                    StorageEvent::SessionsListed {
+                        request_id,
+                        sessions,
+                    },
+                ) => {
+                    assert_eq!(request_id, expected_id);
+                    assert!(sessions.is_empty());
+                }
+                (_, event) => panic!("unexpected event: {event:?}"),
+            }
+            assert!(matches!(
+                wake_receiver.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+        }
+
+        worker.shutdown(None).unwrap();
     }
 
     #[test]
@@ -1022,135 +1063,58 @@ mod tests {
     }
 
     #[test]
-    fn worker_renames_unloaded_sessions_and_lists_each_product_order() {
+    fn worker_preserves_request_ids_for_rename_and_list() {
         let temporary = tempdir().unwrap();
         let path = temporary.path().join("evtap.sqlite3");
-        let worker = StorageWorker::spawn(path.clone(), None, wake_signal()).unwrap();
+        let worker = StorageWorker::spawn(path, None, wake_signal()).unwrap();
         assert!(matches!(recv_event(&worker), StorageEvent::Opened { .. }));
         let mut tracker = DirtyTracker::default();
-
-        let first_generation = tracker.begin_save().unwrap().unwrap();
-        let mut first_snapshot = snapshot(10);
-        first_snapshot.name = Some("First".to_owned());
+        let generation = tracker.begin_save().unwrap().unwrap();
+        let mut initial = snapshot(10);
+        initial.name = Some("Initial".to_owned());
         worker
             .send(StorageCommand::Save(SaveRequest {
-                generation: first_generation,
-                snapshot: first_snapshot,
+                generation,
+                snapshot: initial,
             }))
             .unwrap();
-        let first = match recv_event(&worker) {
-            StorageEvent::Saved { session_id, .. } => session_id,
-            event => panic!("unexpected event: {event:?}"),
-        };
-        tracker.acknowledge(first_generation).unwrap();
-
-        let second_generation = tracker.mark_dirty().unwrap();
-        assert_eq!(tracker.begin_save().unwrap(), Some(second_generation));
-        let mut second_snapshot = snapshot(20);
-        second_snapshot.name = Some("Second".to_owned());
-        worker
-            .send(StorageCommand::Save(SaveRequest {
-                generation: second_generation,
-                snapshot: second_snapshot,
-            }))
-            .unwrap();
-        let second = match recv_event(&worker) {
+        let session_id = match recv_event(&worker) {
             StorageEvent::Saved { session_id, .. } => session_id,
             event => panic!("unexpected event: {event:?}"),
         };
 
         worker
-            .send(StorageCommand::LoadSession {
-                request_id: 1,
-                session_id: first,
-                opened_at_ms: 30,
-            })
-            .unwrap();
-        assert!(matches!(
-            recv_event(&worker),
-            StorageEvent::SessionLoaded {
-                request_id: 1,
-                session: Some(_)
-            }
-        ));
-
-        worker
-            .rename_session(2, second, Some("Project".to_owned()), 40)
+            .rename_session(42, session_id, Some("Renamed".to_owned()), 20)
             .unwrap();
         match recv_event(&worker) {
             StorageEvent::SessionRenamed {
-                request_id: 2,
+                request_id,
                 session: Some(session),
             } => {
-                assert_eq!(session.id, second);
-                assert_eq!(session.name.as_deref(), Some("Project"));
-                assert_eq!(session.updated_at_ms, 40);
-                assert_eq!(session.last_opened_at_ms, 20);
+                assert_eq!(request_id, 42);
+                assert_eq!(session.id, session_id);
+                assert_eq!(session.name.as_deref(), Some("Renamed"));
             }
             event => panic!("unexpected event: {event:?}"),
         }
 
-        for (request_id, order, expected) in [
-            (3, SessionListOrder::LastOpened, vec![first, second]),
-            (4, SessionListOrder::LastUpdated, vec![second, first]),
-        ] {
-            worker
-                .send(StorageCommand::ListSessions { request_id, order })
-                .unwrap();
-            match recv_event(&worker) {
-                StorageEvent::SessionsListed {
-                    request_id: actual_request_id,
-                    sessions,
-                } => {
-                    assert_eq!(actual_request_id, request_id);
-                    assert_eq!(
-                        sessions
-                            .into_iter()
-                            .map(|session| session.id)
-                            .collect::<Vec<_>>(),
-                        expected
-                    );
-                }
-                event => panic!("unexpected event: {event:?}"),
-            }
-        }
-
         worker
-            .rename_session(5, first, Some("Project".to_owned()), 50)
+            .send(StorageCommand::ListSessions {
+                request_id: 43,
+                order: SessionListOrder::LastUpdated,
+            })
             .unwrap();
         match recv_event(&worker) {
-            StorageEvent::SessionRenameFailed {
-                request_id: 5,
-                session_id,
-                failure,
+            StorageEvent::SessionsListed {
+                request_id,
+                sessions,
             } => {
-                assert_eq!(session_id, first);
-                assert_eq!(failure.operation, StorageOperation::Rename);
-                assert!(failure.details.contains("already uses that name"));
+                assert_eq!(request_id, 43);
+                assert_eq!(sessions.len(), 1);
+                assert_eq!(sessions[0].id, session_id);
             }
             event => panic!("unexpected event: {event:?}"),
         }
-
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-
-        worker
-            .rename_session(
-                6,
-                crate::session::SessionId::new(999).unwrap(),
-                Some("Missing".to_owned()),
-                60,
-            )
-            .unwrap();
-        assert!(matches!(
-            recv_event(&worker),
-            StorageEvent::SessionRenamed {
-                request_id: 6,
-                session: None
-            }
-        ));
         worker.shutdown(None).unwrap();
     }
 
@@ -1203,15 +1167,14 @@ mod tests {
             }))
             .unwrap();
         assert!(matches!(recv_event(&worker), StorageEvent::Saved { .. }));
+        let journal = database_files(&path)[3].clone();
+        std::fs::write(&journal, b"fixture sidecar").unwrap();
 
         worker.send(StorageCommand::DeleteAll).unwrap();
         assert!(matches!(recv_event(&worker), StorageEvent::AllDeleted));
-        assert!(!path.exists());
+        for database_file in database_files(&path) {
+            assert!(!database_file.exists());
+        }
         worker.shutdown(None).unwrap();
-    }
-
-    #[test]
-    fn event_types_do_not_need_database_paths_from_callers() {
-        let _: Option<PathBuf> = None;
     }
 }

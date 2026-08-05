@@ -1,8 +1,6 @@
 # Resumable session persistence reference
 
-**Applies to:** evtap 0.2.x
-
-This document defines the session lifecycle, durable data, privacy boundaries, and recovery behavior of evtap's optional local persistence.
+This document defines the current session lifecycle, durable data, privacy boundaries, and recovery behavior of evtap's optional local persistence.
 
 ## 1. Summary
 
@@ -51,9 +49,9 @@ The keyboard display name and XKB model, layout, and variant used most recently 
 
 ### 3.1 Manual save
 
-**Save now** writes the complete current working session. A first save assigns an internal database ID. An untitled session may be saved without forcing a name.
+**Save** writes the complete current working session. A first save assigns an internal database ID. An untitled session may be saved without forcing a name.
 
-The first operation that can write analytics displays a privacy disclosure. Confirming it records a non-analytics `storage_disclosure_acknowledged` preference so the warning is not repeatedly shown.
+The first operation that can write analytics displays a privacy disclosure. Confirming it records the non-analytics `storage.disclosure_acknowledged` preference so the warning is not repeatedly shown.
 
 Manual save remains available whether autosave is on or off.
 
@@ -82,11 +80,11 @@ The working session is dirty when its durable representation differs from the la
 
 Storage status is visible as:
 
-- `Unsaved session`;
+- `Not saved`;
 - `Saved`;
 - `Unsaved changes`;
 - `Saving…`;
-- `Could not save — Retry`.
+- `Save failed`, with a **Retry save** action.
 
 Only acknowledgement of the matching dirty generation may display `Saved`.
 
@@ -152,18 +150,9 @@ Window-state persistence remains independent and may write `app.ron` during a no
 
 ## 7. Session management
 
-The initial session-management UI provides:
+The top bar provides **Save** and a session switcher with **New session**, **Rename**, **Reset statistics**, **Delete session**, and **Manage sessions**. Saved-session management provides rename, individual deletion, and delete-all controls. **Autosave sessions** and **Delete all saved sessions** are also available under Storage & privacy settings.
 
-- session selector;
-- **New session**;
-- **Save now**;
-- **Rename**;
-- **Reset statistics**;
-- **Delete session**;
-- **Delete all saved sessions**;
-- **Autosave sessions**.
-
-Saved sessions are ordered by most recently selected/opened. Rows show enough metadata to distinguish duplicate-looking untitled entries, including update time and keyboard name where available.
+The switcher orders saved sessions by most recently opened; **Manage sessions** orders them by most recently updated. Rows show enough metadata to distinguish duplicate-looking untitled entries, including update time and keyboard name where available.
 
 ### 7.1 Rename
 
@@ -179,7 +168,7 @@ Deletion is explicit and immediate even when autosave is disabled. It requires c
 
 Deleting the current saved session warns that both its saved copy and any unsaved changes will be lost. After acknowledgement, evtap creates a new untitled in-memory session rather than loading an older session.
 
-Deleting all saved sessions removes every database session. The working session becomes a new untitled in-memory session. SQLite sidecars are checkpointed and storage pages reclaimed where practical. The UI describes filesystem deletion as best effort rather than guaranteed forensic erasure.
+Deleting all saved sessions removes every database session. If the active session is saved, its saved copy and unsaved changes are removed and it becomes a new untitled in-memory session. If the active session is an unsaved in-memory draft, that draft remains active and unchanged. The SQLite connection is closed before the database and sidecar files are removed. The UI describes filesystem deletion as best effort rather than guaranteed forensic erasure.
 
 There is no retention cleanup. Saved sessions remain until explicit deletion.
 
@@ -243,7 +232,7 @@ The application does not impose special symlink rejection. Normal operating-syst
 | Domain | Owner | Location | Contents |
 | --- | --- | --- | --- |
 | Window state | eframe | `$XDG_DATA_HOME/evtap/app.ron` | Window size, position, and maximized state only |
-| Preferences | evtap | `$XDG_CONFIG_HOME/evtap/settings.json` | Disclosure acknowledgement, autosave, last session ID, fallback XKB preferences |
+| Preferences | evtap | `$XDG_CONFIG_HOME/evtap/settings.json` | Disclosure acknowledgement, autosave, last session ID, fallback XKB preferences, appearance |
 | Session analytics | evtap | `$XDG_DATA_HOME/evtap/evtap.sqlite3` | Saved session metadata and aggregate metric snapshots |
 
 Use the usual `~/.config` and `~/.local/share` fallbacks. `app.ron` must not contain widget memory, evtap preferences, or analytics.
@@ -264,7 +253,8 @@ Logical settings schema:
     "model": "",
     "layout": "",
     "variant": ""
-  }
+  },
+  "appearance": "system"
 }
 ```
 
@@ -285,7 +275,7 @@ evtap uses bundled SQLite through `rusqlite` and configures:
 
 ### 10.1 Schema
 
-evtap 0.2 uses `user_version = 2`:
+The current database schema uses `user_version = 2`:
 
 ```sql
 CREATE TABLE sessions (
@@ -343,7 +333,7 @@ No partial multi-metric state may become visible. Serialization finishes before 
 
 ### 10.3 Loading and listing
 
-Listing reads lightweight session metadata ordered by `last_opened_at_ms`. Loading one session reads all its metric snapshots into a fresh default metric registry. Unknown, malformed, duplicated, or unsupported metric snapshots are isolated; valid metrics still restore.
+Switcher listing reads lightweight session metadata ordered by `last_opened_at_ms`; **Manage sessions** uses `updated_at_ms`. Loading one session reads all its metric snapshots into a fresh set of built-in metrics. Unknown, malformed, duplicated, or unsupported metric snapshots are isolated; valid metrics still restore.
 
 Selecting a session updates its `last_opened_at_ms` as an explicit metadata operation and updates `last_session_id` in settings.
 

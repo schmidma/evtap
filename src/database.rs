@@ -14,8 +14,9 @@ use thiserror::Error;
 use crate::{
     private_fs::{PrivatePathError, ensure_private_directory, set_private_permissions},
     session::{
-        KeyboardContext, SessionId, SessionMetadata, SessionSnapshot, StoredMetricSnapshot,
-        StoredSession,
+        KeyboardContext, SessionId, SessionMetadata, SessionMetadataValidationError,
+        SessionSnapshot, StoredMetricSnapshot, StoredSession, validate_session_name,
+        validate_session_timestamp,
     },
 };
 
@@ -23,10 +24,6 @@ const APPLICATION_ID: i64 = 0x4556_5450; // "EVTP"
 const DATABASE_SCHEMA_VERSION: i64 = 2;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_SESSION_METRICS: usize = 1_000;
-const MAX_APPLICATION_VERSION_BYTES: usize = 128;
-const MAX_SESSION_NAME_BYTES: usize = 80;
-const MAX_KEYBOARD_NAME_BYTES: usize = 1_024;
-const MAX_KEYBOARD_VALUE_BYTES: usize = 256;
 const MAX_SESSION_LIST_SIZE: u32 = 10_000;
 
 const SCHEMA_V2: &str = r#"
@@ -207,7 +204,7 @@ impl Repository {
         session_id: SessionId,
         opened_at_ms: i64,
     ) -> Result<Option<StoredSession>, RepositoryError> {
-        validate_timestamp(opened_at_ms)?;
+        validate_session_timestamp(opened_at_ms)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -245,7 +242,7 @@ impl Repository {
         updated_at_ms: i64,
     ) -> Result<Option<SessionMetadata>, RepositoryError> {
         validate_session_name(name)?;
-        validate_timestamp(updated_at_ms)?;
+        validate_session_timestamp(updated_at_ms)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -468,33 +465,7 @@ fn write_metrics(
 }
 
 fn validate_snapshot(snapshot: &SessionSnapshot) -> Result<(), RepositoryError> {
-    validate_timestamp(snapshot.created_at_ms)?;
-    validate_timestamp(snapshot.updated_at_ms)?;
-    validate_timestamp(snapshot.last_opened_at_ms)?;
-    if snapshot.captured_duration_ns < 0 {
-        return Err(RepositoryError::InvalidDuration);
-    }
-    if snapshot.application_version.is_empty()
-        || snapshot.application_version.len() > MAX_APPLICATION_VERSION_BYTES
-    {
-        return Err(RepositoryError::InvalidApplicationVersion);
-    }
-    validate_session_name(snapshot.name.as_deref())?;
-    if snapshot
-        .keyboard
-        .display_name
-        .as_ref()
-        .is_some_and(|name| name.len() > MAX_KEYBOARD_NAME_BYTES)
-        || [
-            &snapshot.keyboard.model,
-            &snapshot.keyboard.layout,
-            &snapshot.keyboard.variant,
-        ]
-        .iter()
-        .any(|value| value.len() > MAX_KEYBOARD_VALUE_BYTES)
-    {
-        return Err(RepositoryError::InvalidKeyboardContext);
-    }
+    snapshot.validate_metadata()?;
     if snapshot.metrics.len() > MAX_SESSION_METRICS {
         return Err(RepositoryError::TooManyMetrics);
     }
@@ -513,24 +484,6 @@ fn validate_snapshot(snapshot: &SessionSnapshot) -> Result<(), RepositoryError> 
         })?;
     }
     Ok(())
-}
-
-fn validate_session_name(name: Option<&str>) -> Result<(), RepositoryError> {
-    if name.is_some_and(|name| {
-        name.trim() != name || name.is_empty() || name.len() > MAX_SESSION_NAME_BYTES
-    }) {
-        Err(RepositoryError::InvalidSessionName)
-    } else {
-        Ok(())
-    }
-}
-
-fn validate_timestamp(value: i64) -> Result<(), RepositoryError> {
-    if value < 0 {
-        Err(RepositoryError::InvalidTimestamp)
-    } else {
-        Ok(())
-    }
 }
 
 fn session_metadata_query() -> &'static str {
@@ -592,18 +545,8 @@ impl TryFrom<RawSessionMetadata> for SessionMetadata {
                 variant: raw.xkb_variant,
             },
         };
-        let validation_snapshot = SessionSnapshot {
-            id: Some(metadata.id),
-            name: metadata.name.clone(),
-            created_at_ms: metadata.created_at_ms,
-            updated_at_ms: metadata.updated_at_ms,
-            last_opened_at_ms: metadata.last_opened_at_ms,
-            captured_duration_ns: metadata.captured_duration_ns,
-            application_version: metadata.application_version.clone(),
-            keyboard: metadata.keyboard.clone(),
-            metrics: Vec::new(),
-        };
-        validate_snapshot(&validation_snapshot)
+        metadata
+            .validate_metadata()
             .map_err(|_| RepositoryError::InvalidStoredSession)?;
         Ok(metadata)
     }
@@ -612,6 +555,18 @@ impl TryFrom<RawSessionMetadata> for SessionMetadata {
 fn prepare_database_path(path: &Path) -> Result<(), RepositoryError> {
     let parent = path.parent().ok_or(RepositoryError::MissingParent)?;
     ensure_private_directory(parent).map_err(Into::into)
+}
+
+impl From<SessionMetadataValidationError> for RepositoryError {
+    fn from(error: SessionMetadataValidationError) -> Self {
+        match error {
+            SessionMetadataValidationError::Name => Self::InvalidSessionName,
+            SessionMetadataValidationError::Timestamp => Self::InvalidTimestamp,
+            SessionMetadataValidationError::Duration => Self::InvalidDuration,
+            SessionMetadataValidationError::ApplicationVersion => Self::InvalidApplicationVersion,
+            SessionMetadataValidationError::KeyboardContext => Self::InvalidKeyboardContext,
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -791,6 +746,52 @@ mod tests {
                 .unwrap()
                 .len(),
             3
+        );
+    }
+
+    #[test]
+    fn metadata_validation_failures_keep_granular_write_errors() {
+        let mut repository = Repository::open_in_memory().unwrap();
+
+        let invalid_name = snapshot(None, Some(""), 10);
+        assert!(matches!(
+            repository.save(&invalid_name),
+            Err(RepositoryError::InvalidSessionName)
+        ));
+
+        let mut invalid_timestamp = snapshot(None, None, 10);
+        invalid_timestamp.created_at_ms = -1;
+        assert!(matches!(
+            repository.save(&invalid_timestamp),
+            Err(RepositoryError::InvalidTimestamp)
+        ));
+
+        let mut invalid_duration = snapshot(None, None, 10);
+        invalid_duration.captured_duration_ns = -1;
+        assert!(matches!(
+            repository.save(&invalid_duration),
+            Err(RepositoryError::InvalidDuration)
+        ));
+
+        let mut invalid_version = snapshot(None, None, 10);
+        invalid_version.application_version.clear();
+        assert!(matches!(
+            repository.save(&invalid_version),
+            Err(RepositoryError::InvalidApplicationVersion)
+        ));
+
+        let mut invalid_keyboard = snapshot(None, None, 10);
+        invalid_keyboard.keyboard.model = "x".repeat(257);
+        assert!(matches!(
+            repository.save(&invalid_keyboard),
+            Err(RepositoryError::InvalidKeyboardContext)
+        ));
+
+        assert!(
+            repository
+                .list_sessions(10, SessionListOrder::LastOpened)
+                .unwrap()
+                .is_empty()
         );
     }
 

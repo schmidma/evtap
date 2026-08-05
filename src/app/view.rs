@@ -19,14 +19,18 @@ impl App {
     pub(super) fn render_prompts(&mut self, ctx: &egui::Context) -> bool {
         let focus_to_restore = self.focus_after_prompt.take();
         let mut text_edit_focused = false;
-        if let Some(intent) = self.disclosure_prompt {
+        if self.active_prompt_tag() == Some(super::ActivePromptTag::Disclosure) {
+            let intent = match self.active_prompt.as_ref().map(|prompt| &prompt.kind) {
+                Some(super::ActivePromptKind::Disclosure(intent)) => *intent,
+                _ => unreachable!(),
+            };
             let reviewing = intent == DisclosureIntent::Review;
             let title = if reviewing {
                 "Local storage disclosure"
             } else {
                 "Save sensitive aggregate statistics?"
             };
-            let focus_primary = std::mem::take(&mut self.prompt_needs_focus);
+            let focus_primary = self.take_prompt_initial_focus();
             let (_, should_close) = components::modal(ctx, "storage-disclosure", title, |ui| {
                 ui.label("evtap reads global keyboard input while listening. Saving writes sensitive character, bigram, correction, key-usage, count, and timing aggregates to a local, unencrypted SQLite database.");
                 ui.label("Raw event sequences, device paths, pressed-key state, and unfinished timing or correction context are not stored. No telemetry or synchronization is performed.");
@@ -41,8 +45,7 @@ impl App {
                             close.request_focus();
                         }
                         if close.clicked() {
-                            self.disclosure_prompt = None;
-                            self.finish_prompt();
+                            let _ = self.finish_prompt();
                         }
                     } else {
                         let allow = components::primary_button(ui, "Allow local saves");
@@ -52,8 +55,7 @@ impl App {
                         if allow.clicked() {
                             self.settings.set_storage_disclosure_acknowledged(true);
                             if self.save_settings() {
-                                self.disclosure_prompt = None;
-                                self.finish_prompt();
+                                let _ = self.finish_prompt();
                                 match intent {
                                     DisclosureIntent::Save(after) => self.begin_save(after),
                                     DisclosureIntent::EnableAutosave => {
@@ -73,26 +75,29 @@ impl App {
                             }
                         }
                         if ui.button("Cancel").clicked() {
-                            self.disclosure_prompt = None;
-                            self.finish_prompt();
+                            let _ = self.finish_prompt();
                         }
                     }
                 });
             });
-            if should_close && self.disclosure_prompt.is_some() {
-                self.disclosure_prompt = None;
-                self.finish_prompt();
+            if should_close && self.active_prompt_tag() == Some(super::ActivePromptTag::Disclosure)
+            {
+                let _ = self.finish_prompt();
             }
         }
 
-        if let Some(target) = self.boundary_prompt {
+        if self.active_prompt_tag() == Some(super::ActivePromptTag::Boundary) {
+            let target = match self.active_prompt.as_ref().map(|prompt| &prompt.kind) {
+                Some(super::ActivePromptKind::Boundary(target)) => *target,
+                _ => unreachable!(),
+            };
             let exiting = target == BoundaryTarget::Exit;
             let title = if exiting {
                 "Save changes before exiting?"
             } else {
                 "Save changes before switching sessions?"
             };
-            let focus_primary = std::mem::take(&mut self.prompt_needs_focus);
+            let focus_primary = self.take_prompt_initial_focus();
             let (_, should_close) = components::modal(ctx, "dirty-boundary", title, |ui| {
                 ui.label(format!(
                     "{} has unsaved changes.",
@@ -111,9 +116,10 @@ impl App {
                         save.request_focus();
                     }
                     if save.clicked() {
-                        self.boundary_prompt = None;
-                        self.finish_prompt();
-                        self.request_save(Some(target));
+                        let (_, opener) = self
+                            .take_prompt_for_transition()
+                            .expect("the boundary prompt is active");
+                        self.request_save_from(Some(target), opener);
                     }
                     if components::destructive_button(
                         ui,
@@ -125,25 +131,28 @@ impl App {
                     )
                     .clicked()
                     {
-                        self.boundary_prompt = None;
-                        self.finish_prompt();
+                        let _ = self.finish_prompt();
                         self.execute_boundary(target);
                     }
                     if ui.button("Cancel").clicked() {
-                        self.boundary_prompt = None;
-                        self.finish_prompt();
+                        let _ = self.finish_prompt();
                     }
                 });
             });
-            if should_close && self.boundary_prompt.is_some() {
-                self.boundary_prompt = None;
-                self.finish_prompt();
+            if should_close && self.active_prompt_tag() == Some(super::ActivePromptTag::Boundary) {
+                let _ = self.finish_prompt();
             }
         }
 
         let mut submit_rename = false;
         let mut cancel_rename = false;
-        if let Some(dialog) = &mut self.rename_dialog {
+        if let Some(super::ActivePrompt {
+            kind: super::ActivePromptKind::Rename(dialog),
+            needs_initial_focus,
+            ..
+        }) = &mut self.active_prompt
+        {
+            let focus_text = std::mem::take(needs_initial_focus);
             let (_, should_close) =
                 components::modal(ctx, "rename-session", "Rename session", |ui| {
                     ui.label("Leave the name empty to keep this session untitled.");
@@ -160,7 +169,7 @@ impl App {
                             "Session name",
                         )
                     });
-                    if dialog.focus_text {
+                    if focus_text {
                         edit.request_focus();
                         let mut state =
                             egui::TextEdit::load_state(ctx, edit.id).unwrap_or_default();
@@ -171,7 +180,6 @@ impl App {
                                 egui::text::CCursor::new(dialog.buffer.chars().count()),
                             )));
                         state.store(ctx, edit.id);
-                        dialog.focus_text = false;
                     }
                     text_edit_focused = edit.has_focus();
                     let used_bytes = dialog.buffer.trim().len();
@@ -211,10 +219,10 @@ impl App {
             self.close_rename_dialog();
         }
 
-        if self.confirm_reset {
+        if self.active_prompt_tag() == Some(super::ActivePromptTag::Reset) {
             let mut reset = false;
             let mut cancel = false;
-            let focus_primary = std::mem::take(&mut self.prompt_needs_focus);
+            let focus_primary = self.take_prompt_initial_focus();
             let (_, should_close) = components::modal(
                 ctx,
                 "reset-statistics",
@@ -237,18 +245,23 @@ impl App {
             if reset {
                 self.reset_statistics();
             } else if cancel || should_close {
-                self.confirm_reset = false;
-                self.finish_prompt();
+                let _ = self.finish_prompt();
             }
         }
 
         let mut delete_confirmed = false;
         let mut delete_cancelled = false;
-        if let Some(prompt) = &self.confirm_delete {
-            let target = prompt.display_name.clone();
-            let current = prompt.current;
-            let saved = prompt.session_id.is_some();
-            let focus_primary = std::mem::take(&mut self.prompt_needs_focus);
+        if self.active_prompt_tag() == Some(super::ActivePromptTag::DeleteSession) {
+            let (target, current, saved) =
+                match self.active_prompt.as_ref().map(|prompt| &prompt.kind) {
+                    Some(super::ActivePromptKind::DeleteSession(prompt)) => (
+                        prompt.display_name.clone(),
+                        prompt.current,
+                        prompt.session_id.is_some(),
+                    ),
+                    _ => unreachable!(),
+                };
+            let focus_primary = self.take_prompt_initial_focus();
             let (_, should_close) = components::modal(
                 ctx,
                 "delete-session",
@@ -278,11 +291,10 @@ impl App {
         if delete_confirmed {
             self.delete_prompted_session();
         } else if delete_cancelled {
-            self.confirm_delete = None;
-            self.finish_prompt();
+            let _ = self.finish_prompt();
         }
 
-        if self.confirm_delete_all {
+        if self.active_prompt_tag() == Some(super::ActivePromptTag::DeleteAll) {
             let delete_all_detail = if self.working_session.id.is_some() {
                 "Every saved session, including the active session and its unsaved changes, will be removed. Filesystem backups and snapshots may retain copies."
             } else {
@@ -290,7 +302,7 @@ impl App {
             };
             let mut delete_all = false;
             let mut cancel = false;
-            let focus_primary = std::mem::take(&mut self.prompt_needs_focus);
+            let focus_primary = self.take_prompt_initial_focus();
             let (_, should_close) = components::modal(
                 ctx,
                 "delete-all-sessions",
@@ -311,10 +323,11 @@ impl App {
             if delete_all {
                 self.delete_all_sessions();
             } else if cancel || should_close {
-                self.confirm_delete_all = false;
-                self.finish_prompt();
+                let _ = self.finish_prompt();
             }
         }
+
+        self.resume_deferred_boundary();
 
         if let Some(opener) = focus_to_restore {
             ctx.memory_mut(|memory| memory.request_focus(opener));

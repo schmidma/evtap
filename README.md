@@ -2,12 +2,12 @@
 
 > Local, session-based analysis of everyday typing mechanics.
 
-`evtap` is a Linux desktop application that listens to one selected keyboard through the kernel's evdev interface and computes timing and correction metrics while you type normally. It is intended to reveal physical hesitation, key-hold patterns, common transitions, and correction signals that a conventional words-per-minute test cannot show.
+`evtap` is a Linux desktop application for understanding everyday typing mechanics. It listens to one selected keyboard through the kernel's evdev interface and presents local session analytics for key use, timing, common transitions, and correction signals that a conventional words-per-minute test cannot show.
 
 > [!WARNING]
 > evtap observes global keyboard input from the selected device while listening. Treat it like a keylogger even though it processes data locally and does not save raw input. Read the [privacy model](docs/privacy.md) before use.
 
-evtap is pre-1.0 software. `0.1.x` is the process-only baseline; `0.2.x` adds resumable sessions with optional local aggregate saves. Interfaces and behavior may still change between minor versions.
+evtap is pre-1.0 software. It supports resumable working sessions and optional local aggregate saves; interfaces and behavior may still change between minor versions.
 
 ## Current scope
 
@@ -100,12 +100,12 @@ If evtap cannot inspect any input devices, it displays a permission message rath
 
 1. Start evtap and wait for keyboard scanning to finish. evtap loads the last-selected saved session when one exists; otherwise it starts with an untitled in-memory session.
 2. Select a readable keyboard and the matching XKB model, layout, and variant. Remembered session values are suggestions rather than restrictions.
-3. Choose **Start listening**.
+3. Choose **Start**.
 4. Type normally in other applications; evtap updates when global events arrive.
-5. Choose **Stop listening** to pause capture while keeping the same working session.
-6. Choose **Save now** to write the current aggregate state. The first save displays a sensitivity disclosure.
+5. Choose **Stop** to pause capture while keeping the same working session.
+6. Choose **Save** to write the current aggregate state. The first save displays a sensitivity disclosure; if a save fails, correct the cause and choose **Retry save**.
 7. Optionally enable **Autosave sessions** for 30-second periodic saves and automatic saves on Stop, session switch, and normal close.
-8. Use the session selector or **New session** to change working sessions. With autosave off, dirty switches and closes offer Save, Discard, or Cancel.
+8. Use the session switcher to select or create a working session, or choose **Manage sessions** for saved-session actions. With autosave off, dirty switches and closes offer Save, Discard, or Cancel.
 
 Saved sessions remain mutable and resumable until explicitly deleted. There is no finish or history state. A restored or newly selected session is always paused; capture never starts automatically.
 
@@ -121,7 +121,7 @@ $XDG_DATA_HOME/evtap/app.ron
 $XDG_DATA_HOME/evtap/evtap.sqlite3
 ```
 
-with the usual `~/.config` and `~/.local/share` fallbacks. `settings.json` records the one-time storage disclosure acknowledgement, autosave, last-selected session ID, and fallback XKB preferences. `app.ron` contains native window state only. `evtap.sqlite3` contains saved session metadata and aggregate metric snapshots. evtap creates private application directories and files with restrictive Unix permissions, but the database is not encrypted and filesystem backups or privileged processes can still read it.
+with the usual `~/.config` and `~/.local/share` fallbacks. `settings.json` records the one-time storage disclosure acknowledgement, autosave, last-selected session ID, fallback XKB preferences, and the system/light/dark appearance preference. `app.ron` contains native window state only. `evtap.sqlite3` contains saved session metadata and aggregate metric snapshots. evtap creates private application directories and files with restrictive Unix permissions, but the database is not encrypted and filesystem backups or privileged processes can still read it.
 
 With autosave enabled, dirty sessions are saved approximately every 30 seconds during capture and at Stop, switch, and normal-close boundaries. With autosave disabled, only explicit saves write analytics; dirty switches and closes prompt before dropping state. A crash can lose changes after the latest acknowledged save. See the [persistence reference](docs/persistence-spec.md) and [privacy model](docs/privacy.md) for exact fields and lifecycle behavior.
 
@@ -147,7 +147,7 @@ More detail is available in [docs/privacy.md](docs/privacy.md).
 
 ## Development
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, quality checks, architecture boundaries, metric-extension guidance, and privacy requirements. Persistence changes use the [manual validation guide](docs/persistence-validation.md). The current release plan is in [ROADMAP.md](ROADMAP.md), and notable changes are tracked in [CHANGELOG.md](CHANGELOG.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, quality checks, architecture boundaries, metric-extension guidance, and privacy requirements. Persistence changes use the [focused manual validation runbook](docs/persistence-validation.md). [ROADMAP.md](ROADMAP.md) lists potential future directions rather than a current release plan, and [CHANGELOG.md](CHANGELOG.md) tracks notable changes.
 
 ## License
 

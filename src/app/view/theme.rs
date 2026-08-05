@@ -3,8 +3,8 @@ use std::sync::Arc;
 #[cfg(test)]
 use eframe::egui::epaint::text::Tag;
 use eframe::egui::{
-    self, epaint::text::VariationCoords, Color32, CornerRadius, FontData, FontFamily, FontId,
-    FontTweak, Stroke, TextStyle, Theme,
+    self, Color32, CornerRadius, FontData, FontFamily, FontId, FontTweak, Stroke, TextStyle, Theme,
+    epaint::text::VariationCoords,
 };
 use egui_phosphor::Variant;
 

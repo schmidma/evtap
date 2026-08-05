@@ -8,20 +8,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     app::view::components::{
-        TextTokenContext, describe_text_token, disclosure_list, format_duration_ms,
-        format_exact_count_u128, inline_empty_state, metric_summary_value, ranked_bar_with_label,
-        text_token,
+        TextTokenContext, describe_text_token, format_duration_ms, inline_empty_state,
+        metric_summary_value, ranked_bar_with_label, text_token,
     },
     input::{KeyEvent, KeyEventKind, PhysicalKey},
     metric::{
-        DurationStats, Metric, MetricSnapshot, MetricSnapshotError, validate_dimension,
-        validate_entry_count,
+        DurationStats, Metric, MetricSnapshot, MetricSnapshotError,
+        duration_analysis::{overall_average, render_duration_analysis, sample_count_label},
+        validate_dimension, validate_entry_count,
     },
 };
 
 const METRIC_ID: &str = "dwell-time";
 const SNAPSHOT_VERSION: u32 = 1;
-const INITIAL_ANALYSIS_ROWS: usize = 8;
 
 struct PressedKey {
     timestamp: SystemTime,
@@ -32,26 +31,6 @@ struct PressedKey {
 pub struct DwellTime {
     pressed_keys: HashMap<PhysicalKey, PressedKey>,
     stats: HashMap<String, DurationStats>,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum SortChoice {
-    #[default]
-    Slowest,
-    Fastest,
-    Label,
-    SampleCount,
-}
-
-impl SortChoice {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Slowest => "Slowest",
-            Self::Fastest => "Fastest",
-            Self::Label => "Label",
-            Self::SampleCount => "Sample count",
-        }
-    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -66,73 +45,6 @@ struct DurationEntry {
     text: String,
     total_ns: u64,
     samples: u64,
-}
-
-impl DwellTime {
-    fn overall_average(&self) -> Option<(f64, u128)> {
-        let samples = self
-            .stats
-            .values()
-            .map(|stats| u128::from(stats.samples))
-            .sum::<u128>();
-        if samples == 0 {
-            return None;
-        }
-        let total_nanoseconds = self
-            .stats
-            .values()
-            .map(|stats| stats.total.as_nanos())
-            .sum::<u128>();
-        Some((
-            total_nanoseconds as f64 / samples as f64 / 1_000_000.0,
-            samples,
-        ))
-    }
-
-    fn sorted_stats(&self, sort: SortChoice) -> Vec<(&str, DurationStats)> {
-        let mut stats: Vec<_> = self
-            .stats
-            .iter()
-            .map(|(text, stats)| (text.as_str(), *stats))
-            .collect();
-        stats.sort_by(|(left_text, left), (right_text, right)| match sort {
-            SortChoice::Slowest => right
-                .compare_average(*left)
-                .then_with(|| left_text.cmp(right_text)),
-            SortChoice::Fastest => left
-                .compare_average(*right)
-                .then_with(|| left_text.cmp(right_text)),
-            SortChoice::Label => left_text.cmp(right_text),
-            SortChoice::SampleCount => right
-                .samples
-                .cmp(&left.samples)
-                .then_with(|| left_text.cmp(right_text)),
-        });
-        stats
-    }
-
-    fn maximum_average(&self) -> f64 {
-        self.stats
-            .values()
-            .copied()
-            .max_by(|left, right| left.compare_average(*right))
-            .map(DurationStats::average_milliseconds)
-            .unwrap_or(0.0)
-    }
-}
-
-fn sort_state_id() -> egui::Id {
-    egui::Id::new((METRIC_ID, "analysis-sort-state"))
-}
-
-fn expansion_state_id() -> egui::Id {
-    egui::Id::new((METRIC_ID, "analysis-expansion-state"))
-}
-
-fn sample_count_label(samples: u128) -> String {
-    let count = format_exact_count_u128(samples);
-    let noun = if samples == 1 { "sample" } else { "samples" };
-    format!("{count} {noun}")
 }
 
 fn dwell_empty_state(ui: &mut egui::Ui) {
@@ -196,7 +108,7 @@ impl Metric for DwellTime {
     }
 
     fn summary_ui(&self, ui: &mut egui::Ui) {
-        let Some((average, samples)) = self.overall_average() else {
+        let Some((average, samples)) = overall_average(&self.stats) else {
             dwell_empty_state(ui);
             return;
         };
@@ -217,53 +129,7 @@ impl Metric for DwellTime {
             return;
         }
 
-        let sort_id = sort_state_id();
-        let mut sort = ui
-            .ctx()
-            .data(|data| data.get_temp::<SortChoice>(sort_id))
-            .unwrap_or_default();
-        let previous_sort = sort;
-        ui.horizontal(|ui| {
-            ui.label("Sort");
-            egui::ComboBox::from_id_salt((METRIC_ID, "analysis-sort-control"))
-                .selected_text(sort.label())
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut sort,
-                        SortChoice::Slowest,
-                        SortChoice::Slowest.label(),
-                    );
-                    ui.selectable_value(
-                        &mut sort,
-                        SortChoice::Fastest,
-                        SortChoice::Fastest.label(),
-                    );
-                    ui.selectable_value(&mut sort, SortChoice::Label, SortChoice::Label.label());
-                    ui.selectable_value(
-                        &mut sort,
-                        SortChoice::SampleCount,
-                        SortChoice::SampleCount.label(),
-                    );
-                });
-        });
-        if sort != previous_sort {
-            ui.ctx().data_mut(|data| data.insert_temp(sort_id, sort));
-        }
-
-        let stats = self.sorted_stats(sort);
-        let total_rows = stats.len();
-        let maximum = self.maximum_average();
-        disclosure_list(
-            ui,
-            expansion_state_id(),
-            total_rows,
-            INITIAL_ANALYSIS_ROWS,
-            |ui, shown_rows| {
-                for (text, stats) in stats.into_iter().take(shown_rows) {
-                    dwell_bar(ui, text, stats, maximum);
-                }
-            },
-        );
+        render_duration_analysis(ui, METRIC_ID, &self.stats, dwell_bar);
     }
 
     fn has_data(&self) -> bool {
@@ -334,7 +200,7 @@ mod tests {
         metric::{DurationStats, Metric},
     };
 
-    use super::{DwellTime, SortChoice};
+    use super::DwellTime;
 
     fn event(at_ms: u64, kind: KeyEventKind, text: Option<&str>) -> KeyEvent {
         KeyEvent::new(
@@ -362,73 +228,6 @@ mod tests {
 
         assert_eq!(metric.stats.get("A").map(|stats| stats.samples), Some(1));
         assert_eq!(metric.stats.get("a").map(|stats| stats.samples), None);
-    }
-
-    #[test]
-    fn overall_average_is_weighted_by_samples() {
-        let mut metric = DwellTime::default();
-        metric.stats.insert("a".to_owned(), duration_stats(100, 2));
-        metric.stats.insert("b".to_owned(), duration_stats(100, 1));
-        metric.stats.insert("c".to_owned(), duration_stats(150, 3));
-
-        let (average, samples) = metric
-            .overall_average()
-            .expect("populated dwell stats should have an average");
-        assert_eq!(samples, 6);
-        assert!((average - 350.0 / 6.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn sorting_is_deterministic_for_averages_labels_and_sample_counts() {
-        let mut metric = DwellTime::default();
-        metric
-            .stats
-            .insert("alpha".to_owned(), duration_stats(100, 2));
-        metric
-            .stats
-            .insert("beta".to_owned(), duration_stats(100, 1));
-        metric
-            .stats
-            .insert("delta".to_owned(), duration_stats(150, 3));
-
-        let order = |sort| {
-            metric
-                .sorted_stats(sort)
-                .into_iter()
-                .map(|(text, _)| text)
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(order(SortChoice::Slowest), ["beta", "alpha", "delta"]);
-        assert_eq!(order(SortChoice::Fastest), ["alpha", "delta", "beta"]);
-        assert_eq!(order(SortChoice::Label), ["alpha", "beta", "delta"]);
-        assert_eq!(order(SortChoice::SampleCount), ["delta", "alpha", "beta"]);
-
-        metric.stats.clear();
-        metric.stats.insert(
-            "alphabetically-first".to_owned(),
-            DurationStats {
-                total: Duration::from_nanos(i64::MAX as u64 - 1),
-                samples: 1,
-            },
-        );
-        metric.stats.insert(
-            "truly-slower".to_owned(),
-            DurationStats {
-                total: Duration::from_nanos(i64::MAX as u64),
-                samples: 1,
-            },
-        );
-        let order = |sort| {
-            metric
-                .sorted_stats(sort)
-                .into_iter()
-                .map(|(text, _)| text)
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(
-            order(SortChoice::Slowest),
-            ["truly-slower", "alphabetically-first"]
-        );
     }
 
     #[test]

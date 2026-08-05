@@ -226,8 +226,10 @@ impl App {
                         egui::Button::new("Delete all saved sessions"),
                     );
                     if delete_all.clicked() {
-                        self.begin_prompt(Some(delete_all.id));
-                        self.confirm_delete_all = true;
+                        self.open_prompt(
+                            super::super::ActivePromptKind::DeleteAll,
+                            Some(delete_all.id),
+                        );
                     }
                 });
             });

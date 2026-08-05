@@ -37,7 +37,7 @@ Linux hardware can expose several event interfaces, including separate media-key
 grep -E '^(N: Name|H: Handlers|B: EV|B: KEY)' /proc/bus/input/devices
 ```
 
-Reconnect the keyboard and choose **Rescan**. Check the terminal log for an open error associated with its `/dev/input/event*` path.
+Reconnect the keyboard and choose **Rescan keyboards**. Check the terminal log for an open error associated with its `/dev/input/event*` path.
 
 ## Characters or bigrams are wrong
 
@@ -62,11 +62,11 @@ Function and modifier keys do not produce text-oriented samples.
 
 ## The listener stops unexpectedly
 
-A disconnect, suspend/resume transition, permission change, or kernel read failure can close the event stream. evtap displays the listener error. Reconnect the device, choose **Rescan**, select it again, and restart listening.
+A disconnect, suspend/resume transition, permission change, or kernel read failure can close the event stream. evtap displays the listener error. Reconnect the device, choose **Rescan keyboards**, select it again, and choose **Start**.
 
 ## A saved session does not load
 
-Inspect the session storage status and error shown in the Session panel. evtap loads only the ID recorded as the last-selected saved session. If that session was deleted, evtap deliberately starts a new **Untitled session** rather than choosing an unexpected older session.
+Open **Manage sessions** and inspect the session storage status and error. evtap loads only the ID recorded as the last-selected saved session. If that session was deleted, evtap deliberately starts a new **Untitled session** rather than choosing an unexpected older session.
 
 Expected paths are:
 
@@ -96,11 +96,11 @@ If preserving it matters, copy it privately before editing. Otherwise, with evta
 mv ~/.config/evtap/settings.json ~/.config/evtap/settings.json.backup
 ```
 
-Restarting uses defaults. Treat the backup as private because it records the storage-disclosure acknowledgement, autosave, last-selected session ID, and keyboard preferences.
+Restarting uses defaults. Treat the backup as private because it records the storage-disclosure acknowledgement, autosave, last-selected session ID, keyboard preferences, and appearance.
 
 ## Saves fail or remain dirty
 
-A storage failure never stops capture or clears in-memory metrics. Check free space, ownership, permissions, read-only filesystem state, and whether another process has replaced the database path. Use **Retry storage operation** after correcting the cause; retry serializes a fresh snapshot of the latest aggregates.
+A storage failure never stops capture or clears in-memory metrics. Check free space, ownership, permissions, read-only filesystem state, and whether another process has replaced the database path. Choose **Retry save** after correcting a save failure; retry serializes a fresh snapshot of the latest aggregates. For list, load, or deletion failures, use the operation-specific action shown with the error or return to **Manage sessions**.
 
 With autosave enabled, normal close waits only for a bounded final save. With autosave disabled, a dirty close offers Save, Exit without saving, or Cancel. A timeout or forced process termination can lose changes after the most recent acknowledged save. Do not assume the **Saved** label until the worker has acknowledged the current generation.
 

@@ -1,3 +1,5 @@
+use std::future::Future;
+
 use camino::{Utf8Path, Utf8PathBuf};
 use color_eyre::{Result, eyre::Context};
 use evdev::{AttributeSetRef, Device, KeyCode};
@@ -72,6 +74,14 @@ impl ScannerHandle {
 }
 
 pub fn spawn(wake_signal: WakeSignal) -> ScannerHandle {
+    spawn_with(wake_signal, scan_devices)
+}
+
+fn spawn_with<F, Fut>(wake_signal: WakeSignal, scan: F) -> ScannerHandle
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<ScanReport>> + Send + 'static,
+{
     let (event_sender, event_receiver) = mpsc::channel(CHANNEL_CAPACITY);
     let (command_sender, command_receiver) = mpsc::channel(CHANNEL_CAPACITY);
 
@@ -81,7 +91,7 @@ pub fn spawn(wake_signal: WakeSignal) -> ScannerHandle {
             command_receiver,
             wake_signal,
         }
-        .run()
+        .run(scan)
         .await;
     });
 
@@ -98,11 +108,15 @@ struct Scanner {
 }
 
 impl Scanner {
-    async fn run(mut self) {
+    async fn run<F, Fut>(mut self, mut scan: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<ScanReport>>,
+    {
         while let Some(command) = self.command_receiver.recv().await {
             match command {
                 Command::Scan => {
-                    let result = scan_devices().await.map_err(|error| format!("{error:#}"));
+                    let result = scan().await.map_err(|error| format!("{error:#}"));
                     if self
                         .event_sender
                         .send(Event::ScanFinished { result })
@@ -120,9 +134,25 @@ impl Scanner {
 }
 
 async fn scan_devices() -> Result<ScanReport> {
-    let mut read_dir = fs::read_dir("/dev/input")
-        .await
-        .wrap_err("failed to read /dev/input; verify that Linux evdev is available")?;
+    scan_devices_with(
+        Utf8Path::new("/dev/input"),
+        Utf8Path::new("/sys/class/input"),
+        inspect_device,
+    )
+    .await
+}
+
+async fn scan_devices_with<F>(
+    input_directory: &Utf8Path,
+    sysfs_input_root: &Utf8Path,
+    mut inspect: F,
+) -> Result<ScanReport>
+where
+    F: FnMut(&Utf8Path) -> std::io::Result<DeviceInspection>,
+{
+    let mut read_dir = fs::read_dir(input_directory).await.wrap_err_with(|| {
+        format!("failed to read {input_directory}; verify that Linux evdev is available")
+    })?;
     let mut devices = Vec::new();
     let mut issues = Vec::new();
 
@@ -152,9 +182,9 @@ async fn scan_devices() -> Result<ScanReport> {
             continue;
         }
 
-        let candidate = keyboard_candidate_from_sysfs(&path).await;
-        let device = match Device::open(&path) {
-            Ok(device) => device,
+        let candidate = keyboard_candidate_from_sysfs(&path, sysfs_input_root).await;
+        let inspection = match inspect(&path) {
+            Ok(inspection) => inspection,
             Err(error) => {
                 if matches!(candidate, Ok(false)) {
                     continue;
@@ -183,12 +213,13 @@ async fn scan_devices() -> Result<ScanReport> {
             }
         };
 
-        if !is_keyboard(&device) {
+        let DeviceInspection::Keyboard {
+            name,
+            physical_path,
+        } = inspection
+        else {
             continue;
-        }
-
-        let name = device.name().unwrap_or("Unknown keyboard").to_owned();
-        let physical_path = device.physical_path().unwrap_or("Unknown").to_owned();
+        };
         info!(%name, %path, "found keyboard");
         devices.push(DeviceMetadata {
             path,
@@ -207,11 +238,30 @@ async fn scan_devices() -> Result<ScanReport> {
     Ok(ScanReport { devices, issues })
 }
 
-async fn keyboard_candidate_from_sysfs(device_path: &Utf8Path) -> Result<bool> {
+enum DeviceInspection {
+    Keyboard { name: String, physical_path: String },
+    NotKeyboard,
+}
+
+fn inspect_device(path: &Utf8Path) -> std::io::Result<DeviceInspection> {
+    let device = Device::open(path)?;
+    if !is_keyboard(&device) {
+        return Ok(DeviceInspection::NotKeyboard);
+    }
+    Ok(DeviceInspection::Keyboard {
+        name: device.name().unwrap_or("Unknown keyboard").to_owned(),
+        physical_path: device.physical_path().unwrap_or("Unknown").to_owned(),
+    })
+}
+
+async fn keyboard_candidate_from_sysfs(
+    device_path: &Utf8Path,
+    sysfs_input_root: &Utf8Path,
+) -> Result<bool> {
     let event_name = device_path
         .file_name()
         .ok_or_else(|| color_eyre::eyre::eyre!("input-device path has no event name"))?;
-    let capabilities_path = Utf8PathBuf::from("/sys/class/input")
+    let capabilities_path = sysfs_input_root
         .join(event_name)
         .join("device/capabilities/key");
     let capabilities = fs::read_to_string(&capabilities_path)
@@ -250,11 +300,24 @@ fn has_required_keyboard_keys(keys: &AttributeSetRef<KeyCode>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        collections::VecDeque,
+        fs, io,
+        sync::{Arc, Mutex, mpsc},
+        time::Duration,
+    };
+
+    use camino::Utf8Path;
     use evdev::AttributeSet;
+    use tempfile::tempdir;
+    use tokio::sync::oneshot;
+
+    use crate::wake::WakeSignal;
 
     use super::{
-        REQUIRED_KEYBOARD_KEYS, has_required_keyboard_keys,
-        keyboard_capabilities_include_required_keys,
+        DeviceInspection, DeviceMetadata, DeviceScanIssueKind, Event, REQUIRED_KEYBOARD_KEYS,
+        ScanReport, ScannerHandle, has_required_keyboard_keys,
+        keyboard_capabilities_include_required_keys, scan_devices_with, spawn_with,
     };
 
     #[test]
@@ -274,10 +337,7 @@ mod tests {
 
     #[test]
     fn parses_sysfs_keyboard_capability_words() {
-        let mut low_word = 0_u64;
-        for key in REQUIRED_KEYBOARD_KEYS {
-            low_word |= 1_u64 << key.code();
-        }
+        let mut low_word = required_capabilities_word();
         assert!(
             keyboard_capabilities_include_required_keys(&format!("0 {low_word:x}"))
                 .expect("valid sysfs capabilities")
@@ -288,5 +348,244 @@ mod tests {
                 .expect("valid sysfs capabilities")
         );
         assert!(keyboard_capabilities_include_required_keys("not-hex").is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scan_filters_classifies_and_orders_injected_devices() {
+        let temporary = tempdir().expect("temporary scanner fixture");
+        let root = Utf8Path::from_path(temporary.path()).expect("UTF-8 temporary path");
+        let input = root.join("input");
+        let sysfs = root.join("sysfs");
+        fs::create_dir_all(&input).expect("input fixture directory");
+
+        for name in [
+            "mouse0",
+            "event-zeta",
+            "event-alpha",
+            "event-readable-non-keyboard",
+            "event-not-candidate",
+            "event-denied",
+            "event-unavailable",
+            "event-unknown",
+            "event-malformed",
+        ] {
+            fs::write(input.join(name), []).expect("input fixture entry");
+        }
+        let keyboard_capabilities = format!("{:x}", required_capabilities_word());
+        for name in ["event-not-candidate", "event-denied", "event-unavailable"] {
+            write_capabilities(
+                &sysfs,
+                name,
+                if name == "event-not-candidate" {
+                    "0"
+                } else {
+                    &keyboard_capabilities
+                },
+            );
+        }
+        write_capabilities(&sysfs, "event-malformed", "not-hex");
+
+        let mut inspected = Vec::new();
+        let report = scan_devices_with(&input, &sysfs, |path| {
+            let name = path.file_name().expect("fixture event name");
+            inspected.push(name.to_owned());
+            match name {
+                "event-alpha" => Ok(DeviceInspection::Keyboard {
+                    name: "Alpha".to_owned(),
+                    physical_path: "fixture/alpha".to_owned(),
+                }),
+                "event-zeta" => Ok(DeviceInspection::Keyboard {
+                    name: "alpha".to_owned(),
+                    physical_path: "fixture/zeta".to_owned(),
+                }),
+                "event-readable-non-keyboard" => Ok(DeviceInspection::NotKeyboard),
+                "event-denied" | "event-not-candidate" => {
+                    Err(io::Error::from(io::ErrorKind::PermissionDenied))
+                }
+                "event-unavailable" => Err(io::Error::from(io::ErrorKind::NotFound)),
+                "event-unknown" | "event-malformed" => Err(io::Error::from(io::ErrorKind::Other)),
+                unexpected => panic!("unexpected inspected path: {unexpected}"),
+            }
+        })
+        .await
+        .expect("injected scan succeeds");
+
+        assert!(!inspected.iter().any(|name| name == "mouse0"));
+        assert_eq!(
+            report
+                .devices
+                .iter()
+                .map(|device| device.path.file_name().expect("device event name"))
+                .collect::<Vec<_>>(),
+            ["event-alpha", "event-zeta"]
+        );
+        assert_eq!(report.issues.len(), 4);
+        assert_issue(
+            &report,
+            "event-denied",
+            DeviceScanIssueKind::PermissionDenied,
+        );
+        assert_issue(
+            &report,
+            "event-unavailable",
+            DeviceScanIssueKind::Unavailable,
+        );
+        assert_issue(&report, "event-unknown", DeviceScanIssueKind::Unknown);
+        assert_issue(&report, "event-malformed", DeviceScanIssueKind::Unknown);
+        assert!(
+            !report
+                .issues
+                .iter()
+                .any(|issue| issue.path.ends_with("event-not-candidate"))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scanner_serializes_requests_delivers_reports_and_wakes_once_per_event() {
+        let first = ScanReport {
+            devices: vec![device("First", "/dev/input/event-first")],
+            issues: Vec::new(),
+        };
+        let second = ScanReport {
+            devices: vec![device("Second", "/dev/input/event-second")],
+            issues: Vec::new(),
+        };
+        let (first_release, first_wait) = oneshot::channel();
+        let (second_release, second_wait) = oneshot::channel();
+        let waits = Arc::new(Mutex::new(VecDeque::from([first_wait, second_wait])));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (wake_tx, wake_rx) = mpsc::channel();
+        let wake = WakeSignal::new(move || {
+            let _ = wake_tx.send(());
+        });
+        let mut scanner = spawn_with(wake, move || {
+            started_tx.send(()).expect("observe scan start");
+            let wait = waits
+                .lock()
+                .expect("scan waits lock")
+                .pop_front()
+                .expect("queued scan wait");
+            async move { Ok(wait.await.expect("release scan")) }
+        });
+
+        scanner.start_scan().expect("start first scan");
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first scan starts");
+        scanner.start_scan().expect("queue second scan");
+        assert!(scanner.start_scan().is_err(), "only one scan may queue");
+        assert!(
+            matches!(started_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "the queued scan must not overlap the active scan"
+        );
+
+        first_release
+            .send(first.clone())
+            .expect("release first scan");
+        assert_scan_event(&mut scanner, &wake_rx, &first);
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("queued scan starts after delivery");
+
+        second_release
+            .send(second.clone())
+            .expect("release second scan");
+        assert_scan_event(&mut scanner, &wake_rx, &second);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scanner_stops_cleanly_when_either_channel_closes() {
+        let ScannerHandle {
+            mut events,
+            commands,
+        } = spawn_with(WakeSignal::new(|| {}), || async {
+            panic!("a scan should not run after the command channel closes")
+        });
+        drop(commands);
+        assert!(events.recv().await.is_none());
+
+        let (release, wait) = oneshot::channel();
+        let wait = Arc::new(Mutex::new(Some(wait)));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (wake_tx, wake_rx) = mpsc::channel();
+        let ScannerHandle { events, commands } = spawn_with(
+            WakeSignal::new(move || {
+                let _ = wake_tx.send(());
+            }),
+            move || {
+                started_tx.send(()).expect("observe scan start");
+                let wait = wait
+                    .lock()
+                    .expect("scan wait lock")
+                    .take()
+                    .expect("one scan wait");
+                async move {
+                    wait.await.expect("release scan");
+                    Ok(ScanReport {
+                        devices: Vec::new(),
+                        issues: Vec::new(),
+                    })
+                }
+            },
+        );
+        commands
+            .try_send(super::Command::Scan)
+            .expect("start scan before closing events");
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("scan starts");
+        drop(events);
+        release.send(()).expect("release scan");
+        commands.closed().await;
+        assert!(matches!(
+            wake_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected)
+        ));
+    }
+
+    fn required_capabilities_word() -> u64 {
+        REQUIRED_KEYBOARD_KEYS
+            .iter()
+            .fold(0_u64, |word, key| word | (1_u64 << key.code()))
+    }
+
+    fn write_capabilities(sysfs: &Utf8Path, event_name: &str, contents: &str) {
+        let directory = sysfs.join(event_name).join("device/capabilities");
+        fs::create_dir_all(&directory).expect("sysfs fixture directory");
+        fs::write(directory.join("key"), contents).expect("sysfs capability fixture");
+    }
+
+    fn assert_issue(report: &ScanReport, event_name: &str, kind: DeviceScanIssueKind) {
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| { issue.path.ends_with(event_name) && issue.kind == kind })
+        );
+    }
+
+    fn device(name: &str, path: &str) -> DeviceMetadata {
+        DeviceMetadata {
+            path: path.into(),
+            name: name.to_owned(),
+            physical_path: "fixture".to_owned(),
+        }
+    }
+
+    fn assert_scan_event(
+        scanner: &mut ScannerHandle,
+        wakes: &mpsc::Receiver<()>,
+        expected: &ScanReport,
+    ) {
+        wakes
+            .recv_timeout(Duration::from_secs(1))
+            .expect("scanner wake");
+        match scanner.try_recv_event() {
+            Some(Event::ScanFinished { result }) => {
+                assert_eq!(result.expect("successful injected scan"), *expected);
+            }
+            None => panic!("scanner wake must follow event delivery"),
+        }
+        assert!(matches!(wakes.try_recv(), Err(mpsc::TryRecvError::Empty)));
     }
 }

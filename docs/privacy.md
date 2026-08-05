@@ -10,14 +10,14 @@ Only run binaries you trust. Prefer releases produced by this repository's GitHu
 
 evtap always processes one mutable working session in memory. Session creation, capture, pause, rename, reset, and switching are ordinary application behavior rather than a separate persistence mode.
 
-A session is written to disk only by **Save now** or autosave. Before the first analytics write, evtap explains that aggregate labels remain sensitive and the database is local and unencrypted. The acknowledgement is remembered so the warning is not shown repeatedly.
+A session is written to disk only by **Save** or autosave. Before the first analytics write, evtap explains that aggregate labels remain sensitive and the database is local and unencrypted. The acknowledgement is remembered so the warning is not shown repeatedly.
 
 Autosave is off by default. When off, dirty session switches and normal close offer Save, Discard, or Cancel. When on, evtap saves periodically and at Stop, switch, and close boundaries. Existing saved sessions can be loaded regardless of the autosave setting.
 
 ## Capture and processing flow
 
 1. The scanner inspects readable `/dev/input/event*` devices and lists interfaces that expose a basic keyboard key set.
-2. Capture begins only after the user selects a keyboard and chooses **Start listening**. Loading a session never starts capture automatically.
+2. Capture begins only after the user selects a keyboard and chooses **Start**. Loading a session never starts capture automatically.
 3. Linux key events are converted into an internal event containing physical identity, event kind, timestamp, and optional XKB-produced text.
 4. Metrics consume the event synchronously and retain aggregates or bounded in-flight context.
 5. The normalized event is dropped after processing. The storage module cannot receive it.
@@ -79,7 +79,7 @@ $XDG_DATA_HOME/evtap/evtap.sqlite3
 
 with `~/.config/evtap` and `~/.local/share/evtap` fallbacks.
 
-- `settings.json` stores the settings schema version, disclosure acknowledgement, autosave preference, last-selected session ID, and fallback XKB preferences. It is written atomically and contains no analytics.
+- `settings.json` stores the settings schema version, disclosure acknowledgement, autosave preference, last-selected session ID, fallback XKB preferences, and system/light/dark appearance preference. It is written atomically and contains no analytics.
 - `app.ron` is owned by eframe and contains native window state only. Arbitrary egui widget-memory persistence is disabled.
 - `evtap.sqlite3` and its WAL/shared-memory sidecars store saved session metadata and aggregate snapshots.
 
@@ -89,11 +89,11 @@ The analytics database is not encrypted. Encryption without a defensible key-man
 
 ## Saves, crashes, and deletion
 
-**Save now** creates an explicit durability boundary. With autosave enabled, dirty state is also saved approximately every 30 seconds during continuous capture and after Stop, before switching sessions, and during graceful close. A crash or power loss can discard changes after the latest acknowledged transaction.
+**Save** creates an explicit durability boundary. With autosave enabled, dirty state is also saved approximately every 30 seconds during continuous capture and after Stop, before switching sessions, and during graceful close. A crash or power loss can discard changes after the latest acknowledged transaction.
 
 Deleting a saved session transactionally removes its metric snapshots through SQLite foreign-key cascading. **Delete all saved sessions** closes SQLite and removes the database, WAL, shared-memory, and rollback-journal files. SQLite secure deletion and best-effort page reclamation are enabled, but deletion cannot erase copies in backups, snapshots, SSD remapping, or forensic storage layers.
 
-Corrupt, unidentified, or incompatible-schema databases are not automatically replaced, downgraded, renamed, or truncated. Unsupported database and settings schemas have no automatic migration path; move or delete the incompatible file manually to start fresh.
+Corrupt, unidentified, or incompatible-schema databases are not automatically replaced, downgraded, renamed, or truncated. Unsupported database and settings schemas have no automatic migration path; move or delete the incompatible file manually to start fresh. Keep any settings backup private: it records storage choices, the last-selected session ID, keyboard preferences, and appearance.
 
 ## Network and logging
 

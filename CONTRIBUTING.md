@@ -11,25 +11,17 @@ rustup show
 cargo build --locked
 ```
 
-Before submitting a change, run:
+Before submitting a change, run the same locked commands used by CI:
 
 ```sh
 cargo fmt --all -- --check
 cargo clippy --all-targets --locked -- -D warnings
-cargo nextest run --all-targets --locked
+cargo test --all-targets --locked
 cargo +1.92.0 check --all-targets --locked
 cargo audit
 ```
 
-Install `cargo-nextest` using its documented installer or package for your platform. If it is unavailable, use `cargo test --all-targets --locked` instead.
-
-The session lifecycle UI tests use `egui_kittest` and run entirely in process: they do not create a native window or require an X11 or Wayland display. To verify that boundary explicitly, run:
-
-```sh
-env -u DISPLAY -u WAYLAND_DISPLAY cargo nextest run headless_
-```
-
-Use an isolated virtual display for native-window investigation so test windows never appear in the active desktop session. On Arch Linux, install `xorg-server-xvfb` and `xdotool`; then launch the app and its automation from the same `xvfb-run` command. Xvfb is not required for the normal Rust test suite.
+`cargo nextest run --all-targets --locked` is an optional faster local equivalent to the CI test command. If evtap gains a library target with doctests, run them separately with `cargo test --doc --locked`; `--all-targets` does not include doctests.
 
 `cargo audit` can be installed with:
 
@@ -37,35 +29,35 @@ Use an isolated virtual display for native-window investigation so test windows 
 cargo install cargo-audit --version 0.22.2 --locked
 ```
 
+Persistence changes also use the [focused manual validation runbook](docs/persistence-validation.md) for native evdev, crash, filesystem-fault, and privacy checks that automated tests do not cover.
+
 ## Architecture
 
 The main internal boundaries are:
 
 - `listener` and `scanner`: Linux evdev discovery and capture lifecycle.
 - `input`: normalized, backend-independent keyboard events.
-- `metric`: the metric contract, generic report model, and metric registry.
-- `metric_view`: generic egui rendering for metric reports.
+- `metric`: the built-in metric contract, concrete `SessionMetrics` aggregate, metric-owned egui presentation, and durable snapshot validation.
 - `session`: mutable saved-session metadata and isolated metric recovery.
 - `settings` and `paths`: atomic privacy preferences and XDG locations.
 - `private_fs`: shared Unix permission enforcement with normal operating-system symlink resolution.
 - `database`: SQLite identity/schema validation and transactional mutable-session storage.
 - `storage`: dirty-generation tracking and the background command/event protocol; it accepts aggregate `SessionSnapshot` values and must never import `KeyEvent`.
-- `app`: the thin capture, persistence, and editor-style boundary coordinator.
+- `app`: the single egui-thread owner, split into capture, persistence, session-lifecycle, and keyboard/settings concerns.
 - `app/working_session`: the loaded mutable session, metrics, transient context, and the durable snapshot boundary.
 - `app/view`: egui presentation and modal interaction; it does not own durable state.
 - `app/tests`: headless lifecycle fixtures and end-to-end UI scenarios.
 
-A metric must not depend directly on evdev, Tokio, or egui. To add one:
+A metric must not depend directly on evdev or Tokio. Built-in metrics intentionally own their summary and analysis presentation through the `Metric` egui methods; do not reintroduce a generic report or view-model layer. To add one:
 
 1. Implement `Metric` in a module under `src/metric/`.
-2. Give it a unique, stable descriptor ID and explain its sampling semantics.
-3. Return UI-independent scalar or table report sections.
-4. Register it in `default_metrics` in `src/metric.rs`.
-5. Implement a deterministic, versioned snapshot that stores only durable aggregate state.
-6. Validate the complete snapshot before mutating the metric during restore.
-7. Add deterministic tests covering event kinds, timing boundaries, snapshot round trips, malformed values, transient-state exclusion, and reset behavior.
-
-The generic report renderer means a normal metric addition should not require changes to the UI layer.
+2. Give it a unique, stable ID and explain its sampling semantics.
+3. Implement its summary and analysis UI using the focused primitives under `app/view/components`.
+4. Add a concrete field, explicit lifecycle dispatch, snapshot restoration branch, and accessor to `SessionMetrics` in `src/metric.rs`.
+5. Place the metric explicitly in the appropriate page under `app/view/shell/analytics.rs`.
+6. Implement a deterministic, versioned snapshot that stores only durable aggregate state.
+7. Validate the complete snapshot before mutating the metric during restore.
+8. Add deterministic tests covering event kinds, timing boundaries, presentation, snapshot round trips, malformed values, transient-state exclusion, and reset behavior.
 
 ## Privacy requirements
 
