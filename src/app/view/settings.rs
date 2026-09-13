@@ -476,6 +476,7 @@ fn searchable_selector(
     egui::ComboBox::new(id_salt, label)
         .width(ui.available_width().min(360.0))
         .selected_text(selected_text)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show_ui(ui, |ui| {
             ui.set_min_width(300.0);
             let mut query = ui
@@ -498,14 +499,7 @@ fn searchable_selector(
 
             let normalized = query.trim().to_lowercase();
             let default_matches = normalized.is_empty() || "default".contains(&normalized);
-            if default_matches && ui.selectable_label(current.is_empty(), "Default").clicked() {
-                selected = Some(String::new());
-                ui.ctx()
-                    .data_mut(|data| data.insert_temp(query_id, String::new()));
-                ui.close();
-            }
-
-            let matches: Vec<&str> = options
+            let mut matches: Vec<&str> = options
                 .iter()
                 .map(String::as_str)
                 .filter(|option| {
@@ -514,23 +508,42 @@ fn searchable_selector(
                             || option.to_lowercase().contains(normalized.as_str()))
                 })
                 .collect();
+            if default_matches {
+                matches.insert(0, "");
+            }
+            let row_count = matches.len().max(1);
             let row_height = ui.spacing().interact_size.y;
             egui::ScrollArea::vertical()
                 .id_salt((id_salt, "results"))
                 .max_height(220.0)
-                .show_rows(ui, row_height, matches.len(), |ui, rows| {
-                    for option in &matches[rows] {
-                        if ui.selectable_label(current == *option, *option).clicked() {
-                            selected = Some((*option).to_owned());
+                .auto_shrink([true, false])
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                .show_rows(ui, row_height, row_count, |ui, rows| {
+                    for row in rows {
+                        let option = matches.get(row).copied();
+                        let option_label = match option {
+                            Some("") => "Default",
+                            Some(option) => option,
+                            None => "No matching options",
+                        };
+                        let response = ui.add_enabled(
+                            option.is_some(),
+                            egui::Button::selectable(
+                                option.is_some_and(|option| current == option),
+                                option_label,
+                            )
+                            .truncate(),
+                        );
+                        if response.clicked()
+                            && let Some(option) = option
+                        {
+                            selected = Some(option.to_owned());
                             ui.ctx()
                                 .data_mut(|data| data.insert_temp(query_id, String::new()));
                             ui.close();
                         }
                     }
                 });
-            if !default_matches && matches.is_empty() {
-                ui.weak("No matching options");
-            }
         });
 
     selected

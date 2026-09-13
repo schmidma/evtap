@@ -112,9 +112,16 @@ async fn headless_settings_keyboard_search_reset_and_capture_lock_are_accessible
         .get_by_role_and_label(egui::accesskit::Role::ComboBox, "Model")
         .click();
     harness.run();
-    let search = harness.get_by_role_and_label(egui::accesskit::Role::TextInput, "Search model");
-    search.focus();
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::TextInput, "Search model")
+        .click();
     harness.run();
+    assert!(
+        harness
+            .query_by_role_and_label(egui::accesskit::Role::TextInput, "Search model")
+            .is_some(),
+        "clicking the embedded search input must keep the selector open"
+    );
     harness
         .get_by_role_and_label(egui::accesskit::Role::TextInput, "Search model")
         .type_text("fixture");
@@ -186,6 +193,250 @@ async fn headless_settings_keyboard_search_reset_and_capture_lock_are_accessible
 
     shutdown_harness(&mut harness);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn headless_xkb_search_popup_geometry_and_row_slots_stay_stable() {
+    let workspace = TestWorkspace::new();
+    let mut harness = workspace.start_with_size(egui::vec2(800.0, 600.0));
+    open_settings_category(&mut harness, "Keyboard interpretation");
+
+    let long_model = format!("unique-model-{}", "very-long-label-".repeat(30));
+    {
+        let app = harness.state_mut();
+        app.available_models = (0..40).map(|index| format!("model-{index:02}")).collect();
+        app.available_models.push(long_model.clone());
+    }
+    harness.step();
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::ComboBox, "Model")
+        .click();
+    harness.run();
+
+    let popup_geometry = |harness: &Harness<'_, App>| {
+        let search = harness
+            .get_by_role_and_label(egui::accesskit::Role::TextInput, "Search model")
+            .accesskit_node()
+            .bounding_box()
+            .unwrap();
+        let search_center = egui::pos2(
+            ((search.x0 + search.x1) / 2.0) as f32,
+            ((search.y0 + search.y1) / 2.0) as f32,
+        );
+        let popup = harness.ctx.memory(|memory| {
+            memory
+                .areas()
+                .visible_layer_ids()
+                .into_iter()
+                .filter(|layer| layer.order == egui::Order::Foreground)
+                .filter_map(|layer| memory.area_rect(layer.id))
+                .find(|rect| rect.contains(search_center))
+                .expect("open model popup should have a foreground Area")
+        });
+        (popup, search)
+    };
+
+    let (initial_popup, initial_search) = popup_geometry(&harness);
+    let initial_row = harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, "Default")
+        .accesskit_node();
+    let initial_row_id = initial_row.id();
+    let initial_row_bounds = initial_row.bounding_box().unwrap();
+
+    let search = harness.get_by_role_and_label(egui::accesskit::Role::TextInput, "Search model");
+    search.click();
+    search.type_text("unique-model");
+    harness.run();
+    let (filtered_popup, filtered_search) = popup_geometry(&harness);
+    let filtered_row = harness.get_by_label(&long_model).accesskit_node();
+    assert_eq!(
+        filtered_row.id(),
+        initial_row_id,
+        "the first selectable row must retain its slot ID"
+    );
+    assert_eq!(filtered_row.bounding_box().unwrap(), initial_row_bounds);
+    assert_eq!(filtered_popup, initial_popup);
+    assert_eq!(filtered_search, initial_search);
+    assert!(filtered_row.bounding_box().unwrap().x1 <= f64::from(filtered_popup.max.x));
+
+    harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::A);
+    harness.key_press(egui::Key::Backspace);
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::TextInput, "Search model")
+        .type_text("no-such-model");
+    harness.run();
+    let empty_row = harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, "No matching options")
+        .accesskit_node();
+    assert!(empty_row.is_disabled());
+    assert_eq!(empty_row.id(), initial_row_id);
+    assert_eq!(empty_row.bounding_box().unwrap(), initial_row_bounds);
+    let (empty_popup, empty_search) = popup_geometry(&harness);
+    assert_eq!(empty_popup, initial_popup);
+    assert_eq!(empty_search, initial_search);
+
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::TextInput, "Search model")
+        .click();
+    harness.run();
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    harness.run();
+    harness.key_press(egui::Key::Backspace);
+    harness.run();
+    let (cleared_popup, cleared_search) = popup_geometry(&harness);
+    let cleared_row = harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, "Default")
+        .accesskit_node();
+    assert_eq!(cleared_row.id(), initial_row_id);
+    assert_eq!(cleared_row.bounding_box().unwrap(), initial_row_bounds);
+    assert_eq!(cleared_popup, initial_popup);
+    assert_eq!(cleared_search, initial_search);
+
+    shutdown_harness(&mut harness);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn headless_xkb_search_clicks_keep_selectors_open_until_explicit_dismissal() {
+    let workspace = TestWorkspace::new();
+    let mut harness = workspace.start_with_size(egui::vec2(800.0, 600.0));
+    open_settings_category(&mut harness, "Keyboard interpretation");
+
+    {
+        let app = harness.state_mut();
+        app.available_models = vec!["pc105".to_owned(), "pc104".to_owned()];
+        app.available_layouts = vec!["us".to_owned(), "de".to_owned()];
+    }
+    harness.step();
+
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::ComboBox, "Model")
+        .click();
+    harness.run();
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::TextInput, "Search model")
+        .click();
+    harness.run();
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::TextInput, "Search model")
+        .type_text("105");
+    harness.run();
+    assert!(harness.query_by_label("pc104").is_none());
+    assert!(
+        harness
+            .query_by_role_and_label(egui::accesskit::Role::TextInput, "Search model")
+            .is_some(),
+        "typing must leave the filtered model selector open"
+    );
+    harness.key_press(egui::Key::Escape);
+    harness.run();
+    assert!(
+        harness
+            .query_by_role_and_label(egui::accesskit::Role::TextInput, "Search model")
+            .is_none(),
+        "Escape must dismiss the selector"
+    );
+
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::ComboBox, "Model")
+        .click();
+    harness.run();
+    assert!(harness.query_by_label("pc104").is_none());
+    harness.get_by_label("pc105").click();
+    harness.run();
+    assert_eq!(harness.state().model, "pc105");
+    assert_eq!(harness.state().settings.keyboard_model(), "pc105");
+    assert_eq!(harness.state().working_session.keyboard.model, "pc105");
+    assert!(
+        harness
+            .query_by_role_and_label(egui::accesskit::Role::TextInput, "Search model")
+            .is_none(),
+        "selecting a model must close the selector"
+    );
+
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::ComboBox, "Layout")
+        .click();
+    harness.run();
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::TextInput, "Search layout")
+        .click();
+    harness.run();
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::TextInput, "Search layout")
+        .type_text("us");
+    harness.run();
+    assert!(harness.query_by_label("de").is_none());
+    assert!(
+        harness
+            .query_by_role_and_label(egui::accesskit::Role::TextInput, "Search layout")
+            .is_some()
+    );
+    harness.get_by_label("XKB configuration").click();
+    harness.run();
+    assert!(
+        harness
+            .query_by_role_and_label(egui::accesskit::Role::TextInput, "Search layout")
+            .is_none(),
+        "an outside click must dismiss the selector"
+    );
+
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::ComboBox, "Layout")
+        .click();
+    harness.run();
+    harness.get_by_label("us").click();
+    harness.run();
+    assert_eq!(harness.state().layout, "us");
+    assert_eq!(harness.state().settings.keyboard_layout(), "us");
+    assert_eq!(harness.state().working_session.keyboard.layout, "us");
+    assert!(
+        harness
+            .query_by_role_and_label(egui::accesskit::Role::TextInput, "Search layout")
+            .is_none(),
+        "selecting a layout must close the selector"
+    );
+
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::ComboBox, "Variant")
+        .click();
+    harness.run();
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::TextInput, "Search variant")
+        .click();
+    harness.run();
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::TextInput, "Search variant")
+        .type_text("altgr-intl");
+    harness.run();
+    assert!(harness.query_by_label("dvorak").is_none());
+    assert!(
+        harness
+            .query_by_role_and_label(egui::accesskit::Role::TextInput, "Search variant")
+            .is_some()
+    );
+    harness.get_by_label("altgr-intl").click();
+    harness.run();
+    assert_eq!(harness.state().variant, "altgr-intl");
+    assert_eq!(harness.state().settings.keyboard_variant(), "altgr-intl");
+    assert_eq!(
+        harness.state().working_session.keyboard.variant,
+        "altgr-intl"
+    );
+    assert!(
+        harness
+            .query_by_role_and_label(egui::accesskit::Role::TextInput, "Search variant")
+            .is_none(),
+        "selecting a variant must close the selector"
+    );
+    assert!(!harness.state().working_dirty());
+    shutdown_harness(&mut harness);
+
+    let mut restarted = workspace.start();
+    assert_eq!(restarted.state().settings.keyboard_model(), "pc105");
+    assert_eq!(restarted.state().settings.keyboard_layout(), "us");
+    assert_eq!(restarted.state().settings.keyboard_variant(), "altgr-intl");
+    shutdown_harness(&mut restarted);
+}
+
 fn open_settings_category(harness: &mut Harness<'static, App>, category: &str) {
     harness.get_by_label_contains("Settings").click();
     harness.run();
