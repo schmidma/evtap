@@ -4,6 +4,8 @@ All notable changes to evtap are documented here. The format is based on [Keep a
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-13
+
 ### Added
 
 - System, light, and dark appearance choices that persist across restarts.
@@ -14,6 +16,14 @@ All notable changes to evtap are documented here. The format is based on [Keep a
 - Organized settings into clear categories with searchable keyboard selectors, and improved the session switcher and **Manage sessions** workflow.
 - Expanded analytics with sortable, expandable tables and clearer summaries. The UI now uses **Correction Signals** while the persisted `corrections` metric ID remains compatible with saved sessions.
 - Made storage, device, listener, and session-list feedback specific to the failed operation, with focused dialogs, clearer recovery actions, and improved accessible labels and focus behavior.
+
+### Fixed
+
+- XKB dropdowns stay open for filtering and keep a stable layout while filtering or clearing the search.
+
+### Security
+
+- Updated the browser-opening dependency to fix Unix `BROWSER` argument injection.
 
 ## [0.2.0] - 2026-07-30
 
@@ -62,6 +72,7 @@ All notable changes to evtap are documented here. The format is based on [Keep a
 - Background capture and scanning update the GUI when data arrives.
 - Listener read failures stop capture cleanly.
 
-[Unreleased]: https://github.com/schmidma/evtap/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/schmidma/evtap/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/schmidma/evtap/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/schmidma/evtap/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/schmidma/evtap/releases/tag/v0.1.0

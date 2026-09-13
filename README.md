@@ -38,13 +38,13 @@ Metric definitions, sampling thresholds, and limitations are documented in [docs
 Download the Linux archive and checksum from the [GitHub Releases page](https://github.com/schmidma/evtap/releases), verify it, and extract it:
 
 ```sh
-sha256sum --check evtap-0.2.0-x86_64-unknown-linux-gnu.tar.gz.sha256
-tar -xzf evtap-0.2.0-x86_64-unknown-linux-gnu.tar.gz
-cd evtap-0.2.0-x86_64-unknown-linux-gnu
+sha256sum --check evtap-0.3.0-x86_64-unknown-linux-gnu.tar.gz.sha256
+tar -xzf evtap-0.3.0-x86_64-unknown-linux-gnu.tar.gz
+cd evtap-0.3.0-x86_64-unknown-linux-gnu
 ./evtap
 ```
 
-Replace `0.2.0` with the release you downloaded. GitHub releases are currently the only binary distribution channel; evtap is not published on crates.io or in distribution repositories.
+Replace `0.3.0` with the release you downloaded. GitHub releases are currently the only binary distribution channel; evtap is not published on crates.io or in distribution repositories.
 
 ### From source
 
